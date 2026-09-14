@@ -2,7 +2,7 @@ import { stripVTControlCharacters } from "node:util";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it } from "vitest";
 import { getThemeByName } from "../../../coding-agent/src/modes/interactive/theme/theme.ts";
-import { formatTradingVenue, renderTradingVenue, type TradingVenueInput } from "../venue.ts";
+import { formatTradingStatus, formatTradingVenue, renderTradingVenue, type TradingVenueInput } from "../venue.ts";
 
 describe("formatTradingVenue", () => {
 	it("shows paper market data as the configured exchange public feed", () => {
@@ -90,6 +90,99 @@ describe("formatTradingVenue", () => {
 				}
 			}
 			expect(renderTradingVenue(input, theme, 0)).toEqual([]);
+		});
+
+		it("fits routine identity, source and health into two rows at 80 columns", () => {
+			const lines = renderTradingVenue(
+				{ ...input, mode: "paper", exchangeId: "okx", marketType: "spot", paused: false },
+				plainTheme,
+				80,
+				{
+					summary: "Entry blocks: none",
+					observations: "Monitor: disabled  /health",
+					tone: "muted",
+					entryBlocked: false,
+				},
+			);
+			expect(lines).toHaveLength(2);
+			expect(lines[0]).toContain("[ PAPER ]");
+			expect(lines[0]).toContain("Entry blocks: none");
+			expect(lines[1]).toContain("market data: OKX public");
+			expect(lines[1]).toContain("Monitor: disabled");
+			expect(lines.join("\n")).not.toMatch(/authorized|safe to trade/i);
+		});
+
+		it("puts blocks first and preserves live approval, observations and source at narrow widths", () => {
+			const status = {
+				summary: "Entry blocks: unresolved executions",
+				observations: "Monitor: orders: stale, observed 6m ago, pending 2  /health",
+				tone: "warning",
+				entryBlocked: true,
+				recoveryHint: "Inspect /recovery; do not resubmit orders.",
+			} as const;
+			for (const width of [20, 40, 80, 140]) {
+				const lines = renderTradingVenue({ ...input, orderApproval: "confirm" }, plainTheme, width, status);
+				const text = lines.join(" ").replace(/\s+/g, " ");
+				expect(text.trim()).toMatch(/^Entry blocks:/);
+				for (const expected of [
+					"[ LIVE ]",
+					"[ PAUSED ]",
+					"Binance",
+					"USDT",
+					"Confirm each order",
+					"observed 6m ago",
+					"pending 2",
+					"/health",
+					"/recovery",
+					"orders and market data: Binance",
+				]) {
+					expect(text).toContain(expected);
+				}
+				for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+			}
+			expect(formatTradingStatus(input, status)[0]).toBe(status.summary);
+		});
+
+		it("puts degraded observations ahead of routine identity and never colors no blocks as approval", () => {
+			const theme = getThemeByName("dark");
+			if (!theme) throw new Error("Missing dark theme");
+			const status = {
+				summary: "Entry blocks: none",
+				observations: "Monitor: orders: degraded, observed 30s ago  /health",
+				tone: "warning",
+				entryBlocked: false,
+			} as const;
+			const lines = renderTradingVenue({ ...input, paused: false }, theme, 100, status);
+			expect(stripVTControlCharacters(lines[0])).toContain(status.observations);
+			expect(lines.join("\n")).toContain(theme.fg("muted", status.summary));
+			expect(formatTradingStatus(input, status)[0]).toBe(status.observations);
+		});
+
+		it("preserves localized health and venue information without overflowing", () => {
+			const theme = getThemeByName("light");
+			if (!theme) throw new Error("Missing light theme");
+			const status = {
+				summary: "开仓阻断：无",
+				observations: "监控: 订单: 近期, 12 秒前观测  /health",
+				tone: "muted",
+				entryBlocked: false,
+			} as const;
+			for (const width of [1, 2, 20, 40, 80, 140]) {
+				const lines = renderTradingVenue(
+					{ ...input, language: "zh-CN", orderApproval: "unattended" },
+					theme,
+					width,
+					status,
+				);
+				for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+				if (width >= 40) {
+					const text = lines.map(stripVTControlCharacters).join(" ").replace(/\s+/g, " ");
+					expect(text).toContain("12 秒前观测");
+					expect(text).toContain("开仓阻断：无");
+					expect(text).toContain("USDT");
+					expect(text).toContain("/health");
+				}
+			}
 		});
 	});
 

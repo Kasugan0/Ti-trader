@@ -1260,7 +1260,7 @@ describe("trading order tools", () => {
 		});
 		expect(placeOrder).not.toHaveBeenCalled();
 		expect(runtime.tradingEngine.risk.usage()).toMatchObject({ used: 0, reserved: 0 });
-		expect(notify).toHaveBeenCalledWith("Order cancelled by user", "info");
+		expect(notify).toHaveBeenCalledWith("用户已取消订单", "info");
 	});
 
 	it("confirms live order and order-list cancellations before submitting", async () => {

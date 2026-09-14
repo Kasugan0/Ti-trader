@@ -11,6 +11,8 @@ import {
 	RiskCommitError,
 } from "@nikopack/ti-trading-engine";
 import type { TradingRuntime } from "../context.ts";
+import { t } from "../i18n.ts";
+import { createOrderReview, type OrderReviewPlan, showOrderReview } from "../order-review.ts";
 import { liveOrdersRequireConfirmation } from "../state.ts";
 import { paperFuturesOrderUnsupported } from "./capabilities.ts";
 import {
@@ -193,20 +195,27 @@ function liveSubmissionOverride(trading: TradingRuntime): { allowUnconfirmedLive
 function liveOrderConfirm(
 	ctx: ExtensionContext,
 	trading: TradingRuntime,
-	title: string,
+	engine: TradingRuntime["tradingEngine"],
+	prepared: OrderReviewPlan,
+	protectionStopPrice?: number,
+	signal?: AbortSignal,
 ): ((summary: string) => Promise<boolean>) | undefined {
 	if (!needsLiveConfirmation(trading)) return undefined;
-	return async (summary) => {
+	return async () => {
 		if (!ctx.hasUI) {
 			throw new Error(
 				`Live orders require interactive confirmation but no UI is available. ${UNATTENDED_LIVE_CONFIG_HINT}`,
 			);
 		}
-		const usage = trading.tradingEngine.risk.usage();
-		return ctx.ui.confirm(
-			title,
-			`${summary}\n\nReserved/used notional after fill: ${(usage.used + usage.reserved).toFixed(2)} / ${usage.limit} ${trading.config.quoteCurrency}`,
-		);
+		const usage = engine.risk.usage();
+		const review = createOrderReview(prepared, {
+			language: trading.config.language,
+			quoteCurrency: engine.quoteCurrency,
+			accountId: engine.getExecutionScope().accountId,
+			usage,
+			protectionStopPrice,
+		});
+		return showOrderReview(ctx, review, signal);
 	};
 }
 
@@ -229,20 +238,25 @@ export async function confirmLiveRiskChange(
 	return jsonResult(options.cancelledResult);
 }
 
-function userRejectedConfirmation(ctx: ExtensionContext, summary: string): AgentToolResult<unknown> {
-	ctx.ui.notify(USER_CANCELLED_ORDER, "info");
+function userRejectedConfirmation(
+	ctx: ExtensionContext,
+	trading: TradingRuntime,
+	summary: string,
+): AgentToolResult<unknown> {
+	ctx.ui.notify(t(trading.config.language, "orderReviewCancelled"), "info");
 	return jsonResult({ status: "cancelled", reason: "user rejected confirmation", order: summary });
 }
 
 function handlePlacementFailure(
 	ctx: ExtensionContext,
+	trading: TradingRuntime,
 	error: unknown,
 	planSummary: string,
 	submitted: boolean,
 	labels: { submitted: string; unknown: string },
 ): AgentToolResult<unknown> {
 	if (error instanceof RiskCommitError || error instanceof ExecutionRecoveryError) throw error;
-	if (errorMessage(error) === USER_CANCELLED_ORDER) return userRejectedConfirmation(ctx, planSummary);
+	if (errorMessage(error) === USER_CANCELLED_ORDER) return userRejectedConfirmation(ctx, trading, planSummary);
 	const message = errorMessage(error);
 	if (submitted) {
 		throw new Error(`${labels.submitted} was submitted and the result could not be reported: ${message}`);
@@ -263,14 +277,20 @@ export async function executeOrder(
 	trading: TradingRuntime,
 	signal?: AbortSignal,
 ): Promise<AgentToolResult<unknown>> {
-	const { config } = trading;
 	const engine = trading.tradingEngine;
 	const unsupported = paperFuturesOrderUnsupported(trading, params.symbol, params.type);
 	if (unsupported) throw new Error(unsupported);
 	const plan = await engine.prepareOrder(side, params);
 	let submitted = false;
 	try {
-		const confirm = liveOrderConfirm(ctx, trading, `Confirm LIVE order on ${config.exchange}`);
+		const confirm = liveOrderConfirm(
+			ctx,
+			trading,
+			engine,
+			{ kind: "order", plan },
+			params.protectionStopPrice,
+			signal,
+		);
 		const result = await engine.placeOrder(
 			plan,
 			{
@@ -306,7 +326,7 @@ export async function executeOrder(
 			),
 		});
 	} catch (error) {
-		return handlePlacementFailure(ctx, error, plan.summary, submitted, {
+		return handlePlacementFailure(ctx, trading, error, plan.summary, submitted, {
 			submitted: "Order",
 			unknown: "Order",
 		});
@@ -354,7 +374,14 @@ export async function executeOco(
 
 	let submitted = false;
 	try {
-		const confirm = liveOrderConfirm(ctx, trading, `Confirm LIVE OCO order on ${config.exchange}`);
+		const confirm = liveOrderConfirm(
+			ctx,
+			trading,
+			engine,
+			{ kind: "oco", plan, preflight },
+			params.protectionStopPrice,
+			signal,
+		);
 		const result = await engine.placeOco(
 			plan,
 			{
@@ -384,7 +411,7 @@ export async function executeOco(
 			orders: result.orders.map((order) => formatOrder(order)),
 		});
 	} catch (error) {
-		return handlePlacementFailure(ctx, error, plan.summary, submitted, {
+		return handlePlacementFailure(ctx, trading, error, plan.summary, submitted, {
 			submitted: "OCO order",
 			unknown: "OCO",
 		});

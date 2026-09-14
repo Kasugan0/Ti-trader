@@ -1,7 +1,8 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { type Component, ProcessTerminal, TuiMainScreen, visibleWidth } from "@earendil-works/pi-tui";
+import type { RiskNewExposurePause } from "@nikopack/ti-trading-engine";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createOperationalHealthExtension, readOperationalHealth } from "../health.ts";
+import { createOperationalHealthExtension, createTradingStatus, readOperationalHealth } from "../health.ts";
 import * as monitoringState from "../monitoring-state.ts";
 import { createMemoryMonitoringStore, ensureMonitoringScope } from "../monitoring-state.ts";
 import { assessOperationalHealth } from "../operational-health.ts";
@@ -24,7 +25,7 @@ const runtime = vi.hoisted(() => ({
 	}),
 	tradingEngine: {
 		risk: {
-			usage: () => ({ newExposurePause: undefined }),
+			usage: () => ({ newExposurePause: undefined as RiskNewExposurePause | undefined }),
 			listPendingReservations: () => [],
 		},
 	},
@@ -56,27 +57,34 @@ describe("health command", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 		vi.useRealTimers();
+		runtime.config.language = "en-US";
 	});
 
-	it("refreshes local status while idle, keeps render free of reads and stops on shutdown", () => {
+	it("refreshes one cached status while idle, keeps render free of reads and stops on disposal", () => {
 		vi.useFakeTimers();
+		runtime.config.language = "zh-CN";
 		const readHealth = vi.fn(() => readOperationalHealth(createMemoryMonitoringStore()));
-		const f = fixture(readHealth, () => "zh-CN");
+		const status = createTradingStatus(readHealth);
 		let widget: (Component & { dispose?(): void }) | undefined;
 		const tui = new TuiMainScreen(new ProcessTerminal());
 		vi.spyOn(tui, "requestRender").mockImplementation(() => {});
 		const ctx = {
 			mode: "tui",
+			hasUI: true,
 			ui: {
-				theme: { fg: (_color: string, text: string) => text },
-				setWidget: (_key: string, factory: (tui: TuiMainScreen) => Component) => {
+				theme: { fg: (_color: string, text: string) => text, bold: (text: string) => text },
+				setStatus: vi.fn(),
+				setWidget: vi.fn((_key: string, factory: (tui: TuiMainScreen) => Component) => {
 					widget = factory(tui);
-				},
+				}),
 			},
 		} as unknown as ExtensionCommandContext;
-		f.events.get("session_start")!({}, ctx);
+		status.update(ctx);
 		if (!widget) throw new Error("Missing status widget");
+		const originalWidget = widget;
 		expect(widget.render(80).join("\n")).toContain("未知");
+		status.update(ctx);
+		expect(ctx.ui.setWidget).toHaveBeenCalledOnce();
 		readHealth.mockClear();
 		for (const width of [20, 40, 80]) {
 			for (const line of widget.render(width)) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
@@ -97,11 +105,189 @@ describe("health command", () => {
 		expect(failed).toContain("/health");
 		expect(failed).not.toContain("secret fixture");
 		expect(failed).not.toContain("未决执行");
-		f.events.get("session_shutdown")!({}, ctx);
+		expect(failed).toContain("模拟盘");
+		expect(failed).toContain("OKX");
+		status.dispose();
 		readHealth.mockClear();
 		vi.advanceTimersByTime(10_000);
 		expect(readHealth).not.toHaveBeenCalled();
+		status.update(ctx);
+		expect(widget).not.toBe(originalWidget);
+		originalWidget.dispose?.();
+		readHealth.mockClear();
+		vi.advanceTimersByTime(5_000);
+		expect(readHealth).toHaveBeenCalledOnce();
 		widget.dispose?.();
+		readHealth.mockClear();
+		vi.advanceTimersByTime(10_000);
+		expect(readHealth).not.toHaveBeenCalled();
+	});
+
+	it("keeps pause and identity visible when monitoring state cannot be trusted", () => {
+		const pause = { id: "pause-1", reason: "Inspect orders", pausedAt: new Date().toISOString() };
+		vi.spyOn(runtime.tradingEngine.risk, "usage").mockReturnValue({ newExposurePause: pause });
+		const status = createTradingStatus(() => {
+			throw new Error("secret monitoring fixture");
+		});
+		const setWidget = vi.fn();
+		status.update({
+			mode: "rpc",
+			hasUI: true,
+			ui: { setStatus: vi.fn(), setWidget },
+		} as unknown as ExtensionCommandContext);
+		const text = JSON.stringify(setWidget.mock.calls);
+		expect(text).toContain("PAUSED");
+		expect(text).toContain("PAPER");
+		expect(text).toContain("OKX");
+		expect(text).toContain("market data: OKX public");
+		expect(text).toContain("Health unavailable");
+		expect(text).not.toContain("secret monitoring fixture");
+		status.dispose();
+	});
+
+	it("keeps configured identity visible even when the risk state read fails", () => {
+		vi.spyOn(runtime.tradingEngine.risk, "usage").mockImplementation(() => {
+			throw new Error("secret risk fixture");
+		});
+		const readHealth = vi.fn(() => readOperationalHealth(createMemoryMonitoringStore()));
+		const status = createTradingStatus(readHealth);
+		const setWidget = vi.fn();
+		status.update({
+			mode: "rpc",
+			hasUI: true,
+			ui: { setStatus: vi.fn(), setWidget },
+		} as unknown as ExtensionCommandContext);
+		const text = JSON.stringify(setWidget.mock.calls);
+		expect(text).toContain("PAPER");
+		expect(text).toContain("OKX");
+		expect(text).toContain("Health unavailable");
+		expect(text).not.toContain("secret risk fixture");
+		expect(readHealth).not.toHaveBeenCalled();
+		status.dispose();
+	});
+
+	it.each([
+		[12_000, "en-US", "observed 12s ago"],
+		[125_000, "en-US", "observed 2m ago"],
+		[7_200_000, "zh-CN", "2 小时前观测"],
+	] as const)("shows persisted observation age %s in the widget and health command", async (age, language, label) => {
+		vi.useFakeTimers();
+		vi.setSystemTime(10_000_000);
+		runtime.config.language = language;
+		const store = createMemoryMonitoringStore();
+		store.transact((state) => {
+			const scope = ensureMonitoringScope(state, monitoringState.monitoringScopeForRuntime(runtime), Date.now());
+			scope.health.orders = { lastObservationAt: Date.now() - age, lastPollAt: Date.now() };
+		});
+		const readHealth = () => readOperationalHealth(store);
+		const status = createTradingStatus(readHealth);
+		const setWidget = vi.fn();
+		const ctx = {
+			mode: "rpc",
+			hasUI: true,
+			ui: { setStatus: vi.fn(), setWidget },
+		} as unknown as ExtensionCommandContext;
+		status.update(ctx);
+		expect(JSON.stringify(setWidget.mock.calls)).toContain(label);
+		const f = fixture(readHealth, () => language);
+		await f.handler("", f.ctx);
+		expect(JSON.stringify(f.appendEntry.mock.calls)).toContain(label);
+		vi.advanceTimersByTime(age >= 3_600_000 ? 3_600_000 : 60_000);
+		expect(setWidget).toHaveBeenCalledOnce();
+		status.update(ctx);
+		expect(setWidget).toHaveBeenCalledTimes(2);
+		status.dispose();
+	});
+
+	it("ages the last observation while idle rather than treating each local refresh as a new observation", () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(10_000_000);
+		const store = createMemoryMonitoringStore();
+		store.transact((state) => {
+			const scope = ensureMonitoringScope(state, monitoringState.monitoringScopeForRuntime(runtime), Date.now());
+			scope.health.orders = { lastObservationAt: Date.now() - 12_000, lastPollAt: Date.now() };
+		});
+		const readHealth = vi.fn(() => readOperationalHealth(store));
+		const status = createTradingStatus(readHealth);
+		const tui = new TuiMainScreen(new ProcessTerminal());
+		vi.spyOn(tui, "requestRender").mockImplementation(() => {});
+		let widget: Component | undefined;
+		const ctx = {
+			mode: "tui",
+			hasUI: true,
+			ui: {
+				theme: { fg: (_color: string, text: string) => text, bold: (text: string) => text },
+				setStatus: vi.fn(),
+				setWidget: vi.fn((_key: string, factory: (tui: TuiMainScreen) => Component) => {
+					widget = factory(tui);
+				}),
+			},
+		} as unknown as ExtensionCommandContext;
+		status.update(ctx);
+		if (!widget) throw new Error("Missing status widget");
+		expect(widget.render(140).join("\n")).toContain("observed 12s ago");
+		vi.advanceTimersByTime(5_000);
+		expect(widget.render(140).join("\n")).toContain("observed 17s ago");
+		expect(readHealth).toHaveBeenCalledTimes(2);
+		expect(ctx.ui.setWidget).toHaveBeenCalledOnce();
+		status.dispose();
+	});
+
+	it.each([undefined, 11_000_000])(
+		"does not manufacture a recent age for missing or future observations: %s",
+		(at) => {
+			vi.useFakeTimers();
+			vi.setSystemTime(10_000_000);
+			const store = createMemoryMonitoringStore();
+			store.transact((state) => {
+				const scope = ensureMonitoringScope(state, monitoringState.monitoringScopeForRuntime(runtime), Date.now());
+				scope.health.orders = { lastObservationAt: at, lastPollAt: Date.now() };
+			});
+			const status = createTradingStatus(() => readOperationalHealth(store));
+			const setWidget = vi.fn();
+			status.update({
+				mode: "rpc",
+				hasUI: true,
+				ui: { setStatus: vi.fn(), setWidget },
+			} as unknown as ExtensionCommandContext);
+			const text = JSON.stringify(setWidget.mock.calls);
+			expect(text).toContain(at === undefined ? "unknown" : "stale");
+			expect(text).not.toContain("observed ");
+			status.dispose();
+		},
+	);
+
+	it("shows degraded delivery, pending counts and recovery guidance without claiming authorization", () => {
+		const health = assessOperationalHealth(
+			{
+				mode: "paper",
+				exchange: "okx",
+				marketType: "spot",
+				newExposurePaused: false,
+				maintenanceActive: false,
+				staleRuntime: false,
+				unresolvedExecutions: 1,
+				pendingReservations: 0,
+				observations: [
+					{ source: "orders", enabled: true, lastSuccessAt: 1_000, lastFailureAt: 2_000, pendingNotifications: 2 },
+				],
+				maxObservationAgeMs: 60_000,
+			},
+			3_000,
+		);
+		const status = createTradingStatus(() => health);
+		const setWidget = vi.fn();
+		status.update({
+			mode: "rpc",
+			hasUI: true,
+			ui: { setStatus: vi.fn(), setWidget },
+		} as unknown as ExtensionCommandContext);
+		const lines: string[] = setWidget.mock.calls[0][1];
+		expect(lines[0]).toContain("Entry blocks: unresolved executions");
+		expect(lines.join("\n")).toContain("degraded, observed 2s ago, pending 2");
+		expect(lines.join("\n")).toContain("Inspect /recovery; do not resubmit orders.");
+		expect(lines.join("\n")).not.toMatch(/authorized|safe to trade/i);
+		status.dispose();
 	});
 
 	it("reads scoped persisted observations without treating an unused trigger lane as degraded connectivity", () => {

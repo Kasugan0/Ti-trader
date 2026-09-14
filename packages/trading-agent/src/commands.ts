@@ -2,6 +2,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@e
 import type { Balance } from "@nikopack/ti-trading-engine";
 import { AccountSwitchConfirmationRequired, getTrading } from "./context.ts";
 import { isSupportedExchangeId } from "./exchanges.ts";
+import { createTradingStatus } from "./health.ts";
 import { orderApprovalLabel, t, translate } from "./i18n.ts";
 import { loginExchange, openTradingSettings } from "./settings-menu.ts";
 import { wrapTradingAutocomplete } from "./slash-autocomplete.ts";
@@ -13,7 +14,7 @@ import {
 	type TradingMode,
 } from "./state.ts";
 import { renderTradingTable, type TableData, type TableLine } from "./table.ts";
-import { formatTradingVenue, renderTradingVenue } from "./venue.ts";
+import { formatTradingVenue } from "./venue.ts";
 
 function fmt(n: number | undefined, decimals = 2): string {
 	if (n === undefined || !Number.isFinite(n)) return "-";
@@ -72,6 +73,11 @@ export function createTradingExtension() {
 	return (pi: ExtensionAPI): void => {
 		let lastObservedMode: TradingMode | undefined;
 		let modeAlertInFlight = false;
+		let statusStopped = false;
+		const status = createTradingStatus();
+		const updateStatus = (ctx: ExtensionContext): void => {
+			if (!statusStopped) status.update(ctx);
+		};
 
 		const observeMode = (ctx: ExtensionContext): void => {
 			const trading = getTrading();
@@ -102,6 +108,8 @@ export function createTradingExtension() {
 		};
 
 		pi.on("session_start", async (_event, ctx) => {
+			statusStopped = false;
+			status.dispose();
 			lastObservedMode = getTrading().mode;
 			observeMode(ctx);
 			const pending = getTrading().tradingEngine.risk.listPendingReservations();
@@ -123,10 +131,13 @@ export function createTradingExtension() {
 		pi.on("input", async (_event, ctx) => observeMode(ctx));
 		pi.on("turn_start", async (_event, ctx) => observeMode(ctx));
 		pi.on("turn_end", async (_event, ctx) => observeMode(ctx));
+		pi.on("tool_result", (_event, ctx) => updateStatus(ctx));
 		// InteractiveMode exits the process from its shutdown path, so code after
 		// `interactiveMode.run()` is not guaranteed to execute. Close the exchange
 		// client through the session lifecycle instead of relying on the caller.
 		pi.on("session_shutdown", async (event) => {
+			statusStopped = true;
+			status.dispose();
 			if (event.reason !== "quit") return;
 			await getTrading().close();
 		});
@@ -153,24 +164,8 @@ export function createTradingExtension() {
 
 		const tradingVenue = () => formatTradingVenue(tradingVenueInput());
 
-		const updateStatus = (ctx: ExtensionContext): void => {
-			ctx.ui.setStatus("trading-status", undefined);
-			if (!ctx.hasUI) return;
-			const input = tradingVenueInput();
-			if (ctx.mode !== "tui") {
-				const venue = formatTradingVenue(input);
-				ctx.ui.setWidget("trading-venue", [`${venue.identity}  ${venue.source}`]);
-				return;
-			}
-			ctx.ui.setWidget("trading-venue", () => ({
-				render: (width) => renderTradingVenue(input, ctx.ui.theme, width),
-				invalidate() {},
-			}));
-		};
-
 		let autocompleteWrapped = false;
 		pi.on("session_start", async (_event, ctx) => {
-			updateStatus(ctx);
 			if (ctx.hasUI && !autocompleteWrapped) {
 				ctx.ui.addAutocompleteProvider(wrapTradingAutocomplete);
 				autocompleteWrapped = true;
@@ -679,6 +674,7 @@ export function createTradingExtension() {
 					}
 					await waitForIdleBeforeMutation(ctx);
 					trading.tradingEngine.risk.reset();
+					updateStatus(ctx);
 					ctx.ui.notify(t(language, "riskResetDone"), "info");
 					return;
 				}
@@ -718,6 +714,7 @@ export function createTradingExtension() {
 						if (getTrading() !== trading || getTrading().tradingEngine !== engine)
 							throw new Error(t(language, "riskRuntimeChanged"));
 						engine.risk.reconcileReservation(id, outcome);
+						updateStatus(ctx);
 						ctx.ui.notify(
 							translate(
 								language,
@@ -845,11 +842,13 @@ export function createTradingExtension() {
 						if (getTrading() !== trading || trading.tradingEngine !== engine)
 							throw new Error(t(language, "riskRuntimeChanged"));
 						trading.resolveMaintenance(maintenance.id, parts[2]);
+						updateStatus(ctx);
 						ctx.ui.notify(t(language, "recoveryMaintenanceReleased"), "info");
 						return;
 					}
 					if (parts.length === 1 && parts[0] === "run") {
 						const report = await trading.recoverExecutions();
+						updateStatus(ctx);
 						show(t(language, "titleRecovery"), [
 							translate(language, "recoveryRunReport", {
 								examined: report.examined,
@@ -902,6 +901,7 @@ export function createTradingExtension() {
 						evidenceReference: parts[4],
 						verifiedTerminal: true,
 					});
+					updateStatus(ctx);
 					ctx.ui.notify(t(language, "recoveryReconciled"), "info");
 				} catch (error) {
 					ctx.ui.notify(error instanceof Error ? error.message : t(language, "recoveryFailed"), "error");
@@ -964,6 +964,7 @@ export function createTradingExtension() {
 				}
 				await waitForIdleBeforeMutation(ctx);
 				const applied = await trading.resetPaperAccount(startQuote, { confirmExposure: true });
+				updateStatus(ctx);
 				show(t(language, "titlePaper"), [
 					translate(language, "paperResetDone", {
 						amount: fmt(applied),
@@ -995,6 +996,7 @@ export function createTradingExtension() {
 					return;
 				}
 				await loginExchange(target, ctx);
+				updateStatus(ctx);
 			},
 		});
 	};

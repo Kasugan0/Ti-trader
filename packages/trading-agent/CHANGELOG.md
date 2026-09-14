@@ -11,9 +11,11 @@ All notable changes to `ti-trader` are documented in this file.
 
 ### Changed
 
+- Native trading tools use compact, localized summaries with original parameters and output available through tool expansion. Warnings, incomplete data, order identifiers and ambiguous execution outcomes remain visible.
+- Live order and OCO confirmation shows localized fields from the exact prepared plan, including price provenance, reserved quota and exchange constraints. TUI review defaults to cancellation and supports configurable paging and narrow layouts; RPC retains its confirmation protocol and submission policies are unchanged.
 - Paper futures now accepts the same limit and conditional order types as Paper spot. Prompts, tool descriptions and capability output no longer describe Paper futures as market-only. Futures OCO remains unsupported.
 - Trading query cards retain labeled fields and wrap narrow layouts instead of hiding order conditions or PnL. Market charts wrap Chinese explanations and use terminal display widths for styled content.
-- Live approval is visible beside the trading venue. A local health widget refreshes entry blocks and monitor observations every five seconds without exchange requests.
+- Venue, approval and local health share one cached status region, prioritizing entry blocks and degraded observations while preserving source information. Actual observation ages refresh every five seconds without exchange requests; pause and configuration changes refresh immediately.
 - Slash completion keeps common commands first while showing all available commands. Risk limits and allowed symbols are editable in Settings; the Agent TUI row prepares its built-in settings command in the editor.
 - Market-lab commands accept explicit candle limits and replay horizons. Screens retain per-symbol source, closed sample time and warnings, and distinguish partial failure, total failure and mixed market sources.
 - Rule replays enter at the next candle's open after a closed-bar signal and exit at the configured candle horizon. RSI entries require an observed transition into an extreme; zero-trade statistics are unavailable rather than zero.
@@ -21,6 +23,7 @@ All notable changes to `ti-trader` are documented in this file.
 
 ### Fixed
 
+- Trading tool presentation distinguishes preflight rejection or uncertainty from tool completion, and open or partially filled orders from completed fills, without using the generic success background for business failures.
 - Settings allowed-symbol edits drop empty tokens such as a trailing comma, instead of failing validation.
 - Live futures prompts no longer treat reduce-only conditionals as unconditionally available; the model must check `get_trading_capabilities`.
 - Market-lab replay percentage fields now return percentages (`10` for 10%) instead of fractions. Additive returns are explicitly distinguished from compounded or account returns.

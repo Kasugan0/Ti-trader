@@ -50,17 +50,7 @@ ti                          # 交互 TUI，默认模拟盘
 ti -p "分析 BTC 1h 走势"     # 一次性，无界面
 ```
 
-不要 `sudo npm install -g`。若出现 `EACCES`：
-
-```bash
-mkdir -p ~/.npm-global
-npm config set prefix "$HOME/.npm-global"
-echo 'export PATH="$HOME/.npm-global/bin:$PATH"' >> ~/.zshrc
-source ~/.zshrc
-npm install -g ti-trader
-```
-
-升级用 `npm install -g ti-trader@latest`。
+不要 `sudo npm install -g`；遇到 `EACCES` 把 npm prefix 指到 `~/.npm-global` 再重试。升级用 `npm install -g ti-trader@latest`。
 
 ## 第一次运行
 
@@ -72,7 +62,7 @@ npm install -g ti-trader
 | 4 | `/settings` — 语言、风控上限、市场、模拟资金、监控 |
 | 5 | 真要做实盘再用 `/exchange-login` |
 
-数据在 `~/.ti-trader/agent/`（`trading.json`、`keys.json`、会话）。不读写 Pi 的 `~/.pi`。长跑或隔离验收请设独立的 `TI_DATA_DIR`。
+数据在 `~/.ti-trader/agent/`（`trading.json`、`keys.json`、会话），不碰 Pi 的 `~/.pi`。隔离长跑请设独立的 `TI_DATA_DIR`。
 
 ## 常用命令
 
@@ -84,8 +74,6 @@ npm install -g ti-trader
 | `/risk pause` `/risk resume` | 暂停或恢复**新增**敞口。恢复必须交互确认 |
 | `/recovery` `/audit` `/health` | 未决执行、脱敏审计、本地开仓健康 |
 | `/exchange-login <id>` | 写入交易所 API key |
-| `/login` | 模型供应商 |
-| `/tui-settings` | Agent 界面 |
 
 `/trigger` 是实验性功能。live 触发器只通知，不会拉起交易回合。
 
@@ -95,7 +83,6 @@ npm install -g ti-trader
 - `get_trading_capabilities` 会返回 `supported`、`unsupported` 或 `unknown`。`unknown` 不能当成「大概可以」。
 - 缺 bid/ask、资金费率或未平仓量时返回 `null` 加 `warnings`，不会伪装成 `0`。
 - 可选研究扩展（`web-search`、`zhihu-research`、`market-research`、`subagent`、`freqtrade`）只在对应环境变量或 `--extension` 时加载，都不能下单。
-- 已发布 CLI 不等于生产验收完成。七天 Paper 长跑和任何实盘试点都要单独留证据。
 
 运维手册：[docs/trading-operations.md](docs/trading-operations.md)。设计：[packages/trading-agent/DESIGN.md](packages/trading-agent/DESIGN.md)。引擎契约：[packages/trading-engine/README.md](packages/trading-engine/README.md)。
 

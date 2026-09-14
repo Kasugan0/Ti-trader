@@ -50,17 +50,7 @@ ti                          # interactive TUI, paper
 ti -p "分析 BTC 1h 走势"     # one-shot, no TUI
 ```
 
-Do not `sudo npm install -g`. If npm reports `EACCES`:
-
-```bash
-mkdir -p ~/.npm-global
-npm config set prefix "$HOME/.npm-global"
-echo 'export PATH="$HOME/.npm-global/bin:$PATH"' >> ~/.zshrc
-source ~/.zshrc
-npm install -g ti-trader
-```
-
-Upgrade with `npm install -g ti-trader@latest`.
+Do not `sudo npm install -g`; on `EACCES`, set npm's prefix to `~/.npm-global` and retry. Upgrade with `npm install -g ti-trader@latest`.
 
 ## First session
 
@@ -72,7 +62,7 @@ Upgrade with `npm install -g ti-trader@latest`.
 | 4 | `/settings` — language, risk caps, market, paper balance, monitor |
 | 5 | `/exchange-login` only when you intend to trade live |
 
-State is `~/.ti-trader/agent/` (`trading.json`, `keys.json`, sessions). Ti does not read or write Pi's `~/.pi`. For a soak or an isolated check, set `TI_DATA_DIR` to a dedicated directory.
+State lives in `~/.ti-trader/agent/` (`trading.json`, `keys.json`, sessions); Pi's `~/.pi` is untouched. Set `TI_DATA_DIR` for an isolated soak.
 
 ## Commands you will actually use
 
@@ -84,8 +74,6 @@ State is `~/.ti-trader/agent/` (`trading.json`, `keys.json`, sessions). Ti does 
 | `/risk pause` `/risk resume` | Block or restore **new** exposure. Resume is interactive |
 | `/recovery` `/audit` `/health` | Unresolved executions, redacted history, local admission health |
 | `/exchange-login <id>` | Store exchange API keys |
-| `/login` | Model provider |
-| `/tui-settings` | Agent TUI chrome |
 
 `/trigger` is experimental. Live triggers notify only; they do not wake a trading turn.
 
@@ -95,7 +83,6 @@ State is `~/.ti-trader/agent/` (`trading.json`, `keys.json`, sessions). Ti does 
 - `get_trading_capabilities` returns `supported`, `unsupported` or `unknown`. `unknown` is not “probably fine”.
 - Missing bid/ask, funding, or open interest comes back as `null` plus `warnings`, never as `0`.
 - Optional research extensions (`web-search`, `zhihu-research`, `market-research`, `subagent`, `freqtrade`) load only when their env is set or you pass `--extension`. They cannot submit orders.
-- A published CLI is not a production-acceptance claim. A seven-day Paper soak and any live pilot still need their own evidence.
 
 Operator runbook: [docs/trading-operations.md](docs/trading-operations.md). Design: [packages/trading-agent/DESIGN.md](packages/trading-agent/DESIGN.md). Engine contract: [packages/trading-engine/README.md](packages/trading-engine/README.md).
 

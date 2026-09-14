@@ -1,22 +1,40 @@
 import { stripVTControlCharacters } from "node:util";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { ProcessTerminal, TuiMainScreen, visibleWidth } from "@earendil-works/pi-tui";
+import { type Component, ProcessTerminal, TuiMainScreen, visibleWidth } from "@earendil-works/pi-tui";
 import type { ExecutionMaintenance, ExecutionRecord, RiskNewExposurePause } from "@nikopack/ti-trading-engine";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createOperationalHealthExtension } from "../health.ts";
+import * as monitoringState from "../monitoring-state.ts";
+import type { TradingLanguage } from "../state.ts";
 import { renderTradingTable, type TableData } from "../table.ts";
 
 const trading = vi.hoisted(() => ({
 	mode: "paper" as const,
 	config: {
-		language: "en-US" as const,
+		language: "en-US" as TradingLanguage,
 		exchange: "okx",
 		marketType: "spot" as const,
 		quoteCurrency: "USDT",
 		orderApproval: "confirm" as "confirm" | "unattended",
+		monitor: { enabled: false },
 		risk: { maxOrderNotional: 500, maxDailyNotional: 2000, allowedSymbols: [] as string[] },
 	},
 	setMode: vi.fn(async (_mode: "paper" | "live") => {}),
 	setOrderApproval: vi.fn(async (_mode: "confirm" | "unattended") => {}),
+	setLanguage: vi.fn(async (_language: TradingLanguage) => {}),
+	getExecutionScope: () => ({
+		accountId: "commands-test",
+		mode: "paper",
+		exchange: "okx",
+		marketType: "spot",
+		quoteCurrency: "USDT",
+		positionMode: "one-way",
+	}),
+	getExecutionStatus: vi.fn(() => ({
+		unresolved: [],
+		maintenance: undefined,
+		admission: { stale: false },
+	})),
 	close: vi.fn(async () => {}),
 	resolveExecution: vi.fn(),
 	resolveMaintenance: vi.fn(),
@@ -102,14 +120,16 @@ interface RegisteredCommand {
 
 let shutdownHandler: ((event: { reason: "quit" | "reload" }) => Promise<void>) | undefined;
 const sessionStartHandlers: Array<(event: unknown, ctx: ExtensionCommandContext) => Promise<void>> = [];
+const eventHandlers = new Map<string, (event: unknown, ctx: ExtensionCommandContext) => Promise<void>>();
 const appendEntry = vi.fn();
 
-function registerCommands(): Map<string, RegisteredCommand> {
+function registerCommands(includeHealth = false): Map<string, RegisteredCommand> {
 	const commands = new Map<string, RegisteredCommand>();
 	const pi = {
 		on: vi.fn((event: string, handler: (event: unknown, ctx: ExtensionCommandContext) => Promise<void>) => {
 			if (event === "session_shutdown") shutdownHandler = handler as typeof shutdownHandler;
 			if (event === "session_start") sessionStartHandlers.push(handler);
+			else eventHandlers.set(event, handler);
 		}),
 		registerEntryRenderer: vi.fn(),
 		appendEntry,
@@ -117,6 +137,7 @@ function registerCommands(): Map<string, RegisteredCommand> {
 		registerCommand: vi.fn((name: string, command: RegisteredCommand) => commands.set(name, command)),
 	} as unknown as ExtensionAPI;
 	createTradingExtension()(pi);
+	if (includeHealth) createOperationalHealthExtension()(pi);
 	return commands;
 }
 
@@ -142,28 +163,54 @@ describe("trading commands", () => {
 		vi.clearAllMocks();
 		shutdownHandler = undefined;
 		sessionStartHandlers.length = 0;
+		eventHandlers.clear();
+		trading.config.language = "en-US";
+		trading.config.quoteCurrency = "USDT";
 		trading.config.orderApproval = "confirm";
+		trading.tradingEngine.risk.usage.mockReturnValue({
+			used: 0,
+			reserved: 100,
+			limit: 2000,
+			date: "2026-01-01",
+			resetPolicy: "manual",
+			newExposurePause: undefined,
+		});
 		trading.tradingEngine.listExecutions.mockReturnValue([]);
 		trading.tradingEngine.getExecutionStatus.mockReturnValue({ maintenance: undefined });
+		vi.spyOn(monitoringState, "createFileMonitoringStore").mockImplementation(() =>
+			monitoringState.createMemoryMonitoringStore(),
+		);
 	});
 
-	it("shows the exchange and market-data source above the editor", async () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+		vi.useRealTimers();
+	});
+
+	it("installs one cached widget for venue and health above the editor", async () => {
+		vi.useFakeTimers();
 		const ctx = commandContext(true);
-		registerCommands();
+		registerCommands(true);
 		for (const handler of sessionStartHandlers) await handler({}, ctx);
 		expect(ctx.ui.setStatus).toHaveBeenCalledWith("trading-status", undefined);
-		expect(ctx.ui.setWidget).toHaveBeenCalledWith("trading-venue", expect.any(Function));
+		expect(ctx.ui.setWidget).toHaveBeenCalledOnce();
+		expect(ctx.ui.setWidget).toHaveBeenCalledWith("trading-status", expect.any(Function));
 		const factory = vi.mocked(ctx.ui.setWidget).mock.calls.at(-1)?.[1];
 		if (typeof factory !== "function") throw new Error("Missing venue widget factory");
 		const widget = factory(new TuiMainScreen(new ProcessTerminal()), ctx.ui.theme);
-		expect(widget.render(80).map((line) => line.trim().replace(/ {2,}/g, "  "))).toEqual([
-			"[ PAPER ]  |  OKX  |  Spot  USDT  market data: OKX public",
-		]);
+		const text = widget.render(80).join("\n");
+		expect(text).toContain("[ PAPER ]");
+		expect(text).toContain("OKX");
+		expect(text).toContain("market data: OKX public");
+		expect(text).toContain("unsettled risk reservations");
+		expect(text).toContain("/health");
 		trading.tradingEngine.risk.usage.mockClear();
 		widget.render(40);
 		widget.invalidate();
 		widget.render(80);
 		expect(trading.tradingEngine.risk.usage).not.toHaveBeenCalled();
+		await shutdownHandler?.({ reason: "reload" });
+		expect(vi.getTimerCount()).toBe(0);
 	});
 
 	it.each([
@@ -191,13 +238,68 @@ describe("trading commands", () => {
 		}
 	});
 
-	it("keeps serializable venue text for RPC clients", async () => {
+	it("keeps serializable unified status text for RPC clients", async () => {
 		const ctx = { ...commandContext(true), mode: "rpc" as const };
 		registerCommands();
 		for (const handler of sessionStartHandlers) await handler({}, ctx);
-		expect(ctx.ui.setWidget).toHaveBeenCalledWith("trading-venue", [
-			"PAPER  OKX  Spot  USDT  market data: OKX public",
-		]);
+		expect(ctx.ui.setWidget).toHaveBeenCalledWith(
+			"trading-status",
+			expect.arrayContaining([
+				"PAPER  OKX  Spot  USDT  market data: OKX public",
+				"Entry blocks: unsettled risk reservations",
+			]),
+		);
+	});
+
+	it("refreshes language, configuration and tool results without reinstalling the TUI widget", async () => {
+		vi.useFakeTimers();
+		const ctx = commandContext(true);
+		const commands = registerCommands();
+		const tui = new TuiMainScreen(new ProcessTerminal());
+		vi.spyOn(tui, "requestRender").mockImplementation(() => {});
+		let widget: Component | undefined;
+		vi.mocked(ctx.ui.setWidget).mockImplementation((_key, factory) => {
+			if (typeof factory === "function") widget = factory(tui, ctx.ui.theme);
+		});
+		for (const handler of sessionStartHandlers) await handler({}, ctx);
+		trading.setLanguage.mockImplementationOnce(async (language) => {
+			trading.config.language = language;
+		});
+		await commands.get("language")!.handler("zh-CN", ctx);
+		if (!widget) throw new Error("Missing status widget");
+		expect(widget.render(80).join("\n")).toContain("模拟盘");
+		expect(widget.render(80).join("\n")).toContain("未结算风险占用");
+		trading.config.quoteCurrency = "USDC";
+		await eventHandlers.get("tool_result")?.({}, ctx);
+		expect(widget.render(80).join("\n")).toContain("USDC");
+		expect(ctx.ui.setWidget).toHaveBeenCalledOnce();
+		await shutdownHandler?.({ reason: "reload" });
+		const readsBeforeShutdown = trading.tradingEngine.risk.usage.mock.calls.length;
+		await eventHandlers.get("tool_result")?.({}, ctx);
+		vi.advanceTimersByTime(10_000);
+		expect(trading.tradingEngine.risk.usage).toHaveBeenCalledTimes(readsBeforeShutdown);
+		expect(ctx.ui.setWidget).toHaveBeenCalledOnce();
+		for (const handler of sessionStartHandlers) await handler({}, ctx);
+		expect(ctx.ui.setWidget).toHaveBeenCalledTimes(2);
+		expect(vi.getTimerCount()).toBe(1);
+		await shutdownHandler?.({ reason: "reload" });
+	});
+
+	it("renders a pause immediately, without waiting for the refresh timer or active turn", async () => {
+		const ctx = { ...commandContext(false), mode: "rpc" as const };
+		const commands = registerCommands();
+		for (const handler of sessionStartHandlers) await handler({}, ctx);
+		const usage = trading.tradingEngine.risk.usage();
+		trading.tradingEngine.risk.pauseNewExposure.mockImplementationOnce((reason) => {
+			const pause = { id: "pause-now", reason, pausedAt: new Date().toISOString() };
+			trading.tradingEngine.risk.usage.mockReturnValue({ ...usage, newExposurePause: pause });
+			return pause;
+		});
+		await commands.get("risk")!.handler("pause Inspect orders", ctx);
+		const latest = vi.mocked(ctx.ui.setWidget).mock.calls.at(-1)?.[1];
+		expect(JSON.stringify(latest)).toContain("PAUSED");
+		expect(ctx.waitForIdle).not.toHaveBeenCalled();
+		expect(ctx.ui.confirm).not.toHaveBeenCalled();
 	});
 
 	it("does not install a venue component in headless mode", async () => {

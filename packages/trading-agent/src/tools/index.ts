@@ -29,6 +29,7 @@ import {
 	createPlaceOcoTool,
 	createSellTool,
 } from "./orders.ts";
+import { createTradingToolRenderers } from "./render.ts";
 import type { TradingProvider } from "./shared.ts";
 
 export {
@@ -98,7 +99,7 @@ export const NATIVE_TRADING_TOOL_NAMES = [
 ] as const;
 
 export function createTradingTools(provider: TradingProvider = getTrading): ToolDefinition[] {
-	return [
+	const tools: ToolDefinition[] = [
 		createGetPriceTool(provider),
 		createGetOrderBookTool(provider),
 		createGetMarketInfoTool(provider),
@@ -125,4 +126,8 @@ export function createTradingTools(provider: TradingProvider = getTrading): Tool
 		createSetMarginModeTool(provider),
 		createSetMultiAssetsModeTool(provider),
 	];
+	return tools.map((tool) => ({
+		...tool,
+		...createTradingToolRenderers(tool.name, () => provider().config.language),
+	}));
 }

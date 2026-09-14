@@ -1,5 +1,4 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getTrading } from "./context.ts";
 import { type MenuKey, t, translate } from "./i18n.ts";
 import {
@@ -11,6 +10,7 @@ import {
 import { assessOperationalHealth } from "./operational-health.ts";
 import type { TradingLanguage } from "./state.ts";
 import { renderTradingTable, type TableData } from "./table.ts";
+import { formatTradingStatus, renderTradingVenue, type TradingVenueInput, type TradingVenueStatus } from "./venue.ts";
 
 const HEALTH_LABELS: Readonly<Partial<Record<string, MenuKey>>> = {
 	"new-exposure-paused": "healthPaused",
@@ -65,77 +65,141 @@ export function readOperationalHealth(store: MonitoringStore = createFileMonitor
 	});
 }
 
+function observationAge(language: TradingLanguage, ageMs: number | undefined): string {
+	if (ageMs === undefined || ageMs < 0) return "";
+	const seconds = Math.floor(ageMs / 1_000);
+	if (seconds < 60) return translate(language, "healthAgeSeconds", { age: seconds });
+	if (seconds < 3_600) return translate(language, "healthAgeMinutes", { age: Math.floor(seconds / 60) });
+	return translate(language, "healthAgeHours", { age: Math.floor(seconds / 3_600) });
+}
+
+function readTradingStatus(readHealth: typeof readOperationalHealth) {
+	const trading = getTrading();
+	const language = trading.config.language;
+	const input: TradingVenueInput = {
+		language,
+		mode: trading.mode,
+		exchangeId: trading.config.exchange,
+		marketType: trading.config.marketType,
+		quoteCurrency: trading.config.quoteCurrency,
+		orderApproval: trading.config.orderApproval,
+	};
+	let health: ReturnType<typeof readHealth>;
+	try {
+		// Keep identity and a successfully read pause even when monitoring state is untrusted.
+		input.paused = trading.tradingEngine.risk.usage().newExposurePause !== undefined;
+		health = readHealth();
+	} catch {
+		return {
+			input,
+			status: {
+				summary: `${t(language, "healthUnavailable")}  /health`,
+				tone: "error",
+				entryBlocked: false,
+			} satisfies TradingVenueStatus,
+		};
+	}
+	input.paused = health.blockers.includes("new-exposure-paused");
+	const active = health.observations.filter((item) => item.enabled);
+	const observations = active
+		.map((item) =>
+			[
+				`${healthLabel(language, item.source)}: ${healthLabel(language, item.status)}`,
+				observationAge(language, item.ageMs),
+				...(item.pendingNotifications
+					? [translate(language, "healthPendingShort", { count: item.pendingNotifications })]
+					: []),
+			]
+				.filter(Boolean)
+				.join(", "),
+		)
+		.join(" · ");
+	return {
+		input,
+		status: {
+			summary: health.entryBlocked
+				? translate(language, "healthEntryBlocks", {
+						blocks: health.blockers.map((block) => healthLabel(language, block)).join(", "),
+					})
+				: t(language, "healthNoEntryBlocks"),
+			observations: `${t(language, "monitor")}: ${observations || t(language, "healthDisabled")}  /health`,
+			tone: health.entryBlocked || active.some((item) => item.status !== "recent") ? "warning" : "muted",
+			entryBlocked: health.entryBlocked,
+			recoveryHint:
+				health.unresolvedExecutions > 0 ||
+				health.pendingReservations > 0 ||
+				health.blockers.includes("account-maintenance")
+					? t(language, "healthRecoveryHint")
+					: undefined,
+		} satisfies TradingVenueStatus,
+	};
+}
+
+/** One owner for venue and local health; rendering only consumes the refreshed snapshot. */
+export function createTradingStatus(readHealth = readOperationalHealth) {
+	let active:
+		| { ui: ExtensionContext["ui"]; mode: ExtensionContext["mode"]; refresh(): void; dispose(): void }
+		| undefined;
+	return {
+		update(ctx: ExtensionContext): void {
+			ctx.ui.setStatus("trading-status", undefined);
+			if (!ctx.hasUI) {
+				active?.dispose();
+				return;
+			}
+			if (active?.ui === ctx.ui && active.mode === ctx.mode) {
+				active.refresh();
+				return;
+			}
+			active?.dispose();
+			let snapshot = readTradingStatus(readHealth);
+			let disposed = false;
+			let timer: ReturnType<typeof setInterval> | undefined;
+			let requestRender: (() => void) | undefined;
+			const refresh = () => {
+				if (disposed) return;
+				const next = readTradingStatus(readHealth);
+				if (JSON.stringify(next) === JSON.stringify(snapshot)) return;
+				snapshot = next;
+				if (ctx.mode === "tui") requestRender?.();
+				else ctx.ui.setWidget("trading-status", formatTradingStatus(snapshot.input, snapshot.status));
+			};
+			const dispose = () => {
+				if (disposed) return;
+				disposed = true;
+				clearInterval(timer);
+				if (active?.dispose === dispose) active = undefined;
+			};
+			active = { ui: ctx.ui, mode: ctx.mode, refresh, dispose };
+			if (ctx.mode !== "tui") {
+				ctx.ui.setWidget("trading-status", formatTradingStatus(snapshot.input, snapshot.status));
+				return;
+			}
+			ctx.ui.setWidget("trading-status", (tui) => {
+				if (!disposed) {
+					requestRender = () => tui.requestRender();
+					clearInterval(timer);
+					timer = setInterval(refresh, HEALTH_REFRESH_MS);
+					timer.unref();
+				}
+				return {
+					render: (width) => renderTradingVenue(snapshot.input, ctx.ui.theme, width, snapshot.status),
+					invalidate() {},
+					dispose,
+				};
+			});
+		},
+		dispose(): void {
+			active?.dispose();
+		},
+	};
+}
+
 export function createOperationalHealthExtension(
 	readHealth = readOperationalHealth,
 	getLanguage: () => TradingLanguage = () => getTrading().config.language,
 ) {
 	return (pi: ExtensionAPI): void => {
-		let refreshStatus: (() => void) | undefined;
-		let disposeStatus: (() => void) | undefined;
-		pi.on("session_shutdown", () => disposeStatus?.());
-		pi.on("session_start", (_event, ctx) => {
-			if (ctx.mode !== "tui") return;
-			ctx.ui.setWidget("trading-health", (tui) => {
-				let text = "";
-				let color: "warning" | "error" | "muted" = "muted";
-				const refresh = () => {
-					const language = getLanguage();
-					let next: string;
-					let nextColor: typeof color;
-					try {
-						const health = readHealth();
-						const active = health.observations.filter((item) => item.enabled);
-						const observations =
-							active.length === 0
-								? t(language, "healthDisabled")
-								: active
-										.map(
-											(item) =>
-												`${healthLabel(language, item.source)}: ${healthLabel(language, item.status)}${item.pendingNotifications ? ` (${item.pendingNotifications})` : ""}`,
-										)
-										.join(" · ");
-						next = [
-							...(health.entryBlocked
-								? [
-										translate(language, "healthEntryBlocks", {
-											blocks: health.blockers.map((block) => healthLabel(language, block)).join(", "),
-										}),
-									]
-								: []),
-							`${t(language, "monitor")}: ${observations}  /health`,
-						].join("\n");
-						nextColor =
-							health.entryBlocked || active.some((item) => item.status !== "recent") ? "warning" : "muted";
-					} catch {
-						next = `${t(language, "healthUnavailable")}  /health`;
-						nextColor = "error";
-					}
-					if (next === text && nextColor === color) return;
-					text = next;
-					color = nextColor;
-					tui.requestRender();
-				};
-				refreshStatus = refresh;
-				refresh();
-				const timer = setInterval(refresh, HEALTH_REFRESH_MS);
-				timer.unref();
-				const dispose = () => {
-					clearInterval(timer);
-					if (refreshStatus === refresh) refreshStatus = undefined;
-					if (disposeStatus === dispose) disposeStatus = undefined;
-				};
-				disposeStatus = dispose;
-				return {
-					render: (width) => (width <= 0 ? [] : new Text(ctx.ui.theme.fg(color, text), 1, 0).render(width)),
-					invalidate() {},
-					dispose,
-				};
-			});
-		});
-		pi.on("turn_end", () => refreshStatus?.());
-		pi.on("tool_result", () => {
-			refreshStatus?.();
-		});
 		pi.registerEntryRenderer<TableData>("trading:health", (entry, _opts, theme) =>
 			renderTradingTable(entry.data ?? { title: "health", lines: [] }, theme),
 		);
@@ -161,12 +225,17 @@ export function createOperationalHealthExtension(
 							translate(language, "healthReservations", { count: health.pendingReservations }),
 							translate(language, "healthConnectivity", { status: localize(health.connectivity) }),
 							...health.observations.map((observation) =>
-								translate(language, "healthObservation", {
-									source: localize(observation.source),
-									status: localize(observation.status),
-									count: observation.pendingNotifications,
-									error: observation.errorCode ? `; ${observation.errorCode}` : "",
-								}),
+								[
+									translate(language, "healthObservation", {
+										source: localize(observation.source),
+										status: localize(observation.status),
+										count: observation.pendingNotifications,
+										error: observation.errorCode ? `; ${observation.errorCode}` : "",
+									}),
+									observationAge(language, observation.ageMs),
+								]
+									.filter(Boolean)
+									.join("; "),
 							),
 							t(language, "healthSemantics"),
 						],
