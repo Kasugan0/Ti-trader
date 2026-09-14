@@ -3,7 +3,8 @@ import { type Component, Text, truncateToWidth, visibleWidth } from "@earendil-w
 import { type MenuKey, t } from "./i18n.ts";
 import type { TradingLanguage } from "./state.ts";
 
-const TI_LOGO = [" _______  _ ", "|__   __|(_)", "   | |   | |", "   |_|   |_|"];
+const TI_STEM = "    ██     ██";
+const TI_LOGO = [" ████████  ██", TI_STEM, TI_STEM, TI_STEM];
 
 const EXPANDED_SHORTCUTS = [
 	["app.interrupt", "headerInterrupt"],
@@ -52,7 +53,10 @@ export class TradingHeader implements Component {
 		const details = [title, theme.fg("muted", t(language, "headerWorkspace")), "", commands];
 		const lines =
 			width >= 64
-				? TI_LOGO.map((line, index) => `${theme.fg("accent", line)}   ${details[index]}`)
+				? TI_LOGO.map((line, index) => {
+						const detail = details[index];
+						return detail ? `${theme.fg("muted", line)}   ${detail}` : theme.fg("muted", line);
+					})
 				: [title, theme.fg("muted", t(language, "headerWorkspace")), commands];
 		const hint = (key: string, description: string) => `${theme.fg("text", key)} ${theme.fg("muted", description)}`;
 		const clearKey = keyText("app.clear");

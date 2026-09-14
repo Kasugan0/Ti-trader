@@ -31,8 +31,9 @@ describe("Ti startup header", () => {
 		const header = new TradingHeader("0.2.1", () => ({ language: "en-US", theme: plainTheme }));
 		const lines = renderPlain(header, 100);
 		expect(lines).toHaveLength(5);
-		expect(lines[0]).toContain("_______");
+		expect(lines[0]).toContain(" ████████  ██");
 		expect(lines[0]).toContain("Ti  v0.2.1");
+		expect(lines[1]).toContain("██");
 		expect(lines[1]).toContain("Trading workspace");
 		expect(lines[3]).toContain("/settings   /model   /health");
 		expect(lines[4]).toContain("escape interrupt");
@@ -42,10 +43,19 @@ describe("Ti startup header", () => {
 	it("uses a compact wordmark on narrow terminals without losing command hints", () => {
 		const header = new TradingHeader("0.2.1", () => ({ language: "en-US", theme: plainTheme }));
 		const text = renderPlain(header, 40).join("\n");
-		expect(text).not.toContain("_______");
+		expect(text).not.toContain(" ████████  ██");
 		expect(text).toContain("Ti  v0.2.1");
 		for (const command of ["/settings", "/model", "/health"]) expect(text).toContain(command);
 		expect(text).toContain("ctrl+o more");
+	});
+
+	it("paints the wordmark muted gray instead of accent", () => {
+		const theme = getThemeByName("light");
+		if (!theme) throw new Error("Missing light theme");
+		const rendered = new TradingHeader("0.2.1", () => ({ language: "en-US", theme })).render(100).join("\n");
+		const wordmark = " ████████  ██";
+		expect(rendered).toContain(theme.fg("muted", wordmark));
+		expect(rendered).not.toContain(theme.fg("accent", wordmark));
 	});
 
 	it("reads current keybindings instead of hardcoding shortcut labels", () => {

@@ -11,6 +11,7 @@ All notable changes to `ti-trader` are documented in this file.
 
 ### Changed
 
+- Replaced the interactive Ti wordmark with a compact solid block mark in muted gray.
 - Native trading tools use compact, localized summaries with original parameters and output available through tool expansion. Warnings, incomplete data, order identifiers and ambiguous execution outcomes remain visible.
 - Live order and OCO confirmation shows localized fields from the exact prepared plan, including price provenance, reserved quota and exchange constraints. TUI review defaults to cancellation and supports configurable paging and narrow layouts; RPC retains its confirmation protocol and submission policies are unchanged.
 - Paper futures now accepts the same limit and conditional order types as Paper spot. Prompts, tool descriptions and capability output no longer describe Paper futures as market-only. Futures OCO remains unsupported.
