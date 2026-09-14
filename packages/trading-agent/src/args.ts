@@ -1,6 +1,8 @@
+import type { AutonomousCommand } from "./autonomous/daemon.ts";
 import type { TradingMode } from "./state.ts";
 
 export interface TradingArgs {
+	autonomous?: AutonomousCommand;
 	help: boolean;
 	version: boolean;
 	print: boolean;
@@ -27,6 +29,20 @@ export function parseTradingArgs(argv: string[]): TradingArgs {
 	for (let i = 0; i < argv.length; i++) {
 		const arg = argv[i];
 		switch (arg) {
+			case "--autonomous": {
+				const command = argv[++i];
+				if (
+					command !== "start" &&
+					command !== "run" &&
+					command !== "status" &&
+					command !== "pause" &&
+					command !== "resume" &&
+					command !== "stop"
+				)
+					throw new Error("--autonomous requires start|run|status|pause|resume|stop");
+				result.autonomous = command;
+				break;
+			}
 			case "-h":
 			case "--help":
 				result.help = true;
@@ -87,6 +103,13 @@ export function parseTradingArgs(argv: string[]): TradingArgs {
 	if (positional.length > 0) {
 		result.message = positional.join(" ");
 	}
+	if (
+		result.autonomous &&
+		(result.print || result.extensions.length || result.mode || result.exchange || result.message)
+	)
+		throw new Error(
+			"Autonomous mode uses its explicit configuration; do not combine it with print, extensions, overrides or a message",
+		);
 	return result;
 }
 
@@ -96,6 +119,7 @@ export function printHelp(): void {
 Usage: ti [options] [message...]
 
 Options:
+  --autonomous <action>   Explicit headless mode: start|run|status|pause|resume|stop
   --mode <paper|live>     Trading mode (default: from ~/.ti-trader/agent/trading.json, initially paper)
   --exchange <id>         ccxt exchange id, e.g. binance, okx (default: from config)
   -p, --print             Non-interactive: run once with the given message and exit

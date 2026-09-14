@@ -273,10 +273,30 @@ export interface FundingRateRecord {
 	markPrice?: number;
 }
 
+/** A complete, adapter-owned snapshot, never reconstructed from model messages. */
+export interface AccountSnapshot {
+	source: string;
+	epoch: string;
+	observedAt: number;
+	oldestPriceAt: number;
+	equity: number;
+	netExternalFlows: number;
+	marginUsed: number;
+	positions: Position[];
+	orders: Order[];
+	/** Mark/ticker observations used in valuation. */
+	prices: Record<string, { price: number; timestamp: number }>;
+	limitations: string[];
+}
+
 export interface ExchangeClient {
 	readonly id: string;
 	readonly mode: "paper" | "live";
 	readonly quoteCurrency: string;
+	/** Paper taker fee used for reservation preflight. Live adapters omit this. */
+	readonly feeRate?: number;
+	/** Omit unless complete equity, external flows, margin and order enumeration are supported. */
+	getAccountSnapshot?(): Promise<AccountSnapshot>;
 	getTicker(symbol: string): Promise<Ticker>;
 	getOrderBook(symbol: string, limit?: number): Promise<OrderBook>;
 	getMarketInfo(symbol: string): Promise<MarketInfo>;
@@ -291,6 +311,8 @@ export interface ExchangeClient {
 	getOrderList(orderListId: string): Promise<OrderList>;
 	getOrderListByClientId(listClientOrderId: string): Promise<OrderList>;
 	placeOrder(input: PlaceOrderInput): Promise<PlaceOrderResult>;
+	/** Commit removal of the listed reducing orders and the replacement together, or neither. */
+	replaceProtectiveOrders?(input: PlaceOrderInput, orderIds: string[]): Promise<PlaceOrderResult>;
 	placeOcoOrder(input: PlaceOcoOrderInput): Promise<PlaceOcoOrderResult>;
 	cancelOrder(id: string, symbol: string): Promise<void>;
 	cancelOrderList(orderListId: string, symbol: string): Promise<void>;
@@ -300,6 +322,8 @@ export interface ExchangeClient {
 	getFundingRateHistory(symbol: string, limit?: number): Promise<FundingRateRecord[]>;
 	/** Effective leverage applied to new futures orders for this symbol, when the adapter can report it. */
 	getEffectiveLeverage?(symbol: string): number;
+	getRiskSettings?(symbol: string): Promise<{ leverage: number; marginType: "isolated" | "cross" }>;
+	projectOpeningRisk?(input: PlaceOrderInput, referencePrice: number): Promise<{ liquidationDistancePct: number }>;
 	setLeverage(symbol: string, leverage: number): Promise<void>;
 	setMarginMode(symbol: string, marginType: "isolated" | "cross"): Promise<void>;
 	setMultiAssetsMode(enabled: boolean): Promise<void>;

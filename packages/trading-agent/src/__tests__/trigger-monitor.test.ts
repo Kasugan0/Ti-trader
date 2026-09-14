@@ -247,7 +247,7 @@ describe("trigger monitor", () => {
 		await add("change", {
 			kind: "change",
 			fact: { key: "price:BTC/USDT" },
-			windowSec: 60,
+			windowSec: 5,
 			operator: "gt",
 			value: 0,
 			unit: "absolute",
@@ -409,20 +409,18 @@ describe("trigger monitor", () => {
 		expect(waitForIdle).not.toHaveBeenCalled();
 	});
 
-	it("warns once and evaluates unsupported fact keys as unknown", async () => {
+	it("rejects unsupported fact keys when adding triggers", async () => {
 		vi.useFakeTimers();
 		vi.setSystemTime(NOW);
-		let start: ((ctx: ExtensionContext) => Promise<void>) | undefined;
 		const commands = new Map<string, Handler>();
 		const notify = vi.fn();
+		const store = createMemoryMonitoringStore();
 		const api = {
 			registerCommand: (name: string, value: { handler: Handler }) => commands.set(name, value.handler),
-			on: (event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void>) => {
-				if (event === "session_start") start = (sessionCtx) => handler({}, sessionCtx);
-			},
+			on: vi.fn(),
 			sendMessage: vi.fn(),
 		} as unknown as ExtensionAPI;
-		createTriggerMonitorExtension()(api);
+		createTriggerMonitorExtension(store)(api);
 		const ctx = { hasUI: true, mode: "tui", isIdle: () => true, ui: { notify } } as unknown as ExtensionContext;
 		const definition = {
 			id: "unknown",
@@ -432,10 +430,8 @@ describe("trigger monitor", () => {
 		// biome-ignore lint/suspicious/noThenProperty: public trigger action field
 		definition.then = { kind: "notify", message: "hit" };
 		await commands.get("trigger")?.(`add ${JSON.stringify(definition)}`, ctx);
-		await start?.(ctx);
-		await vi.advanceTimersByTimeAsync(5_000);
 		expect(notify).toHaveBeenCalledWith(expect.stringContaining('unsupported fact key "other:value"'), "warning");
-		expect(notify.mock.calls.filter(([message]) => String(message).includes("unsupported fact key")).length).toBe(1);
+		expect(store.read().scopes).toEqual([]);
 		vi.useRealTimers();
 	});
 });

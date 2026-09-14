@@ -1,0 +1,264 @@
+import { fork } from "node:child_process";
+import { closeSync, openSync } from "node:fs";
+import { join } from "node:path";
+import {
+	acquireFileLock,
+	type ExecutionScope,
+	RiskLedger,
+	readJsonFile,
+	releaseFileLock,
+	superviseAccountRisk,
+	validateAccountRiskLimits,
+	writeJsonFileDurable,
+} from "@nikopack/ti-trading-engine";
+import { AGENT_DIR, ensureAgentDir } from "../config.ts";
+import { TradingRuntime } from "../context.ts";
+import { createFileMonitoringStore, validateMonitoringScope } from "../monitoring-state.ts";
+import { loadTradingConfig, loadTradingState, saveTradingState, transactTradingState } from "../state.ts";
+import { loadAutonomousConfig } from "./config.ts";
+import { ModelProcess } from "./model-process.ts";
+import { AutonomousRuntime, failureCode, withDeadline } from "./runtime.ts";
+import { AutonomousStore } from "./state.ts";
+import { AutonomousTools } from "./tools.ts";
+
+export type AutonomousCommand = "start" | "run" | "status" | "pause" | "resume" | "stop";
+interface DaemonManifest {
+	version: 1;
+	scope: ExecutionScope;
+	pid: number;
+	startedAt: number;
+}
+const manifestPath = join(AGENT_DIR, "autonomous-process.json");
+
+function manifest(): DaemonManifest | undefined {
+	const value = readJsonFile(manifestPath);
+	if (value === undefined) return undefined;
+	if (
+		!value ||
+		typeof value !== "object" ||
+		!("scope" in value) ||
+		!("pid" in value) ||
+		!Number.isSafeInteger(value.pid) ||
+		Number(value.pid) <= 0 ||
+		!("version" in value) ||
+		value.version !== 1
+	)
+		throw new Error("Invalid autonomous process manifest");
+	validateMonitoringScope(value.scope);
+	return value as DaemonManifest;
+}
+function processExists(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		if (error && typeof error === "object" && "code" in error && error.code === "ESRCH") return false;
+		throw error;
+	}
+}
+
+export async function autonomousCommand(command: AutonomousCommand): Promise<void> {
+	ensureAgentDir();
+	if (command === "run") {
+		await runDaemon();
+		return;
+	}
+	const existing = manifest();
+	if (command === "start") {
+		const config = loadAutonomousConfig();
+		const tradingConfig = loadTradingConfig();
+		validateAccountRiskLimits(tradingConfig.risk.account);
+		if (existing && processExists(existing.pid)) throw new Error("Autonomous process is already running");
+		const logPath = join(AGENT_DIR, "autonomous.log");
+		const log = openSync(logPath, "a", 0o600);
+		const child = fork(process.argv[1], ["--autonomous", "run"], {
+			detached: true,
+			stdio: ["ignore", log, log, "ipc"],
+		});
+		closeSync(log);
+		try {
+			await withDeadline(
+				new Promise<void>((resolve, reject) => {
+					child.once("error", reject);
+					child.once("exit", (code) =>
+						reject(new Error(`Autonomous startup failed (${code}); inspect ${logPath}`)),
+					);
+					child.once("message", (message: unknown) => {
+						if (message && typeof message === "object" && "ready" in message && message.ready === true) resolve();
+						else reject(new Error("Autonomous startup did not acknowledge readiness"));
+					});
+				}),
+				config.serviceTimeoutMs * config.maxAttempts,
+				"autonomous-startup",
+			);
+		} catch (error) {
+			child.kill("SIGTERM");
+			throw error;
+		} finally {
+			if (child.connected) child.disconnect();
+			child.unref();
+		}
+		console.log(`Autonomous runtime started. pid=${child.pid} mode=${config.mode} log=${logPath}`);
+		return;
+	}
+	if (!existing) throw new Error("No autonomous runtime has been initialized");
+	const state = new AutonomousStore(createFileMonitoringStore(), existing.scope);
+	if (command === "status") {
+		const current = state.read();
+		console.log(
+			JSON.stringify(
+				{
+					mode: existing.scope.mode,
+					exchange: existing.scope.exchange,
+					marketType: existing.scope.marketType,
+					pid: existing.pid,
+					processAlive: processExists(existing.pid),
+					control: current.control,
+					heartbeat: current.heartbeat,
+					pendingEvents: current.events.length,
+					currentDecision: current.decision,
+					wakes: state.store
+						.read()
+						.scopes.find(
+							(scope) =>
+								scope.scope.accountId === existing.scope.accountId && scope.scope.mode === existing.scope.mode,
+						)?.triggers,
+					lastDecision: current.summaries.at(-1),
+					failures: current.failures.slice(-10),
+					risk: loadTradingState().accountRisk,
+					userPause: loadTradingState()[existing.scope.mode].newExposurePause,
+				},
+				null,
+				2,
+			),
+		);
+		return;
+	}
+	const config = loadTradingConfig(existing.scope.mode);
+	const risk = new RiskLedger(config, {
+		load: loadTradingState,
+		save: saveTradingState,
+		transact: transactTradingState,
+	});
+	if (command === "pause") {
+		risk.pauseNewExposure("User paused autonomous trading");
+		state.mutate((state) => {
+			state.control = "paused";
+		});
+		console.log(
+			"Model paused; new exposure blocked. Independent risk monitoring and existing protection remain active. No implicit cancellation or liquidation.",
+		);
+	} else if (command === "resume") {
+		if (!processExists(existing.pid)) throw new Error("Daemon is not running; start it before resuming");
+		const pause = risk.usage().newExposurePause;
+		if (pause) risk.resumeNewExposure(pause.id);
+		state.mutate((state) => {
+			state.control = "running";
+		});
+		state.enqueue({
+			id: `resume-${Date.now()}`,
+			kind: "start",
+			at: Date.now(),
+			message: "Operator resumed model decisions. Re-evaluate authoritative account and persistent risk state.",
+		});
+		console.log("Model resumed. Persistent loss trips and unresolved execution blocks are unchanged.");
+	} else {
+		state.mutate((state) => {
+			state.control = "stopped";
+		});
+		console.log(
+			"Stop requested. Model and daemon will stop; no orders are cancelled and no positions are closed. Exchange-native protection remains.",
+		);
+	}
+}
+
+export async function runDaemon(): Promise<void> {
+	const config = loadAutonomousConfig();
+	const tradingConfig = loadTradingConfig();
+	for (const key of ["mode", "exchange", "marketType", "quoteCurrency"] as const) {
+		if (tradingConfig[key] !== config[key]) throw new Error(`Autonomous scope does not match trading.json: ${key}`);
+	}
+	validateAccountRiskLimits(tradingConfig.risk.account);
+	if (tradingConfig.orderApproval !== "unattended")
+		throw new Error("Autonomous trading requires explicit orderApproval: unattended");
+	// Existing live adapters do not expose complete cash-flow and fee evidence.
+	// Refuse before loading exchange credentials rather than running with a fake loss budget.
+	if (config.mode === "live")
+		throw new Error(
+			"Live autonomous mode is unavailable: current adapters lack complete external-flow, fee and funding evidence required by account hard risk",
+		);
+	const lock = await acquireFileLock(join(AGENT_DIR, "autonomous-daemon.lock"), {
+		staleMs: Infinity,
+		reclaimDeadOwner: true,
+		timeoutMs: config.serviceTimeoutMs,
+	});
+	let trading: TradingRuntime | undefined;
+	let monitor: TradingRuntime | undefined;
+	let runtime: AutonomousRuntime | undefined;
+	const abort = new AbortController();
+	const stop = (): void => abort.abort(new Error("Daemon termination requested"));
+	process.on("SIGTERM", stop);
+	process.on("SIGINT", stop);
+	try {
+		trading = await TradingRuntime.init();
+		monitor = await TradingRuntime.init();
+		const scope = trading.getExecutionScope();
+		const state = new AutonomousStore(createFileMonitoringStore(), scope);
+		const model = new ModelProcess(config, AGENT_DIR, new AutonomousTools(trading.tradingEngine, state, config));
+		const monitorEngine = monitor.tradingEngine;
+		runtime = new AutonomousRuntime({
+			state,
+			config,
+			model,
+			supervise: () =>
+				superviseAccountRisk(monitorEngine, {
+					timeoutMs: config.serviceTimeoutMs,
+					protectionAttempts: config.protectionAttempts,
+				}),
+			ticker: (symbol) => monitorEngine.getTicker(symbol),
+			block: (reason) => monitorEngine.accountRisk!.block(reason),
+			recover: async () => {
+				await trading!.recoverExecutions();
+				await withDeadline(
+					monitorEngine.accountRisk!.inspect(),
+					config.serviceTimeoutMs,
+					"startup-account-observation",
+				);
+			},
+		});
+		await runtime.initialize();
+		const previous = state.read();
+		// An explicit stop can be restarted. A persisted pause is never cleared by startup.
+		state.mutate((state) => {
+			if (trading!.tradingEngine.risk.usage().newExposurePause) state.control = "paused";
+			else if (state.control === "stopped") state.control = "running";
+			state.pid = process.pid;
+			state.heartbeat = Date.now();
+		});
+		if (!previous.decision) runtime.startEvent();
+		writeJsonFileDurable(manifestPath, { version: 1, scope, pid: process.pid, startedAt: Date.now() }, 0o600);
+		process.send?.({ ready: true });
+		await runtime.run(abort.signal);
+	} catch (error) {
+		console.error(`[autonomous] ${failureCode(error)}`);
+		throw new Error(
+			`Autonomous runtime failed: ${failureCode(error)}; inspect persisted status and execution records`,
+		);
+	} finally {
+		process.removeListener("SIGTERM", stop);
+		process.removeListener("SIGINT", stop);
+		try {
+			await runtime?.stop();
+		} finally {
+			try {
+				await withDeadline(
+					Promise.all([trading?.close(), monitor?.close()]),
+					config.serviceTimeoutMs,
+					"trading-shutdown",
+				);
+			} finally {
+				releaseFileLock(lock);
+			}
+		}
+	}
+}

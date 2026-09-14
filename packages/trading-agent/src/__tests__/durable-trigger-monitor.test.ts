@@ -14,6 +14,7 @@ vi.mock("../context.ts", () => ({ getTrading: () => runtime }));
 import {
 	createMemoryMonitoringStore,
 	enqueueMonitoringNotification,
+	ensureMonitoringScope,
 	MONITORING_MAX_AGE_MS,
 	type MonitoringScope,
 	type MonitoringStore,
@@ -83,6 +84,8 @@ beforeEach(() => {
 	runtime.config.monitor.intervalSec = 5;
 	runtime.marketData.getTicker.mockClear();
 	runtime.marketData.getTicker.mockImplementation(async () => ({ last: 101, timestamp: Date.now() }));
+	runtime.tradingEngine.getPositions.mockClear();
+	runtime.tradingEngine.getPositions.mockImplementation(async (): Promise<Position[]> => []);
 });
 afterEach(() => {
 	vi.clearAllTimers();
@@ -346,6 +349,48 @@ describe("durable trigger monitor", () => {
 		expect(restarted.sendMessage).toHaveBeenCalledOnce();
 	});
 
+	it("persists change history across restart and requires a full window baseline", async () => {
+		const store = createMemoryMonitoringStore();
+		let price = 100;
+		runtime.marketData.getTicker.mockImplementation(async () => ({ last: price, timestamp: Date.now() }));
+		const condition: Condition = {
+			kind: "change",
+			fact: { key: "price:BTC/USDT" },
+			windowSec: 60,
+			operator: "gte",
+			value: 10,
+			unit: "absolute",
+		};
+		const first = harness(store);
+		await first.add(definition(condition));
+		await first.start();
+		await first.stop();
+		vi.setSystemTime(NOW + 5_000);
+		price = 110;
+		const tooSoon = harness(store);
+		await tooSoon.start();
+		expect(tooSoon.sendMessage).not.toHaveBeenCalled();
+		expect(store.read().scopes[0].facts[0]).toEqual({ key: "price:BTC/USDT", value: 110, observedAt: NOW + 5_000 });
+		expect(store.read().scopes[0].factHistory).toEqual([
+			{ key: "price:BTC/USDT", samples: [{ value: 100, observedAt: NOW }] },
+		]);
+		store.transact((state) => {
+			const entry = state.scopes[0];
+			entry.facts = entry.facts.filter((fact) => fact.key !== "price:BTC/USDT");
+			entry.facts.push({ key: "price:BTC/USDT", value: 112, observedAt: NOW + 30_000 });
+		});
+		expect(store.read().scopes[0].factHistory).toEqual([
+			{ key: "price:BTC/USDT", samples: [{ value: 100, observedAt: NOW }] },
+		]);
+		await tooSoon.stop();
+		vi.setSystemTime(NOW + 65_000);
+		price = 120;
+		const matured = harness(store);
+		await matured.start();
+		expect(matured.sendMessage).toHaveBeenCalledOnce();
+		expect(store.read().scopes[0].triggers[0].state.status).toBe("fired");
+	});
+
 	it.each(["stale", "future"] as const)("does not persist a %s observation as a crossing baseline", async (kind) => {
 		const store = createMemoryMonitoringStore();
 		runtime.marketData.getTicker.mockImplementation(async () => ({
@@ -370,6 +415,51 @@ describe("durable trigger monitor", () => {
 		await monitor.start();
 		await vi.advanceTimersByTimeAsync(15_000);
 		expect(monitor.sendMessage).toHaveBeenCalledOnce();
+	});
+
+	it("treats unqualified hedge PnL facts as unknown and supports explicit sides", async () => {
+		const store = createMemoryMonitoringStore();
+		runtime.tradingEngine.getPositions.mockImplementation(async () => [
+			{
+				symbol: "BTC/USDT",
+				asset: "BTC",
+				amount: 1,
+				positionSide: "LONG",
+				unrealizedPnlPct: 2,
+			},
+			{
+				symbol: "BTC/USDT",
+				asset: "BTC",
+				amount: -1,
+				positionSide: "SHORT",
+				unrealizedPnlPct: -1,
+			},
+		]);
+		const ambiguous = harness(store);
+		await ambiguous.add(
+			definition({ kind: "compare", fact: { key: "position_pnl_pct:BTC/USDT" }, operator: "gt", value: 0 }),
+		);
+		await ambiguous.start();
+		expect(ambiguous.sendMessage).not.toHaveBeenCalled();
+		expect(ambiguous.notify).toHaveBeenCalledWith(expect.stringContaining("ambiguous position fact"), "warning");
+		await ambiguous.stop();
+		const explicit = harness(createMemoryMonitoringStore());
+		await explicit.add(
+			definition({ kind: "compare", fact: { key: "position_pnl_pct:BTC/USDT:LONG" }, operator: "gt", value: 0 }),
+		);
+		await explicit.start();
+		expect(explicit.sendMessage).toHaveBeenCalledOnce();
+	});
+
+	it("rejects unsupported monitor fact keys at add time", async () => {
+		const store = createMemoryMonitoringStore();
+		const monitor = harness(store);
+		await monitor.add(definition({ kind: "compare", fact: { key: "other:value" }, operator: "gt", value: 0 }));
+		expect(monitor.notify).toHaveBeenCalledWith(
+			expect.stringContaining('unsupported fact key "other:value"'),
+			"warning",
+		);
+		expect(store.read().scopes).toEqual([]);
 	});
 
 	it("atomically transitions and delivers only once with two concurrent monitors", async () => {
@@ -444,6 +534,41 @@ describe("durable trigger monitor", () => {
 		await live.start();
 		expect(live.sendMessage).not.toHaveBeenCalled();
 		expect(store.read().scopes[0].triggers).toHaveLength(1);
+	});
+
+	it("does not evaluate or mutate autonomous-owned triggers from the interactive monitor", async () => {
+		const store = createMemoryMonitoringStore();
+		store.transact((state) => {
+			const entry = ensureMonitoringScope(state, SCOPE, NOW);
+			entry.autonomous = {
+				version: 1,
+				control: "stopped",
+				events: [],
+				receipts: {},
+				sequence: 0,
+				triggerIds: ["autonomous-wake"],
+				summaries: [],
+				failures: [],
+			};
+			entry.triggers.push({
+				definition: {
+					...definition(),
+					id: "autonomous-wake",
+					name: "autonomous wake",
+					// biome-ignore lint/suspicious/noThenProperty: public trigger action field
+					then: { kind: "wake_agent", message: "autonomous" },
+				},
+				revision: "autonomous-revision",
+				state: { status: "active", armed: true },
+				updatedAt: NOW,
+			});
+		});
+		const monitor = harness(store);
+		await monitor.add(definition(undefined, { mode: "once" }));
+		await monitor.start();
+		expect(monitor.sendMessage.mock.calls.map(([message]) => message.content)).toEqual(["[trigger:price] review"]);
+		await monitor.command("clear");
+		expect(store.read().scopes[0].triggers.map((trigger) => trigger.definition.id)).toEqual(["autonomous-wake"]);
 	});
 
 	it("does not advance state or notify when the atomic transition write fails", async () => {

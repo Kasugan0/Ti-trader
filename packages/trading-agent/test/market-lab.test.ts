@@ -1,10 +1,12 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import marketLabExtension, {
 	analyze,
 	binanceSymbol,
 	fetchCandles,
+	type MarketLabCandleProvider,
 	parseLabArgs,
+	parseReplayArgs,
 	parseScreenArgs,
 	screenMarkets,
 	sessionSymbol,
@@ -52,6 +54,7 @@ function fallingCandles(count: number): Candle[] {
 
 afterEach(() => {
 	vi.restoreAllMocks();
+	vi.useRealTimers();
 	setMarketLabCandleProvider(undefined);
 });
 
@@ -102,6 +105,92 @@ describe("market-lab", () => {
 		expect(fetchSpy).not.toHaveBeenCalled();
 		expect(result.source).toEqual({ venue: "okx", market: "spot", kind: "session-klines", mode: "paper" });
 		expect(result.warnings[0]).toContain("okx");
+	});
+
+	it("rejects invalid direct limits instead of clamping before fetching", async () => {
+		const provider = vi.fn(async () => ({
+			candles: flatCandles(20),
+			source: { venue: "okx", market: "spot" as const, kind: "session-klines" as const },
+		}));
+		setMarketLabCandleProvider(provider);
+		await expect(fetchCandles({ symbol: "BTC/USDT", timeframe: "1h", limit: 19 })).rejects.toThrow(
+			"Invalid limit: integer 20-200 required",
+		);
+		await expect(fetchCandles({ symbol: "BTC/USDT", timeframe: "1h", limit: 201 })).rejects.toThrow(
+			"Invalid limit: integer 20-200 required",
+		);
+		expect(provider).not.toHaveBeenCalled();
+	});
+
+	it("propagates cancellation and enforces provider candle limits", async () => {
+		const provider = vi.fn(async () => ({
+			candles: flatCandles(21),
+			source: { venue: "okx", market: "spot" as const, kind: "session-klines" as const },
+		}));
+		setMarketLabCandleProvider(provider);
+		const controller = new AbortController();
+		controller.abort();
+		await expect(fetchCandles({ symbol: "BTC/USDT", timeframe: "1h", limit: 20 }, controller.signal)).rejects.toThrow(
+			"Market data request timed out or was cancelled",
+		);
+		expect(provider).not.toHaveBeenCalled();
+
+		await expect(fetchCandles({ symbol: "BTC/USDT", timeframe: "1h", limit: 20 })).rejects.toThrow(
+			"Market data provider returned 21 candles; requested limit 20",
+		);
+		expect(provider).toHaveBeenCalledTimes(1);
+	});
+
+	it("stops waiting for a provider that cannot cancel its underlying request", async () => {
+		let resolveProvider: ((value: Awaited<ReturnType<MarketLabCandleProvider>>) => void) | undefined;
+		const provider = vi.fn(
+			() =>
+				new Promise<Awaited<ReturnType<MarketLabCandleProvider>>>((resolve) => {
+					resolveProvider = resolve;
+				}),
+		);
+		setMarketLabCandleProvider(provider);
+		const controller = new AbortController();
+		const pending = fetchCandles({ symbol: "BTC/USDT", timeframe: "1h", limit: 20 }, controller.signal);
+		await Promise.resolve();
+		controller.abort();
+		await expect(pending).rejects.toThrow("Market data request timed out or was cancelled");
+		expect(provider).toHaveBeenCalledTimes(1);
+		resolveProvider?.({
+			candles: flatCandles(20),
+			source: { venue: "okx", market: "spot", kind: "session-klines" },
+		});
+	});
+
+	it("times out a provider without leaving the caller waiting indefinitely", async () => {
+		vi.useFakeTimers();
+		setMarketLabCandleProvider(() => new Promise(() => {}));
+		const pending = fetchCandles({ symbol: "BTC/USDT", limit: 20 });
+		const rejected = expect(pending).rejects.toThrow("timed out");
+		await vi.advanceTimersByTimeAsync(10_000);
+		await rejected;
+	});
+
+	it("limits public data and reports the actual closed sample interval", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(22 * 3_600_000);
+		const rows = flatCandles(21).map((candle) => [
+			candle.timestamp,
+			candle.open,
+			candle.high,
+			candle.low,
+			candle.close,
+			candle.volume,
+		]);
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValue(new Response(JSON.stringify(rows), { status: 200 }));
+		const result = await fetchCandles({ symbol: "BTC/USDT", limit: 20, timeframe: "1h" });
+		expect(result.candles).toHaveLength(20);
+		expect(result.startedAt).toBe(new Date(2 * 3_600_000).toISOString());
+		expect(result.closedThrough).toBe(new Date(22 * 3_600_000).toISOString());
+		fetchSpy.mockResolvedValue(new Response(JSON.stringify([...rows, rows[0]]), { status: 200 }));
+		await expect(fetchCandles({ symbol: "BTC/USDT", limit: 20 })).rejects.toThrow("exceeded");
 	});
 
 	it("calculates stable indicators after enough candles", () => {
@@ -237,10 +326,25 @@ describe("market-lab", () => {
 		});
 		expect(parseLabArgs("BTC/USDT macd-hist")).toEqual({
 			symbol: "BTC/USDT",
-			timeframe: undefined,
 			preset: "macd-hist",
 		});
+		expect(parseLabArgs("BTC/USDT limit=80")).toEqual({
+			symbol: "BTC/USDT",
+			limit: 80,
+		});
+		expect(parseLabArgs("BTC/USDT horizon=3").error).toMatch(/only supported by \/replay/);
 		expect(parseLabArgs("BTC/USDT 2h bogus").error).toMatch(/Unknown argument/);
+	});
+
+	it("parses /replay limit and horizon arguments", () => {
+		expect(parseReplayArgs("BTC/USDT 1h rsi-revert limit=80 horizon=3")).toEqual({
+			symbol: "BTC/USDT",
+			timeframe: "1h",
+			preset: "rsi-revert",
+			limit: 80,
+			horizon: 3,
+		});
+		expect(parseReplayArgs("BTC/USDT horizon=0").error).toBe("Invalid horizon: integer 1-20 required");
 	});
 
 	it("passes the selected preset through analyze", async () => {
@@ -267,6 +371,10 @@ describe("market-lab", () => {
 			timeframe: "1h",
 			preset: "rsi-revert",
 		});
+		expect(parseScreenArgs("BTC/USDT ETH/USDT limit=50")).toEqual({
+			symbols: ["BTC/USDT", "ETH/USDT"],
+			limit: 50,
+		});
 		expect(parseScreenArgs("1h").error).toMatch(/Usage: \/screen/);
 	});
 
@@ -276,7 +384,7 @@ describe("market-lab", () => {
 			if (url.includes("symbol=BADUSDT")) {
 				return new Response("nope", { status: 400, headers: { "content-type": "application/json" } });
 			}
-			const series = url.includes("symbol=ETHUSDT") ? fallingCandles(41) : flatCandles(61);
+			const series = url.includes("symbol=ETHUSDT") ? fallingCandles(41) : flatCandles(41);
 			const rows = series.map((candle) => [
 				candle.timestamp,
 				candle.open,
@@ -293,11 +401,16 @@ describe("market-lab", () => {
 			limit: 40,
 			preset: "rsi-revert",
 		});
+		expect(result.status).toBe("partial-failure");
+		expect(result.requested).toBe(4);
 		expect(result.scanned).toBe(3);
 		expect(result.failed).toBe(1);
+		expect(result.duplicates).toEqual(["ETH/USDT"]);
 		expect(result.rows.find((row) => row.symbol === "ETH/USDT")).toMatchObject({
 			event: "oversold",
 			bias: "bullish",
+			candleCount: 40,
+			closedThrough: new Date(42 * 3_600_000).toISOString(),
 		});
 		expect(result.rows.find((row) => row.symbol === "BTC/USDT")).toMatchObject({
 			event: "mid-range",
@@ -306,6 +419,58 @@ describe("market-lab", () => {
 		expect(result.rows.at(-1)).toMatchObject({ symbol: "BAD/USDT" });
 		expect(typeof result.rows.at(-1)?.error).toBe("string");
 		expect(result.warnings).toContain("This is a read-only scan; no order was created.");
+		expect(result.warnings).toContain("Duplicate symbols skipped after normalization: ETH/USDT");
+	});
+
+	it("reports all screen failures without fabricating a source", async () => {
+		vi.spyOn(globalThis, "fetch").mockResolvedValue(
+			new Response("nope", { status: 400, headers: { "content-type": "application/json" } }),
+		);
+		const result = await screenMarkets({
+			symbols: ["BAD/USDT", "NOPE/USDT"],
+			timeframe: "1h",
+			limit: 20,
+			preset: "ema-cross",
+		});
+		expect(result.status).toBe("failed");
+		expect(result.source).toBeNull();
+		expect(result.failed).toBe(2);
+		expect(result.warnings[0]).toBe("Every symbol failed; no market data source was confirmed.");
+	});
+
+	it("does not stamp a mixed spot and futures scan with the first row's market", async () => {
+		setMarketLabCandleProvider(async ({ symbol }) => ({
+			candles: flatCandles(60),
+			source: { venue: "binance", market: symbol.includes(":") ? "swap" : "spot", kind: "session-klines" },
+		}));
+		const result = await screenMarkets({ symbols: ["BTC/USDT", "BTC/USDT:USDT"], limit: 60 });
+		expect(result.source).toBeNull();
+		expect(result.rows.map((row) => row.source?.market).sort()).toEqual(["spot", "swap"]);
+		expect(result.warnings[0]).toContain("different market data sources");
+	});
+
+	it("passes command options and cancellation to replay and screen without trading", async () => {
+		const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+		const api: Pick<ExtensionAPI, "registerTool" | "registerCommand"> = {
+			registerTool: vi.fn(),
+			registerCommand: (name, options) => {
+				commands.set(name, options);
+			},
+		};
+		marketLabExtension(api as ExtensionAPI);
+		const notify = vi.fn();
+		const controller = new AbortController();
+		const ctx = { signal: controller.signal, ui: { notify } } as unknown as ExtensionCommandContext;
+		const provider = vi.fn<MarketLabCandleProvider>(async ({ limit }) => ({
+			candles: flatCandles(limit),
+			source: { venue: "okx", market: "spot", kind: "session-klines" },
+		}));
+		setMarketLabCandleProvider(provider);
+		await commands.get("replay")!.handler("BTC/USDT 1h limit=60 horizon=3", ctx);
+		expect(JSON.parse(notify.mock.calls[0][0])).toMatchObject({ horizon: 3, candleCount: 60 });
+		controller.abort();
+		await expect(commands.get("screen")!.handler("BTC/USDT 1h limit=60", ctx)).rejects.toThrow("cancelled");
+		expect(provider).toHaveBeenCalledTimes(1);
 	});
 
 	it("replays only discrete events and ignores persistent above/below states", () => {
@@ -327,21 +492,70 @@ describe("market-lab", () => {
 		expect(replay.tradeCount).toBe(1);
 		expect(replay.longs).toBe(1);
 		expect(replay.trades[0]?.event).toBe("cross-up");
-		expect(replay.trades[0]?.returnPct).toBe(0.1);
+		expect(replay.trades[0]).toMatchObject({ signalIndex: 2, entryIndex: 3, exitIndex: 4 });
+		expect(replay.trades[0]?.entry).toBe(100);
+		expect(replay.trades[0]?.exit).toBe(110);
+		expect(replay.trades[0]?.returnPct).toBe(10);
+		expect(replay.avgReturnPct).toBe(10);
+		expect(replay.sumReturnPct).toBe(10);
 		expect(replay.winRate).toBe(1);
 		expect(replay.warnings).toContain("Closed-candle rule replay only; not a backtest.");
 		expect(replay).not.toHaveProperty("order");
 	});
 
-	it("takes a non-overlapping rsi-revert replay on a falling series", () => {
+	it("does not invent an RSI transition when the first available RSI is already oversold", () => {
 		const series = fallingCandles(40);
 		const replay = simulateRule(calculateIndicators(series), series, "rsi-revert", undefined, 5);
-		expect(replay.tradeCount).toBeGreaterThan(0);
-		expect(replay.longs).toBe(replay.tradeCount);
-		expect(replay.trades.every((trade) => trade.event === "oversold")).toBe(true);
+		expect(replay.tradeCount).toBe(0);
+		expect(replay.winRate).toBeNull();
+	});
+
+	it("reopens RSI only after a known non-extreme state and keeps trades non-overlapping", () => {
+		const series = flatCandles(20);
+		const points = series.map((candle, index) => ({
+			timestamp: candle.timestamp,
+			close: candle.close,
+			rsi: index === 0 || index === 9 ? 50 : 20,
+		}));
+		const replay = simulateRule(points, series, "rsi-revert", undefined, 5);
+		expect(replay.trades.map((trade) => trade.signalIndex)).toEqual([1, 10]);
+		expect(replay.longs).toBe(2);
+		expect(replay.warnings).toContain(
+			"RSI replay opens only on transitions into oversold or overbought states; continuous extremes are not reopened until the state resets.",
+		);
 		const opens = replay.trades.map((trade) => trade.index);
 		for (let index = 1; index < opens.length; index++) {
 			expect(opens[index] - opens[index - 1]).toBeGreaterThanOrEqual(5);
 		}
+	});
+
+	it("does not change a completed replay trade when only later candles change", () => {
+		const series = flatCandles(8);
+		const points = series.map((candle, index) => ({
+			timestamp: candle.timestamp,
+			close: candle.close,
+			emaFast: index === 2 ? 3 : 1,
+			emaSlow: 2,
+		}));
+		const original = simulateRule(points, series, "ema-cross", undefined, 2);
+		const later = series.map((candle, index) =>
+			index > 4 ? { ...candle, open: 150, high: 200, close: 170 } : candle,
+		);
+		expect(simulateRule(points, later, "ema-cross", undefined, 2).trades[0]).toEqual(original.trades[0]);
+	});
+
+	it("reports insufficient replay samples and keeps zero-trade stats null", () => {
+		const series = candles(20);
+		const replay = simulateRule(calculateIndicators(series), series, "ema-cross", undefined, 5);
+		expect(replay.tradeCount).toBe(0);
+		expect(replay.winRate).toBeNull();
+		expect(replay.avgReturnPct).toBeNull();
+		expect(replay.bestReturnPct).toBeNull();
+		expect(replay.worstReturnPct).toBeNull();
+		expect(replay.sumReturnPct).toBe(0);
+		expect(replay.warnings.some((warning) => warning.includes("Not enough closed candles"))).toBe(true);
+		expect(replay.warnings).toContain(
+			"No replay trades opened; winRate, avgReturnPct, bestReturnPct, and worstReturnPct are null.",
+		);
 	});
 });

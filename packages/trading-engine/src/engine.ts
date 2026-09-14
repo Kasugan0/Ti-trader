@@ -1,10 +1,12 @@
 import {
+	assessLeverageSetting,
 	type RiskClock,
 	type RiskConfig,
 	RiskLedger,
 	type RiskReservation,
 	type RiskStateStore,
 } from "@nikopack/ti-trading-risk";
+import { AccountRiskGuard } from "./account-risk.ts";
 import type { FuturesPositionMode } from "./client-types.ts";
 import {
 	ExecutionJournal,
@@ -33,6 +35,7 @@ import {
 } from "./order-plan.ts";
 import { preflightOco, preflightOrder } from "./order-preflight.ts";
 import {
+	type Balance,
 	createMarketDataView,
 	type ExchangeClient,
 	isSubmissionStatusUnknownError,
@@ -41,6 +44,7 @@ import {
 	type OrderList,
 	type OrderSide,
 	type PlaceOcoOrderResult,
+	type PlaceOrderInput,
 	type PlaceOrderResult,
 	SubmissionRejectedError,
 } from "./types.ts";
@@ -55,6 +59,12 @@ export class PreparedPlanError extends Error {
 }
 
 export interface TradingEngineSubmissionPolicy {
+	/** Stable logical action identity, preserved across model turn retries and restarts. */
+	intentId?: string;
+	timeoutMs?: number;
+	protectionStopPrice?: number;
+	/** Engine-validated atomic protection replacement or full protected close. */
+	replacementIds?: string[];
 	confirm?(summary: string): Promise<boolean>;
 	/** Explicitly opt into headless live submission without a confirmation callback. */
 	allowUnconfirmedLive?: boolean;
@@ -100,6 +110,7 @@ export class TradingEngine {
 	private readonly inFlightPlans = new WeakSet<object>();
 	private readonly journal: ExecutionJournal | undefined;
 	private submissionsRetired = false;
+	readonly accountRisk: AccountRiskGuard | undefined;
 
 	constructor(
 		config: TradingEngineConfig,
@@ -140,11 +151,33 @@ export class TradingEngine {
 				clock,
 				execution.admissionGeneration,
 			);
+			this.accountRisk = new AccountRiskGuard(
+				stateStore,
+				exchange,
+				this.journal.scope,
+				config.risk.account,
+				clock ? () => clock.now().getTime() : Date.now,
+			);
 		}
 	}
 
 	listExecutions() {
 		return this.executionJournal().list();
+	}
+	findExecutionIntent(intentId: string): string | undefined {
+		return this.executionJournal().findIntent(intentId);
+	}
+	protectionTargets() {
+		return this.executionJournal().protectionTargets();
+	}
+	claimProtectionRepair(id: string): string {
+		return this.executionJournal().claimProtectionRepair(id);
+	}
+	finishProtectionRepair(id: string, succeeded = false): void {
+		this.executionJournal().finishProtectionRepair(id, succeeded);
+	}
+	retireProtectionTarget(id: string): void {
+		this.executionJournal().retireProtectionTarget(id);
 	}
 	getExecutionScope() {
 		return structuredClone(this.executionJournal().scope);
@@ -242,19 +275,54 @@ export class TradingEngine {
 	getEffectiveLeverage(symbol: string): number {
 		return this.exchangeClient.getEffectiveLeverage?.(symbol) ?? 1;
 	}
-	async setLeverage(symbol: string, leverage: number) {
+	async setLeverage(symbol: string, leverage: number, intentId?: string, signal?: AbortSignal) {
+		signal?.throwIfAborted();
+		let mutationId: string | undefined;
+		if (this.accountRisk?.state()) {
+			if (this.getExecutionStatus().unresolved.length)
+				throw new Error("Reconcile in-flight orders before changing leverage");
+			const observed = await this.accountRisk.inspect();
+			const limits = this.accountRisk.state()!.limits;
+			if (assessLeverageSetting(limits, leverage).length)
+				throw new Error("Leverage exceeds configured account risk limit");
+			if (observed.snapshot.positions.length || observed.snapshot.orders.length)
+				throw new Error(
+					"Leverage adjustment with exposure requires an adapter post-change margin/liquidation projection",
+				);
+			if (!observed.assessment.allowed) throw new Error(`Account risk: ${observed.assessment.reasons.join(", ")}`);
+			signal?.throwIfAborted();
+			mutationId = this.accountRisk.claim(observed.revision, { kind: "leverage", symbol, leverage }, intentId);
+		}
 		this.recordConfigurationChange("leverage-requested");
 		const result = await this.exchangeClient.setLeverage(symbol, leverage);
+		if (mutationId) this.accountRisk!.finishMutation(mutationId);
 		this.recordConfigurationChange("leverage-applied");
 		return result;
 	}
-	async setMarginMode(symbol: string, marginType: "isolated" | "cross") {
+	async setMarginMode(symbol: string, marginType: "isolated" | "cross", intentId?: string, signal?: AbortSignal) {
+		signal?.throwIfAborted();
+		let mutationId: string | undefined;
+		if (this.accountRisk?.state()) {
+			if (this.getExecutionStatus().unresolved.length)
+				throw new Error("Reconcile in-flight orders before changing margin mode");
+			const observed = await this.accountRisk.inspect();
+			if (observed.snapshot.positions.length || observed.snapshot.orders.length)
+				throw new Error(
+					"Margin-mode adjustment with exposure requires an adapter post-change liquidation projection",
+				);
+			if (!observed.assessment.allowed) throw new Error(`Account risk: ${observed.assessment.reasons.join(", ")}`);
+			signal?.throwIfAborted();
+			mutationId = this.accountRisk.claim(observed.revision, { kind: "margin", symbol, marginType }, intentId);
+		}
 		this.recordConfigurationChange("margin-mode-requested");
 		const result = await this.exchangeClient.setMarginMode(symbol, marginType);
+		if (mutationId) this.accountRisk!.finishMutation(mutationId);
 		this.recordConfigurationChange("margin-mode-applied");
 		return result;
 	}
 	async setMultiAssetsMode(enabled: boolean) {
+		if (this.accountRisk?.state())
+			throw new Error("Multi-Assets risk projection is unavailable; account hard limits prohibit this change");
 		this.recordConfigurationChange("multi-assets-requested");
 		const result = await this.exchangeClient.setMultiAssetsMode(enabled);
 		this.recordConfigurationChange("multi-assets-applied");
@@ -299,6 +367,60 @@ export class TradingEngine {
 		});
 	}
 
+	async previewOrder(plan: PreparedOrder, policy: TradingEngineSubmissionPolicy = {}) {
+		const prepared = this.preparedOrders.get(plan);
+		if (!prepared) throw new PreparedPlanError("Order plan was not prepared by this trading engine");
+		const quotaError = this.risk.check(prepared.input.symbol, prepared.notional, {
+			countTowardsDailyLimit: prepared.countTowardsDailyLimit,
+		});
+		if (quotaError) throw new PreparedPlanError(quotaError);
+		const execution = await this.preflightPreparedOrder(prepared, policy.replacementIds);
+		const account = this.accountRisk?.state()
+			? await this.accountRisk.preflight(
+					prepared.input,
+					prepared.countTowardsDailyLimit,
+					policy.protectionStopPrice,
+					policy.replacementIds,
+				)
+			: undefined;
+		if (account && prepared.countTowardsDailyLimit) {
+			const freshQuotaError = this.risk.check(prepared.input.symbol, Math.max(prepared.notional, account.notional));
+			if (freshQuotaError) throw new PreparedPlanError(freshQuotaError);
+		}
+		return { execution, account };
+	}
+
+	private async preflightPreparedOrder(prepared: PreparedOrder, replacementIds?: string[]) {
+		const input = prepared.input;
+		const result = await preflightOrder(prepared, {
+			getMarketInfo: (symbol) => this.marketDataClient.getMarketInfo(symbol),
+			getBalances: async () => {
+				const balances = await this.marketDataClient.getBalances();
+				if (!replacementIds || input.symbol.includes(":")) return balances;
+				const snapshot = await this.accountRisk!.snapshot();
+				const groups = new Set<string>();
+				let released = 0;
+				for (const order of snapshot.orders.filter((order) => replacementIds.includes(order.id))) {
+					const group = order.ocoGroup ?? order.id;
+					if (!groups.has(group)) released += order.remaining;
+					groups.add(group);
+				}
+				return balances.map(
+					(balance): Balance =>
+						balance.asset === input.symbol.split("/")[0]
+							? { ...balance, free: balance.free + released }
+							: balance,
+				);
+			},
+			quoteCurrency: this.quoteCurrency,
+			marketType: this.config.marketType,
+			getEffectiveLeverage: (symbol) => this.getEffectiveLeverage(symbol),
+			feeRate: this.exchangeClient.feeRate,
+		});
+		if (!prepared.countTowardsDailyLimit && !replacementIds) await this.verifyReduction(input);
+		return result;
+	}
+
 	async placeOrder(
 		plan: PreparedOrder,
 		policy: TradingEngineSubmissionPolicy = {},
@@ -306,23 +428,26 @@ export class TradingEngine {
 	): Promise<PlaceOrderResult> {
 		const prepared = this.preparedOrders.get(plan);
 		if (!prepared) throw new PreparedPlanError("Order plan was not prepared by this trading engine");
-		const input = { ...prepared.input, clientOrderId: executionClientIds().clientOrderId };
+		const input = { ...prepared.input, clientOrderId: executionClientIds(policy.intentId).clientOrderId };
+		const replacementIds = policy.replacementIds;
+		if (
+			replacementIds &&
+			(prepared.countTowardsDailyLimit || !this.accountRisk?.state() || !this.exchangeClient.replaceProtectiveOrders)
+		) {
+			throw new Error("Atomic replacement requires a reducing order, account hard risk and adapter support");
+		}
 		return this.submitWithReservation(
 			plan,
 			"Order",
 			prepared.notional,
 			prepared.countTowardsDailyLimit,
 			prepared.summary,
-			{ kind: "order", input },
-			() => this.exchangeClient.placeOrder(input),
+			{ kind: "order", input, ...(replacementIds ? { replacementIds } : {}) },
 			() =>
-				preflightOrder(prepared, {
-					getMarketInfo: (symbol) => this.marketDataClient.getMarketInfo(symbol),
-					getBalances: () => this.marketDataClient.getBalances(),
-					quoteCurrency: this.quoteCurrency,
-					marketType: this.config.marketType,
-					getEffectiveLeverage: (symbol) => this.getEffectiveLeverage(symbol),
-				}),
+				replacementIds
+					? this.exchangeClient.replaceProtectiveOrders!(input, replacementIds)
+					: this.exchangeClient.placeOrder(input),
+			() => this.preflightPreparedOrder(prepared, replacementIds),
 			policy,
 			signal,
 		);
@@ -335,7 +460,7 @@ export class TradingEngine {
 	): Promise<PlaceOcoOrderResult> {
 		const prepared = this.preparedOcos.get(plan);
 		if (!prepared) throw new PreparedPlanError("OCO plan was not prepared by this trading engine");
-		const { listClientOrderId, aboveClientOrderId, belowClientOrderId } = executionClientIds();
+		const { listClientOrderId, aboveClientOrderId, belowClientOrderId } = executionClientIds(policy.intentId);
 		const input = { ...prepared.input, listClientOrderId, aboveClientOrderId, belowClientOrderId };
 		return this.submitWithReservation(
 			plan,
@@ -345,12 +470,16 @@ export class TradingEngine {
 			prepared.summary,
 			{ kind: "oco", input },
 			() => this.exchangeClient.placeOcoOrder(input),
-			() =>
-				preflightOco(prepared, {
+			async () => {
+				const result = await preflightOco(prepared, {
 					getMarketInfo: (symbol) => this.marketDataClient.getMarketInfo(symbol),
 					getBalances: () => this.marketDataClient.getBalances(),
 					quoteCurrency: this.quoteCurrency,
-				}),
+				});
+				if (!prepared.countTowardsDailyLimit)
+					await this.verifyReduction({ ...input, type: "stop_market", stopPrice: input.stopLossPrice });
+				return result;
+			},
 			policy,
 			signal,
 		);
@@ -391,7 +520,28 @@ export class TradingEngine {
 		let execution: ExecutionRecord;
 		try {
 			if (this.submissionsRetired) throw new Error("Trading engine was replaced; prepare with the active runtime");
-			execution = journal.prepare(intent, notional, countTowardsDailyLimit);
+			const riskInput =
+				intent.kind === "order"
+					? intent.input
+					: { ...intent.input, type: "stop_market" as const, stopPrice: intent.input.stopLossPrice };
+			const accountCheck = this.accountRisk?.state()
+				? await this.accountRisk.preflight(
+						riskInput,
+						countTowardsDailyLimit,
+						policy.protectionStopPrice,
+						policy.replacementIds,
+					)
+				: undefined;
+			execution = journal.prepare(
+				intent,
+				countTowardsDailyLimit && accountCheck ? Math.max(notional, accountCheck.notional) : notional,
+				countTowardsDailyLimit,
+				{
+					intentId: policy.intentId,
+					riskRevision: accountCheck?.revision,
+					protectionStopPrice: policy.protectionStopPrice,
+				},
+			);
 		} catch (error) {
 			this.inFlightPlans.delete(plan);
 			throw error;
@@ -435,9 +585,27 @@ export class TradingEngine {
 		}
 		try {
 			throwIfAborted();
+			await preflight();
+			let riskRevision: number | undefined;
+			if (this.accountRisk?.state()) {
+				const input =
+					intent.kind === "order"
+						? intent.input
+						: { ...intent.input, type: "stop_market" as const, stopPrice: intent.input.stopLossPrice };
+				const finalRisk = await this.accountRisk.preflight(
+					input,
+					countTowardsDailyLimit,
+					policy.protectionStopPrice,
+					policy.replacementIds,
+				);
+				riskRevision = finalRisk.revision;
+				if (countTowardsDailyLimit && finalRisk.notional > execution.notional)
+					throw new PreparedPlanError("Account notional increased after reservation; prepare a fresh intent");
+			}
 			// A user or another process may pause entries while confirmation is open.
+			throwIfAborted();
 			if (countTowardsDailyLimit) this.risk.assertNewExposureAllowed(execution.id);
-			journal.begin(execution.id);
+			journal.begin(execution.id, riskRevision);
 		} catch (error) {
 			return releaseAndThrow(error, `${label} pre-submission check and risk release failed`);
 		}
@@ -447,8 +615,22 @@ export class TradingEngine {
 		this.inFlightPlans.delete(plan);
 		this.consumedPlans.add(plan);
 		let result: T;
+		let timeout: ReturnType<typeof setTimeout> | undefined;
 		try {
-			result = await submit();
+			if (policy.timeoutMs !== undefined && (!Number.isFinite(policy.timeoutMs) || policy.timeoutMs <= 0))
+				throw new Error("Invalid submission timeout");
+			result =
+				policy.timeoutMs === undefined
+					? await submit()
+					: await Promise.race([
+							submit(),
+							new Promise<never>((_resolve, reject) => {
+								timeout = setTimeout(
+									() => reject(new Error("Submission timeout; exchange acceptance unknown")),
+									policy.timeoutMs,
+								);
+							}),
+						]);
 		} catch (submissionError) {
 			let statusUnknown =
 				!(submissionError instanceof SubmissionRejectedError) || isSubmissionStatusUnknownError(submissionError);
@@ -475,6 +657,8 @@ export class TradingEngine {
 				throw new ExecutionRecoveryError(execution.id, "rejection persistence failed");
 			}
 			throw submissionError;
+		} finally {
+			if (timeout) clearTimeout(timeout);
 		}
 
 		try {
@@ -486,14 +670,65 @@ export class TradingEngine {
 		return { ...result, executionId: execution.id };
 	}
 
-	async cancelOrder(id: string, symbol: string, signal?: AbortSignal): Promise<void> {
+	async cancelOrder(id: string, symbol: string, signal?: AbortSignal, intentId?: string): Promise<void> {
 		if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("Operation cancelled");
+		const revision = await this.accountRisk?.checkCancellation([id], symbol);
+		signal?.throwIfAborted();
+		const mutationId =
+			revision !== undefined
+				? this.accountRisk!.claim(revision, { kind: "cancel", symbol, orderIds: [id] }, intentId)
+				: undefined;
 		await this.exchangeClient.cancelOrder(id, symbol);
+		if (mutationId) this.accountRisk!.finishMutation(mutationId);
 	}
 
 	async cancelOrderList(orderListId: string, symbol: string, signal?: AbortSignal): Promise<void> {
 		if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("Operation cancelled");
+		let mutationId: string | undefined;
+		if (this.accountRisk?.state()) {
+			const list = await this.exchangeClient.getOrderList(orderListId);
+			const revision = await this.accountRisk.checkCancellation(
+				list.orders.map((order) => order.id),
+				symbol,
+			);
+			signal?.throwIfAborted();
+			if (revision !== undefined)
+				mutationId = this.accountRisk.claim(revision, {
+					kind: "cancel",
+					symbol,
+					orderIds: list.orders.map((order) => order.id),
+				});
+		}
 		await this.exchangeClient.cancelOrderList(orderListId, symbol);
+		if (mutationId) this.accountRisk!.finishMutation(mutationId);
+	}
+
+	private async verifyReduction(input: PlaceOrderInput): Promise<void> {
+		if (!input.symbol.includes(":")) {
+			const balances = await this.exchangeClient.getBalances();
+			const held = balances.find((balance) => balance.asset === input.symbol.split("/")[0]);
+			if (
+				input.side !== "sell" ||
+				!held ||
+				!Number.isFinite(held.free) ||
+				input.amount - held.free > Number.EPSILON * Math.max(1, input.amount, Math.abs(held.free)) * 8
+			)
+				throw new Error("Spot reduction exceeds currently available holdings");
+			return;
+		}
+		const positions = await this.exchangeClient.getPositions();
+		const matches = positions.filter(
+			(position) =>
+				position.symbol === input.symbol &&
+				(input.side === "buy"
+					? position.positionSide === "SHORT" || position.amount < 0
+					: position.positionSide !== "SHORT" && position.amount > 0) &&
+				(this.config.positionMode !== "hedge" || position.positionSide === input.positionSide),
+		);
+		if (matches.length !== 1 || input.amount > Math.abs(matches[0].amount) * (1 + 1e-12))
+			throw new Error("Reduction no longer fits the current position");
+		if (this.config.positionMode === "one-way" && input.reduceOnly !== true && input.closePosition !== true)
+			throw new Error("Reduction requires an exchange reduce-only constraint");
 	}
 
 	getOrder(id: string, symbol: string): Promise<Order> {

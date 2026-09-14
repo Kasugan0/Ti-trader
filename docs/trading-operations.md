@@ -2,6 +2,8 @@
 
 This guide is for an operator of a human-confirmed Ti trading assistant. It covers local state, emergency pause, recovery evidence, backup and upgrade procedure. It does not authorize real trades or describe an unattended service.
 
+The separately enabled [autonomous Paper runtime](autonomous-trading.md) has its own configuration and start/pause/stop procedure. It currently rejects autonomous live startup.
+
 ## Prepare an isolated candidate
 
 Use a dedicated operating-system user or a private data directory. Do not point development tools or a Paper exercise at a live account's data directory.
@@ -68,7 +70,7 @@ Account replacement and Paper reset hold a persisted maintenance fence: a record
 
 Successful maintenance advances a durable admission generation, separate from account identity. Processes and plans bound to an older generation cannot submit after the fence clears. If `/health` reports an outdated runtime, restart that Ti process using the intended data directory and current configuration. Do not reset quota or clear a pause to bypass this state.
 
-The risk/execution file lock is a separate filesystem mechanism. It is not automatically taken over because its timestamp is old; configuration and Paper account locks follow the same rule. If a crash leaves an exact lock behind, first establish that all writers have stopped, preserve the state, and remove only that abandoned lock file. Do not delete the state file, delete all lock files indiscriminately or use lock age as proof that its owner is dead.
+The risk/execution file lock is a separate filesystem mechanism. It is not automatically taken over because its timestamp is old; configuration and Paper account locks follow the same rule. New locks record PID/host metadata and permit recovery only when a local owner is verified dead. Legacy empty locks, foreign-host locks and interrupted reclaim locks still require operator action. First establish that all writers have stopped, preserve the state, and remove only the exact abandoned lock file. Do not delete the state file, delete all lock files indiscriminately or use lock age as proof that its owner is dead.
 
 ## Triage by symptom
 

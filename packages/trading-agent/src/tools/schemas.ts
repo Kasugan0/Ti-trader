@@ -103,6 +103,13 @@ const orderFields = {
 		}),
 	),
 	closePosition: Type.Optional(Type.Boolean()),
+	protectionStopPrice: Type.Optional(
+		Type.Number({
+			exclusiveMinimum: 0,
+			description:
+				"Opening protection target when account hard limits require coverage; separate from this order's trigger price.",
+		}),
+	),
 };
 
 export const orderSchema = Type.Object(orderFields);
@@ -133,6 +140,12 @@ export const cancelOrderListSchema = Type.Object({
 });
 
 export const ocoSchema = Type.Object({
+	protectionStopPrice: Type.Optional(
+		Type.Number({
+			exclusiveMinimum: 0,
+			description: "Protection target for an increasing OCO entry when account hard limits require coverage.",
+		}),
+	),
 	symbol: Type.String({ description: SYMBOL_DESC }),
 	side: Type.Union([Type.Literal("buy"), Type.Literal("sell")], {
 		description:

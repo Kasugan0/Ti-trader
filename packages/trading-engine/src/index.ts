@@ -1,6 +1,13 @@
 export {
+	type AccountRiskAssessment,
+	type AccountRiskFacts,
+	type AccountRiskLimits,
+	type AccountRiskMemory,
+	type AccountRiskState,
 	AUDIT_HISTORY_LIMIT,
 	appendTradingAuditEvent,
+	assessAccountRisk,
+	assessExecutionPrice,
 	isRiskNewExposurePause,
 	isTradingAuditState,
 	type RiskClock,
@@ -21,8 +28,11 @@ export {
 	type TradingAuditState,
 	type TradingMode,
 	type TradingRiskState,
+	validateAccountRiskLimits,
+	validateAccountRiskStates,
 	validateTradingSymbol,
 } from "@nikopack/ti-trading-risk";
+export { AccountRiskError, accountRiskFacts, accountRiskKey, verifiedReducingOrder } from "./account-risk.ts";
 export * from "./capabilities.ts";
 export { CcxtExchangeClient } from "./ccxt-client.ts";
 export type { ExchangeCredentials, FuturesMarginType, FuturesPositionMode, MarketType } from "./client-types.ts";
@@ -96,7 +106,9 @@ export {
 	writeJsonFileDurable,
 } from "./persist.ts";
 export { isProtection, protectionCoverage, reduceSide } from "./protection.ts";
+export { controlledRiskClose, type RiskSupervisionReport, superviseAccountRisk } from "./risk-supervisor.ts";
 export type {
+	AccountSnapshot,
 	Balance,
 	ContractStats,
 	ContractType,

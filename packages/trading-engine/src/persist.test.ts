@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -61,5 +62,24 @@ describe("persist", () => {
 		).toThrow("mutator failed");
 		const lock = acquireFileLockSync(lockPath, { timeoutMs: 200 });
 		releaseFileLock(lock);
+	});
+
+	it("never takes over a live owner by age, but recovers a verified dead local owner", () => {
+		const path = join(dir, "owned.lock");
+		const lock = acquireFileLockSync(path, { staleMs: Infinity, reclaimDeadOwner: true });
+		const past = new Date(Date.now() - 120_000);
+		utimesSync(path, past, past);
+		expect(() => acquireFileLockSync(path, { timeoutMs: 20, staleMs: Infinity, reclaimDeadOwner: true })).toThrow(
+			"Timed out",
+		);
+		const owner = readJsonFile(path);
+		if (!owner || typeof owner !== "object" || !("pid" in owner)) throw new Error("Owner metadata missing");
+		const child = spawnSync(process.execPath, ["-e", "process.exit(0)"]);
+		expect(child.status).toBe(0);
+		owner.pid = child.pid;
+		writeJsonFile(path, owner);
+		const recovered = acquireFileLockSync(path, { timeoutMs: 200, staleMs: Infinity, reclaimDeadOwner: true });
+		releaseFileLock(lock);
+		releaseFileLock(recovered);
 	});
 });

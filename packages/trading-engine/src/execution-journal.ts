@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
 	appendTradingAuditEvent,
 	type RiskClock,
@@ -8,6 +8,7 @@ import {
 	type TradingAuditEvent,
 	type TradingRiskState,
 } from "@nikopack/ti-trading-risk";
+import { accountRiskKey } from "./account-risk.ts";
 import { ORDER_TYPES } from "./capabilities.ts";
 import type { Order, PlaceOcoOrderInput, PlaceOrderInput } from "./types.ts";
 
@@ -59,7 +60,9 @@ export interface ExecutionRecord {
 	id: string;
 	admissionGeneration?: number;
 	scope: ExecutionScope;
-	intent: { kind: "order"; input: PlaceOrderInput } | { kind: "oco"; input: PlaceOcoOrderInput };
+	intent:
+		| { kind: "order"; input: PlaceOrderInput; replacementIds?: string[] }
+		| { kind: "oco"; input: PlaceOcoOrderInput };
 	notional: number;
 	reservationId?: string;
 	status: ExecutionStatus;
@@ -77,6 +80,22 @@ export interface ExecutionJournalState {
 	records: ExecutionRecord[];
 	admissionGeneration?: number;
 	maintenance?: ExecutionMaintenance;
+	/** Stable intent tombstones survive bounded execution-detail retention. */
+	intentKeys?: Record<string, { executionId: string; fingerprint: string }>;
+	protections?: ProtectionTarget[];
+}
+export interface ProtectionTarget {
+	id: string;
+	scope: ExecutionScope;
+	executionId: string;
+	symbol: string;
+	positionSide?: "BOTH" | "LONG" | "SHORT";
+	side: "buy" | "sell";
+	stopPrice: number;
+	/** Each repair receives a new stable logical identity; unknown repairs never advance it. */
+	generation: number;
+	failures?: number;
+	lastRepairIntentId?: string;
 }
 export interface ExecutionMaintenance {
 	id: string;
@@ -154,7 +173,16 @@ function scopeValid(value: unknown): value is ExecutionScope {
 	);
 }
 function intentValid(value: unknown): value is ExecutionRecord["intent"] {
-	if (!record(value) || !keys(value, ["kind", "input"]) || !record(value.input)) return false;
+	if (!record(value) || !keys(value, ["kind", "input", "replacementIds"]) || !record(value.input)) return false;
+	if (
+		value.replacementIds !== undefined &&
+		(value.kind !== "order" ||
+			!Array.isArray(value.replacementIds) ||
+			!value.replacementIds.length ||
+			!value.replacementIds.every(identifier) ||
+			new Set(value.replacementIds).size !== value.replacementIds.length)
+	)
+		return false;
 	const input = value.input;
 	if (
 		typeof input.symbol !== "string" ||
@@ -253,10 +281,45 @@ export function isExecutionJournalState(value: unknown): value is ExecutionJourn
 	if (
 		!record(value) ||
 		value.version !== 1 ||
-		!keys(value, ["version", "records", "maintenance", "admissionGeneration"]) ||
+		!keys(value, ["version", "records", "maintenance", "admissionGeneration", "intentKeys", "protections"]) ||
 		(value.admissionGeneration !== undefined &&
 			(!Number.isSafeInteger(value.admissionGeneration) || Number(value.admissionGeneration) < 0)) ||
 		!Array.isArray(value.records)
+	)
+		return false;
+	if (
+		value.intentKeys !== undefined &&
+		(!record(value.intentKeys) ||
+			Object.entries(value.intentKeys).some(
+				([key, entry]) =>
+					!identifier(key) ||
+					!record(entry) ||
+					!identifier(entry.executionId) ||
+					typeof entry.fingerprint !== "string" ||
+					!/^[a-f0-9]{64}$/.test(entry.fingerprint),
+			))
+	)
+		return false;
+	if (
+		value.protections !== undefined &&
+		(!Array.isArray(value.protections) ||
+			value.protections.some(
+				(target) =>
+					!record(target) ||
+					!identifier(target.id) ||
+					!identifier(target.executionId) ||
+					!scopeValid(target.scope) ||
+					typeof target.symbol !== "string" ||
+					!nonnegative(target.stopPrice) ||
+					target.stopPrice === 0 ||
+					(target.side !== "buy" && target.side !== "sell") ||
+					!Number.isSafeInteger(target.generation) ||
+					Number(target.generation) < 0 ||
+					(target.failures !== undefined &&
+						(!Number.isSafeInteger(target.failures) || Number(target.failures) < 0)) ||
+					(target.lastRepairIntentId !== undefined && !identifier(target.lastRepairIntentId)) ||
+					(target.positionSide !== undefined && !["BOTH", "LONG", "SHORT"].includes(String(target.positionSide))),
+			))
 	)
 		return false;
 	if (
@@ -552,10 +615,38 @@ export class ExecutionJournal {
 			appendTradingAuditEvent(state, { kind: "config-change", mode: this.scope.mode, action }),
 		);
 	}
-	prepare(intent: ExecutionRecord["intent"], notional: number, count: boolean): ExecutionRecord {
+	prepare(
+		intent: ExecutionRecord["intent"],
+		notional: number,
+		count: boolean,
+		options: { intentId?: string; riskRevision?: number; protectionStopPrice?: number } = {},
+	): ExecutionRecord {
 		return this.transact((state, risk) => {
 			this.assertAdmission(state);
 			const journal = state.executions ?? { version: 1, records: [], admissionGeneration: this.admissionGeneration };
+			const fingerprint = createHash("sha256").update(JSON.stringify(intent)).digest("hex");
+			const intentKey = options.intentId === undefined ? undefined : this.intentKey(options.intentId);
+			if (options.intentId !== undefined) {
+				if (!identifier(options.intentId)) throw new Error("Invalid stable intent identity");
+				const known = journal.intentKeys?.[intentKey!];
+				if (known) {
+					throw new ExecutionRecoveryError(
+						known.executionId,
+						known.fingerprint === fingerprint
+							? "intent already recorded"
+							: "intent identity reused with different parameters",
+					);
+				}
+			}
+			const accountRisk = state.accountRisk?.[accountRiskKey(this.scope)];
+			if (accountRisk) {
+				if (options.riskRevision !== accountRisk.revision)
+					throw new Error("Account changed after risk preflight; collect fresh facts");
+				if (count && (accountRisk.blockedReasons.length || accountRisk.memory?.lossTrip || accountRisk.mutation)) {
+					throw new Error(`Account risk blocks new exposure: ${accountRisk.blockedReasons.join(", ")}`);
+				}
+				accountRisk.revision++;
+			}
 			if (journal.records.filter(isUnresolvedExecution).length >= UNRESOLVED_EXECUTION_LIMIT)
 				throw new Error("Unresolved execution limit reached; reconciliation required");
 			const id = randomUUID();
@@ -578,13 +669,74 @@ export class ExecutionJournal {
 				attempts: 0,
 			};
 			journal.records.push(entry);
+			if (options.protectionStopPrice !== undefined) {
+				if (!count || !Number.isFinite(options.protectionStopPrice) || options.protectionStopPrice <= 0)
+					throw new Error("Invalid opening protection target");
+				journal.protections ??= [];
+				journal.protections.push({
+					id,
+					executionId: id,
+					scope: structuredClone(this.scope),
+					symbol: intent.input.symbol,
+					side: intent.input.side === "buy" ? "sell" : "buy",
+					positionSide: intent.kind === "order" ? intent.input.positionSide : undefined,
+					stopPrice: options.protectionStopPrice,
+					generation: 0,
+				});
+			}
+			if (intentKey) {
+				journal.intentKeys ??= {};
+				journal.intentKeys[intentKey] = { executionId: id, fingerprint };
+			}
 			state.executions = journal;
 			state[this.scope.mode].executionBlocks = { ...state[this.scope.mode].executionBlocks, [id]: true };
 			this.audit(state, entry);
 			return entry;
 		});
 	}
-	begin(id: string): ExecutionRecord {
+	findIntent(intentId: string): string | undefined {
+		return (this.store.load() as ExecutionRiskState).executions?.intentKeys?.[this.intentKey(intentId)]?.executionId;
+	}
+	private intentKey(intentId: string): string {
+		return createHash("sha256")
+			.update(`${accountRiskKey(this.scope)}:${intentId}`)
+			.digest("hex");
+	}
+	protectionTargets(): ProtectionTarget[] {
+		return structuredClone((this.store.load() as ExecutionRiskState).executions?.protections ?? []).filter(
+			(target) => accountRiskKey(target.scope) === accountRiskKey(this.scope),
+		);
+	}
+	claimProtectionRepair(id: string): string {
+		return this.transact((state) => {
+			const target = state.executions?.protections?.find((target) => target.id === id);
+			if (!target) throw new Error("Protection target missing");
+			if (target.lastRepairIntentId) return target.lastRepairIntentId;
+			target.lastRepairIntentId = createHash("sha256").update(`${id}:protection:${target.generation}`).digest("hex");
+			return target.lastRepairIntentId;
+		});
+	}
+	finishProtectionRepair(id: string, succeeded = false): void {
+		this.transact((state) => {
+			const target = state.executions?.protections?.find((target) => target.id === id);
+			if (!target) throw new Error("Protection target missing");
+			delete target.lastRepairIntentId;
+			target.generation++;
+			target.failures = succeeded ? 0 : (target.failures ?? 0) + 1;
+		});
+	}
+	retireProtectionTarget(id: string): void {
+		this.transact((state) => {
+			if (
+				!state.executions?.protections?.some(
+					(target) => target.id === id && accountRiskKey(target.scope) === accountRiskKey(this.scope),
+				)
+			)
+				throw new Error("Protection target missing");
+			state.executions.protections = state.executions.protections.filter((target) => target.id !== id);
+		});
+	}
+	begin(id: string, riskRevision?: number): ExecutionRecord {
 		return this.transact((state, risk) => {
 			this.assertAdmission(state);
 			const entry = this.find(state, id);
@@ -592,6 +744,15 @@ export class ExecutionJournal {
 			if ((entry.admissionGeneration ?? 0) !== this.admissionGeneration)
 				throw new Error("Execution admission generation changed; reinitialize this runtime");
 			if (entry.reservationId) risk.assertNewExposureAllowed(id);
+			const account = state.accountRisk?.[accountRiskKey(this.scope)];
+			if (
+				account &&
+				(account.revision !== riskRevision ||
+					(entry.reservationId &&
+						(account.blockedReasons.length > 0 || account.memory?.lossTrip || account.mutation)))
+			) {
+				throw new Error("Final account risk admission changed; collect fresh facts");
+			}
 			this.transition(state, entry, "submission-started");
 			return entry;
 		});
@@ -640,6 +801,34 @@ export class ExecutionJournal {
 			if (entry.reservationId) risk.reconcileReservation(entry.reservationId, outcome, notional, entry.id);
 			entry.settlement = { outcome, notional: outcome === "commit" ? notional : 0 };
 			if (evidence) entry.evidence = structuredClone(evidence);
+			if (outcome === "commit" && state.executions?.protections) {
+				const target = state.executions.protections.find((target) => target.executionId === entry.id);
+				if (target)
+					state.executions.protections = state.executions.protections.filter(
+						(candidate) =>
+							candidate.id === target.id ||
+							accountRiskKey(candidate.scope) !== accountRiskKey(target.scope) ||
+							candidate.symbol !== target.symbol ||
+							candidate.side !== target.side ||
+							candidate.positionSide !== target.positionSide,
+					);
+				if (
+					entry.intent.kind === "order" &&
+					entry.intent.replacementIds &&
+					entry.intent.input.type === "stop_market"
+				) {
+					for (const target of state.executions.protections) {
+						if (
+							accountRiskKey(target.scope) === accountRiskKey(entry.scope) &&
+							target.symbol === entry.intent.input.symbol &&
+							target.side === entry.intent.input.side
+						) {
+							target.stopPrice = entry.intent.input.stopPrice!;
+							target.failures = 0;
+						}
+					}
+				}
+			}
 			delete entry.issue;
 			delete entry.nextAttemptAt;
 			delete state[entry.scope.mode].executionBlocks?.[entry.id];
@@ -685,13 +874,15 @@ export class ExecutionJournal {
 	}
 }
 
-export function executionClientIds(): {
+export function executionClientIds(intentId?: string): {
 	clientOrderId: string;
 	listClientOrderId: string;
 	aboveClientOrderId: string;
 	belowClientOrderId: string;
 } {
-	const id = randomUUID().replaceAll("-", "").slice(0, 30);
+	const id = intentId
+		? createHash("sha256").update(intentId).digest("hex").slice(0, 30)
+		: randomUUID().replaceAll("-", "").slice(0, 30);
 	return {
 		clientOrderId: `ti${id}`,
 		listClientOrderId: `tl${id}`,

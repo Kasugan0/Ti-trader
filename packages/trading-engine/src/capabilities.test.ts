@@ -443,6 +443,22 @@ describe("executable capability contracts", () => {
 		},
 	);
 
+	it("includes paper futures fees in preflight margin", async () => {
+		const { planning, client } = fixture("paper", "futures");
+		const plan = await prepareOrder("buy", { ...intent("limit", futures), price: 90 }, planning);
+		const dependencies = {
+			getMarketInfo: (symbol: string) => client.getMarketInfo(symbol),
+			getBalances: async () => [{ asset: "USDT", free: 18.05, used: 0, total: 18.05 }],
+			quoteCurrency: "USDT",
+			marketType: "usdm-futures" as const,
+			getEffectiveLeverage: () => 5,
+		};
+		await expect(preflightOrder(plan, dependencies)).resolves.toEqual({ warnings: [] });
+		await expect(preflightOrder(plan, { ...dependencies, feeRate: 0.001 })).rejects.toThrow(
+			/Insufficient available USDT/,
+		);
+	});
+
 	it("rejects unsupported OCO and futures-control combinations at planning", async () => {
 		const { planning } = fixture("live", "spot");
 		await expect(

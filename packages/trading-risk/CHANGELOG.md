@@ -4,6 +4,14 @@ All notable changes to `@nikopack/ti-trading-risk` are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Explicit account-wide exposure, leverage, margin, freshness, execution-price/liquidity and protection limits, with flow-adjusted loss/drawdown tracking and persistent hard-loss trips.
+
+### Fixed
+
+- Engine-verified reductions bypass opening whitelist and single-order/flow limits while retaining symbol and numeric validation.
+
 ## [0.2.0] - 2026-09-08
 
 ### Breaking Changes

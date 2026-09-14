@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { evaluateCondition, transitionTrigger } from "./evaluator.ts";
-import type { FactSnapshot, RuntimeState, TriggerDefinition } from "./model.ts";
+import { type FactSnapshot, MAX_CHANGE_WINDOW_SEC, type RuntimeState, type TriggerDefinition } from "./model.ts";
 import { validateCondition, validateTriggerDefinition } from "./schema.ts";
 
 const facts: FactSnapshot = { price: { value: 101, observedAt: 1000, previousValue: 99, previousObservedAt: 900 } };
@@ -41,6 +41,11 @@ describe("trigger evaluator", () => {
 		const one = transitionTrigger(d, base, facts, 1000);
 		expect(one.shouldFire).toBe(true);
 		expect(transitionTrigger(d, one.state, facts, 1500).shouldFire).toBe(true);
+		const cooled: TriggerDefinition = { ...definition("while_true"), policy: { mode: "while_true", cooldownSec: 1 } };
+		const cooledOne = transitionTrigger(cooled, base, facts, 1000);
+		expect(cooledOne.shouldFire).toBe(true);
+		expect(transitionTrigger(cooled, cooledOne.state, facts, 1500).shouldFire).toBe(false);
+		expect(transitionTrigger(cooled, cooledOne.state, facts, 2000).shouldFire).toBe(true);
 	});
 	it("preserves independent nested stable_for state and rejects stale/future windows", () => {
 		const condition = {
@@ -73,10 +78,106 @@ describe("trigger evaluator", () => {
 		expect(
 			evaluateCondition(
 				{ kind: "change", fact: { key: "price" }, windowSec: 100, operator: "gt", value: 0, unit: "absolute" },
-				{ price: { value: 2, observedAt: 2_000, previousValue: 1, previousObservedAt: 3_000 } },
+				{ price: { value: 2, observedAt: 2_000, history: [{ value: 1, observedAt: 3_000 }] } },
 				2_000,
 			).state,
 		).toBe("unknown");
+	});
+
+	it("requires an explicit historical baseline for change windows", () => {
+		const condition = {
+			kind: "change" as const,
+			fact: { key: "price" },
+			windowSec: 60,
+			operator: "gte" as const,
+			value: 10,
+			unit: "percent" as const,
+		};
+		expect(
+			evaluateCondition(
+				condition,
+				{ price: { value: 110, observedAt: 61_000, previousValue: 100, previousObservedAt: 56_000 } },
+				61_000,
+			).state,
+		).toBe("unknown");
+		expect(
+			evaluateCondition(
+				condition,
+				{
+					price: {
+						value: 110,
+						observedAt: 61_000,
+						previousValue: 108,
+						previousObservedAt: 56_000,
+						history: [{ value: 100, observedAt: 1_000 }],
+					},
+				},
+				61_000,
+			).state,
+		).toBe("true");
+		expect(
+			evaluateCondition(
+				condition,
+				{ price: { value: 110, observedAt: 61_000, history: [{ value: 100, observedAt: 30_000 }] } },
+				61_000,
+			).state,
+		).toBe("unknown");
+	});
+
+	it("rejects unordered or stale cross baselines and preserves edge arming through unknown", () => {
+		const cross: TriggerDefinition = {
+			id: "cross",
+			name: "cross",
+			when: { kind: "cross", fact: { key: "price" }, direction: "above", value: 100 },
+			// biome-ignore lint/suspicious/noThenProperty: public trigger action field
+			then: { kind: "notify", message: "hit" },
+			policy: { mode: "on_edge" },
+		};
+		expect(
+			evaluateCondition(
+				cross.when,
+				{ price: { value: 101, observedAt: 1_000, previousValue: 99, previousObservedAt: 1_000 } },
+				1_000,
+			).state,
+		).toBe("unknown");
+		expect(
+			evaluateCondition(
+				cross.when,
+				{ price: { value: 101, observedAt: 10 * 60_000, previousValue: 99, previousObservedAt: 1_000 } },
+				10 * 60_000,
+			).state,
+		).toBe("unknown");
+		const first = transitionTrigger(cross, base, facts, 1_000);
+		const unknown = transitionTrigger(cross, first.state, {}, 2_000);
+		const duplicate = transitionTrigger(cross, unknown.state, facts, 3_000);
+		expect(first.shouldFire).toBe(true);
+		expect(unknown.state.armed).toBe(false);
+		expect(duplicate.shouldFire).toBe(false);
+	});
+
+	it("fails closed for invalid policies and rejects excessive change windows", () => {
+		expect(
+			transitionTrigger(
+				{ ...definition(), policy: { mode: "while_true", cooldownSec: Number.NaN } },
+				base,
+				facts,
+				1_000,
+			).evaluation,
+		).toMatchObject({ state: "unknown", reason: "invalid cooldown" });
+		expect(
+			transitionTrigger({ ...definition(), policy: { mode: "once", expiresAt: "not-a-date" } }, base, facts, 1_000)
+				.evaluation,
+		).toMatchObject({ state: "unknown", reason: "invalid expiry" });
+		expect(() =>
+			validateCondition({
+				kind: "change",
+				fact: { key: "price" },
+				windowSec: MAX_CHANGE_WINDOW_SEC + 1,
+				operator: "gt",
+				value: 1,
+				unit: "absolute",
+			}),
+		).toThrow();
 	});
 
 	it("preserves nested stable_for state through trigger transitions", () => {
@@ -137,5 +238,34 @@ describe("trigger evaluator", () => {
 				then: { kind: "notify", message: "" },
 			}),
 		).toThrow();
+	});
+
+	it("counts time leaves in the atomic condition limit", () => {
+		const branch = {
+			kind: "all",
+			conditions: Array.from({ length: 10 }, () => ({ kind: "time", at: "2026-01-01" })),
+		};
+		expect(() => validateCondition({ kind: "all", conditions: [branch, branch, branch] })).not.toThrow();
+		expect(() => validateCondition({ kind: "all", conditions: [branch, branch, branch, branch] })).toThrow(
+			"too many",
+		);
+	});
+
+	it("rejects invalid clocks and unavailable percent-change denominators", () => {
+		expect(() => evaluateCondition(definition().when, facts, Number.NaN)).toThrow("time must be finite");
+		expect(
+			evaluateCondition(
+				{
+					kind: "change",
+					fact: { key: "price" },
+					windowSec: 60,
+					operator: "gt",
+					value: 0,
+					unit: "percent",
+				},
+				{ price: { value: 10, observedAt: 61_000, history: [{ value: 0, observedAt: 1000 }] } },
+				61_000,
+			).state,
+		).toBe("unknown");
 	});
 });

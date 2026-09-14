@@ -209,10 +209,13 @@ export function evaluateStrategy(
 export type RuleSide = "long" | "short";
 
 export interface RuleReplayTrade {
+	signalIndex: number;
 	index: number;
 	timestamp: number;
 	side: RuleSide;
 	event: StrategyEvent;
+	entryIndex: number;
+	exitIndex: number;
 	entry: number;
 	exit: number;
 	horizon: number;
@@ -242,14 +245,14 @@ const MIN_HORIZON = 1;
 const MAX_HORIZON = 20;
 
 export function resolveReplayHorizon(horizon?: number): number {
-	const value = horizon ?? 5;
+	const value = horizon === undefined ? 5 : horizon;
 	if (!Number.isInteger(value) || value < MIN_HORIZON || value > MAX_HORIZON) {
 		throw new Error(`Invalid horizon: integer ${MIN_HORIZON}-${MAX_HORIZON} required`);
 	}
 	return value;
 }
 
-/** Only discrete events open a replay trade. Persistent above/below states are ignored. */
+/** Maps a current strategy event to the implied side; replay applies preset-specific transition checks. */
 export function signalSide(evaluation: StrategyEvaluation): RuleSide | undefined {
 	if (evaluation.event === "cross-up" || evaluation.event === "oversold") return "long";
 	if (evaluation.event === "cross-down" || evaluation.event === "overbought") return "short";
@@ -258,7 +261,8 @@ export function signalSide(evaluation: StrategyEvaluation): RuleSide | undefined
 
 /**
  * Replay a named preset on closed candles. Not a backtest: no fees, slippage, or fills.
- * Trades are non-overlapping; the next entry cannot open before the previous horizon ends.
+ * Signals are evaluated at a closed candle, entries use the next candle open, and exits use
+ * the close `horizon` candles after the signal. Trades are non-overlapping.
  */
 export function simulateRule(
 	points: IndicatorPoint[],
@@ -267,35 +271,73 @@ export function simulateRule(
 	periods: IndicatorPeriods = DEFAULT_INDICATOR_PERIODS,
 	horizonInput?: number,
 ): RuleReplayResult {
+	if (!isStrategyPreset(preset)) throw new Error(`Unsupported strategy preset: ${preset}`);
 	const horizon = resolveReplayHorizon(horizonInput);
 	if (points.length !== candles.length) throw new Error("Indicator series length mismatch");
 	const trades: RuleReplayTrade[] = [];
-	let nextOpen = 1;
-	const lastOpen = candles.length - horizon - 1;
-	for (let index = 1; index <= lastOpen; index++) {
-		if (index < nextOpen) continue;
+	let nextSignalIndex = 1;
+	const lastSignalIndex = candles.length - horizon - 1;
+	for (let index = 1; index <= lastSignalIndex; index++) {
+		if (index < nextSignalIndex) continue;
 		const evaluation = evaluateStrategy(points.slice(0, index + 1), candles.slice(0, index + 1), preset, periods);
+		const previousEvaluation = evaluateStrategy(points.slice(0, index), candles.slice(0, index), preset, periods);
 		const side = signalSide(evaluation);
 		if (!side) continue;
-		const entry = candles[index].close;
-		const exit = candles[index + horizon].close;
+		if (
+			preset === "rsi-revert" &&
+			(previousEvaluation.event === "insufficient-data" || previousEvaluation.event === evaluation.event)
+		)
+			continue;
+		const entryIndex = index + 1;
+		const exitIndex = index + horizon;
+		const entry = candles[entryIndex].open;
+		const exit = candles[exitIndex].close;
 		if (!(entry > 0) || !Number.isFinite(exit)) continue;
-		const returnPct = ((exit - entry) / entry) * (side === "long" ? 1 : -1);
+		const returnPct = ((exit - entry) / entry) * (side === "long" ? 100 : -100);
 		trades.push({
+			signalIndex: index,
 			index,
 			timestamp: candles[index].timestamp,
 			side,
 			event: evaluation.event,
+			entryIndex,
+			exitIndex,
 			entry,
 			exit,
 			horizon,
 			returnPct,
 		});
-		nextOpen = index + horizon;
+		nextSignalIndex = index + horizon;
 	}
 	const returns = trades.map((trade) => trade.returnPct);
 	const tradeCount = trades.length;
 	const sumReturnPct = returns.reduce((sum, value) => sum + value, 0);
+	const warnings = [
+		"Closed-candle rule replay only; not a backtest.",
+		"Signals use only candles closed at the signal index; entries use the next candle open.",
+		"No fees, slippage, funding, or fills were applied.",
+		"ReturnPct fields use percentage points (10 means 10%); sumReturnPct is additive, not compounded.",
+		...ANALYSIS_WARNINGS,
+	];
+	const minimumCandles =
+		(preset === "ema-cross"
+			? Math.max(periods.emaFast, periods.emaSlow) + 1
+			: preset === "rsi-revert"
+				? periods.rsi + 2
+				: Math.max(periods.macdFast, periods.macdSlow) + periods.macdSignal) + horizon;
+	if (candles.length < minimumCandles) {
+		warnings.push(
+			`Not enough closed candles for a ${preset} replay sample before the ${horizon}-candle exit horizon; at least ${minimumCandles} are recommended.`,
+		);
+	}
+	if (preset === "rsi-revert") {
+		warnings.push(
+			"RSI replay opens only on transitions into oversold or overbought states; continuous extremes are not reopened until the state resets.",
+		);
+	}
+	if (tradeCount === 0) {
+		warnings.push("No replay trades opened; winRate, avgReturnPct, bestReturnPct, and worstReturnPct are null.");
+	}
 	return {
 		preset,
 		horizon,
@@ -312,10 +354,6 @@ export function simulateRule(
 		bestReturnPct: tradeCount === 0 ? null : Math.max(...returns),
 		worstReturnPct: tradeCount === 0 ? null : Math.min(...returns),
 		trades,
-		warnings: [
-			"Closed-candle rule replay only; not a backtest.",
-			"No fees, slippage, funding, or fills were applied.",
-			...ANALYSIS_WARNINGS,
-		],
+		warnings,
 	};
 }

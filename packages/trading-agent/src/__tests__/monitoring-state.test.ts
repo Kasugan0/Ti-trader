@@ -56,7 +56,12 @@ function seed(store: MonitoringStore): void {
 			state: { status: "active", armed: true, lastFiredAt: NOW - 1000, stableSinceByPath: { "$.condition": NOW } },
 			updatedAt: NOW,
 		});
-		entry.facts.push({ key: "price:BTC/USDT", value: 90, observedAt: NOW });
+		entry.facts.push({
+			key: "price:BTC/USDT",
+			value: 90,
+			observedAt: NOW,
+		});
+		entry.factHistory = [{ key: "price:BTC/USDT", samples: [{ value: 80, observedAt: NOW - 60_000 }] }];
 		entry.orders.known.push({ id: "pending", symbol: "BTC/USDT" });
 		entry.orders.seeded = true;
 		entry.orders.guards.push({ key: "BTC/USDT:LONG:drawdown", lastAlertAt: NOW });
@@ -110,6 +115,8 @@ describe("durable monitoring state", () => {
 		(state: MonitoringState) => Object.assign(state.scopes[0].triggers[0].state, { armed: "yes" }),
 		(state: MonitoringState) => Object.assign(state.scopes[0].triggers[0].state, { stableSinceByPath: { $: NaN } }),
 		(state: MonitoringState) => Object.assign(state.scopes[0].facts[0], { observedAt: Infinity }),
+		(state: MonitoringState) =>
+			state.scopes[0].factHistory?.[0]?.samples.push({ value: 80, observedAt: NOW - 120_000 }),
 		(state: MonitoringState) => Object.assign(state.scopes[0].orders.guards[0], { lastAlertAt: -1 }),
 		(state: MonitoringState) => state.scopes[0].orders.known.push({ id: "pending", symbol: "BTC/USDT" }),
 		(state: MonitoringState) => Object.assign(state.scopes[0].health.orders, { errorCode: "raw-request-secret" }),

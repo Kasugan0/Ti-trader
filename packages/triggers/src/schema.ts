@@ -1,5 +1,5 @@
 import { type TSchema, Type } from "typebox";
-import type { TriggerDefinition } from "./model.ts";
+import { MAX_CHANGE_WINDOW_SEC, type TriggerDefinition } from "./model.ts";
 
 // TypeBox 1.x does not expose a recursive builder; runtime validation is completed below.
 export const conditionSchema: TSchema = Type.Unknown();
@@ -29,7 +29,7 @@ export function validateCondition(value: unknown, depth = 0, atoms = { count: 0 
 	switch (condition.kind) {
 		case "time":
 			date(condition.at, "Condition time");
-			return;
+			break;
 		case "compare":
 			fact(condition.fact);
 			if (typeof condition.operator !== "string" || !compareOperators.has(condition.operator))
@@ -52,6 +52,8 @@ export function validateCondition(value: unknown, depth = 0, atoms = { count: 0 
 					condition.windowSec <= 0
 				)
 					throw new Error("Change windowSec must be positive");
+				if (condition.windowSec > MAX_CHANGE_WINDOW_SEC)
+					throw new Error(`Change windowSec must not exceed ${MAX_CHANGE_WINDOW_SEC}`);
 				if (condition.unit !== "absolute" && condition.unit !== "percent") throw new Error("Invalid change unit");
 				if (typeof condition.operator !== "string" || !compareOperators.has(condition.operator))
 					throw new Error("Invalid change operator");

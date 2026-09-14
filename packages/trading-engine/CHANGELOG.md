@@ -6,12 +6,17 @@ All notable changes to `@nikopack/ti-trading-engine` are documented in this file
 
 ### Added
 
+- Account-wide hard-risk admission, stable intent identities, unknown-only running recovery, persistent protection targets and independent supervision. Paper supplies atomic account snapshots and atomic stop replacement/protected closure.
+- Pending cancellation/settings identities and verified-dead local lock recovery retain execution state across interrupted operations.
+
 - Paper futures now simulates limit, stop, take-profit and trailing orders with the same lazy kline-backfill matching as Paper spot. Reduce-only and closePosition orders lock the matching position; opening orders reserve quote margin. OCO, funding payments, slippage and exchange-specific liquidation remain out of scope.
 
 ### Fixed
 
 - Paper futures now cancels leftover reduce-only orders after a one-way reverse or a partial close that no longer fits, instead of leaving a stop that can deadlock settlement.
 - Opening trailing sells top up reserved margin as the peak rises, and a leverage drop re-reserves resting opening orders. A working opening order stays open when a fill cannot be margined.
+- Cross-margin liquidation counts reserved opening-order margin as equity. Reducing futures limits reserve fee only, not opening margin. A closePosition stop locks the live position quantity.
+- Hedge reducing orders lock the open side so overlapping closes cannot deadlock settlement. Position-mode switches with open futures orders are rejected. Leftover one-way closes re-reserve as openings. Paper preflight includes taker fee, and closePosition is limited to market/stop_market/take_profit_market.
 
 ## [0.3.3] - 2026-09-10
 

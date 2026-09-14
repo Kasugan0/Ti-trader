@@ -391,7 +391,7 @@ describe("RiskLedger new exposure pause", () => {
 		expect(second.listPendingReservations()).toEqual([]);
 	});
 
-	it("allows protective orders during a pause while retaining all non-daily validations", () => {
+	it("allows engine-verified reductions despite opening limits while retaining symbol and numeric validation", () => {
 		const shared = sharedLedgers();
 		const risk = shared.createLedger("paper", ["BTC/USDT"]);
 		risk.record(800);
@@ -401,10 +401,15 @@ describe("RiskLedger new exposure pause", () => {
 		expect(risk.check("BTC/USDT", 100, options)).toBeNull();
 		risk.reserve("BTC/USDT", 100, options).commit();
 		risk.reserve("BTC/USDT", 100, options).release();
+		for (const [symbol, notional] of [
+			["ETH/USDT", 100],
+			["BTC/USDT", 501],
+		] as const) {
+			expect(risk.check(symbol, notional, options)).toBeNull();
+			risk.reserve(symbol, notional, options).commit();
+		}
 		for (const [symbol, notional, error] of [
 			["BTC/USDC", 100, /quote currency/],
-			["ETH/USDT", 100, /allowedSymbols/],
-			["BTC/USDT", 501, /maxOrderNotional/],
 			["BTC/USDT", 0, /positive finite/],
 			["BTC/USDT", Number.NaN, /positive finite/],
 			["BTC/USDT", Number.POSITIVE_INFINITY, /positive finite/],

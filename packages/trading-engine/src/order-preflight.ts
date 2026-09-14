@@ -116,6 +116,7 @@ function checkBalance(
 	futures: boolean,
 	marketType: MarketType,
 	getEffectiveLeverage: (symbol: string) => number,
+	feeRate?: number,
 ): void {
 	const asset = requiredBalance(plan, quote, futures, marketType);
 	if (asset === undefined) return;
@@ -130,8 +131,15 @@ function checkBalance(
 			reject("Effective futures leverage is unavailable during order preflight", true);
 		}
 		required = plan.notional / leverage;
+		if (feeRate !== undefined) {
+			if (!Number.isFinite(feeRate) || feeRate < 0 || feeRate >= 1) {
+				reject("Taker fee rate is unavailable during order preflight", true);
+			}
+			required += plan.notional * feeRate;
+		}
 	}
-	if (balance.free < required) reject(`Insufficient available ${asset}: need ${required}, have ${balance.free}`);
+	if (required - balance.free > Number.EPSILON * Math.max(1, required, Math.abs(balance.free)) * 8)
+		reject(`Insufficient available ${asset}: need ${required}, have ${balance.free}`);
 }
 
 export async function preflightOrder(
@@ -142,6 +150,7 @@ export async function preflightOrder(
 		quoteCurrency: string;
 		marketType: MarketType;
 		getEffectiveLeverage(symbol: string): number;
+		feeRate?: number;
 	},
 ): Promise<OrderPreflightResult> {
 	const futures = isFuturesSymbol(plan.input.symbol, dependencies.quoteCurrency);
@@ -171,6 +180,7 @@ export async function preflightOrder(
 		futures,
 		dependencies.marketType,
 		dependencies.getEffectiveLeverage,
+		dependencies.feeRate,
 	);
 	const evaluated = evaluateOrderCapability({ ...plan.capabilityContext, marketInfo: market }, plan.input);
 	return { warnings: evaluated.capability.status === "unknown" ? [evaluated.capability.reason] : [] };

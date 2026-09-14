@@ -1,4 +1,7 @@
+export * from "./account-risk.ts";
 export {
+	type AccountRiskMutation,
+	type AccountRiskState,
 	AUDIT_HISTORY_LIMIT,
 	appendTradingAuditEvent,
 	isRiskNewExposurePause,
@@ -22,5 +25,6 @@ export {
 	type TradingAuditState,
 	type TradingMode,
 	type TradingRiskState,
+	validateAccountRiskStates,
 	validateTradingSymbol,
 } from "./risk.ts";

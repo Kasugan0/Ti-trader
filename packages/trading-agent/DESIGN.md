@@ -51,10 +51,10 @@ Ti 是一个 **AI 驱动的加密货币现货与 Binance USDⓈ-M 合约交易 a
 | 模型层 | 继承 pi：OpenAI/Anthropic/Google 等多 provider、`/login`、`/model` | ✅（上游） |
 | 会话层 | 继承 pi：会话持久化、`/new` `/resume` `/fork` `/compact` 等 | ✅（上游） |
 | 自动化 | `--print` 无头一次性模式 | ✅ |
-| 事件驱动 | 实验性内存 `/trigger`（通知/paper 唤醒；live 只通知）；WebSocket 行情推送 | 部分 |
+| 事件驱动 | 实验性持久化 `/trigger`（通知/paper 唤醒；live 只通知）；WebSocket 行情推送尚未实现 | 部分 |
 | 定时任务 | cron 式自动运行 | ❌ 未实现 |
 | 合约/杠杆 | Paper 与 Binance USDⓈ-M live：杠杆、保证金模式、持仓方向、reduceOnly；Binance live 支持资金费率查询，Paper 不模拟资金费率扣款或历史 | ✅ v1 |
-| 回测 | 历史数据回放 | 可选 `freqtrade` 扩展：本机 webserver 侧车；默认不加载，不进入下单路径 |
+| 筛选与回放 | 多标的扫描、三种预设的有界规则回放 | 内置 `market-lab`；完整回测可选本机 `freqtrade` 侧车，两者均不进入下单路径 |
 
 ---
 
@@ -178,7 +178,7 @@ live 模式的现货在交易历史完整且能与余额核对时返回手续费
 | `/exchange [id]` | 查看/切换交易所 | ccxt 交易所 id，如 `okx` `bybit` |
 | `/market [type]` | 查看/切换市场类型 | `spot`、`usdm-futures` 或 `both`（`both` 仅 Paper） |
 | `/risk [show\|reset\|reconcile <id> commit\|release]` | 风控状态 | 限额、已用/预留额度、未结算占用；`reset` 二次确认后手动清零（paper 额度为累计制）；`reconcile` 在核对交易所后结算卡住的占用 |
-| `/trigger add\|list\|remove\|clear` | 实验性条件监控 | 内存定义，只读行情/持仓；live 下 `wake_agent` 只通知，不自动拉起交易回合 |
+| `/trigger add\|list\|remove\|clear` | 实验性条件监控 | 按账户与配置作用域持久化，只读行情/持仓；live 下 `wake_agent` 只通知，不自动拉起交易回合 |
 | `/paper [reset [金额]]` | 模拟账户 | 查看摘要；`reset` 二次确认后重置资产（可指定初始 USDT） |
 | `/monitor [on\|off]` | 后台监控 | 成交监控 + 仓位守护的状态与本会话开关 |
 | `/exchange-login [id]` | 配置交易所 API | 交互录入 Binance（币安）、OKX、Bybit 凭证 |
@@ -204,7 +204,9 @@ packages/trading-agent/src/
   tools/           agent 原生交易工具
   commands.ts      交易 slash 命令
   monitor.ts       成交监控与仓位守护
-  trigger-monitor.ts 实验性 /trigger 内存监控
+  trigger-monitor.ts 实验性 /trigger 持久化监控
+  trigger-facts.ts  普通监控与自主唤醒共享的事实历史
+  monitoring-state.ts 作用域状态与通知重试
   config.ts/state.ts  配置与状态持久化
 packages/trading-engine/src/
   types.ts         规范化交易合约
@@ -326,6 +328,7 @@ ti [options] [message...]
 ~/.ti-trader/agent/
   trading.json         交易配置（模式/交易所/报价币/风控/模拟参数）
   trading-state.json   风控日计数与未结算 reservations（自动维护，勿手改；对账用 /risk reconcile）
+  monitoring-state.json 条件定义、运行状态、观测历史与通知记录（按账户/交易配置隔离）
   keys.json            交易所 API 凭证（0600）
   auth.json            模型 provider 凭证（pi 机制）
   settings.json        TUI/模型等设置（pi 机制）
@@ -438,17 +441,28 @@ Paper 触发单按触发价成交、限价单按限价成交（与真实滑点�
 
 `@nikopack/ti-triggers` 是无副作用求值器：输入定义、上一状态、事实快照和时间，输出状态迁移，不做 IO、不下单。`ti-trader` 用 `trigger-monitor.ts` 注册 `/trigger add|list|remove|clear`。
 
-- 定义和运行时状态只在当前会话内存中；不是跨会话/跨进程的耐久存储。
+- 定义、运行状态、观测历史、冷却与通知记录按账户、模式、交易所、市场类型、报价币和持仓模式持久化；普通监控随会话退出停止。重启不补算停机期间未观察到的穿越，也不把停机时间计入持续成立时长。
 - 只读 `marketData.getTicker` 和持仓浮亏。价格事实用 ticker 时间戳；缺失或非法时间戳跳过。求值器将超过五分钟的观测视为 unknown，不触发。
+- 支持比较、穿越、窗口变化、时间、逻辑组合和嵌套 `stable_for`。窗口变化使用最长一小时的历史，取窗口起点之前最近且相差不超过 15 秒的样本；没有基准则 unknown，不以相邻两次采样冒充整个窗口。高频轮询按五秒桶保留样本，单事实最多 1024 个。
+- 双向持仓的 PnL 必须能唯一匹配；可用 `position_pnl_pct:BTC/USDT:USDT:LONG` 指定方向。普通命令不修改自主运行器拥有的 trigger。
 - 动作仅 `notify` 与 `wake_agent`。paper 交互会话可以 follow-up 唤醒；live 与 `--print` 只写入 `[trigger:id]` 消息（live 另发通知），`triggerTurn: false`。该消息是观察，不是交易授权或风控批准；awakened 之后的下单仍走确认与风控。
+- 通知按稳定事件 ID 有界重试，不承诺恰好投递一次；恢复或重试只通知，不再次自动唤醒。完整参数见 [`../triggers/README.md`](../triggers/README.md)。
+
+## 13.9 多标的筛选与策略回放
+
+`market-lab` 使用当前会话的已收盘 K 线，缺少会话桥接时明确退回 Binance 公共现货数据。`/screen` 最多处理 8 个标的，各行保留来源、收盘时间、样本数、警告和错误，区分部分失败、全部失败及混合来源。`/replay` 最多使用 200 根 K 线，支持 `ema-cross`、`rsi-revert`、`macd-hist`。
+
+回放在信号 K 线收盘后，按下一根开盘价入场，在指定 K 线期限的收盘价退出；RSI 需要观察到进入极值区间，不能每根重复入场。收益百分数字段中 `10` 表示 `10%`；收益相加不等于账户或复利收益。零交易不能证明策略有效。
+
+命令支持 `limit=100` 和回放的 `horizon=5`，工具与命令均支持取消和请求超时。该功能不模拟手续费、滑点、资金费率或真实成交，不替代完整账户级回测。参数和示例见 [`../../extensions/market-lab/README.md`](../../extensions/market-lab/README.md)。
 
 ## 14. 当前边界与路线图
 
-**明确不做的（当前版本）**：WebSocket 行情推送、定时任务、回测、多账户、跨所套利。合约 v1 已覆盖 Paper futures 与 Binance USDⓈ-M live；WebSocket 用户数据流和自动账户模式切换仍不在当前版本范围内。
+**明确不做的（当前版本）**：WebSocket 行情推送、cron 式定时任务、原生完整账户级回测、多账户、跨所套利。合约 v1 已覆盖 Paper futures 与 Binance USDⓈ-M live；WebSocket 用户数据流和自动账户模式切换仍不在当前版本范围内。
 
 建议优先级：
 
-1. **事件驱动循环**（高价值）：行情 WebSocket 订阅，让 agent 从"请求驱动"升级为"事件驱动"（当前已有 30s 轮询版监控与仓位守护，见 13.7，以及实验性内存 `/trigger`，见 13.8；WebSocket 化可降低延迟，并需要耐久 trigger 状态）。
+1. **事件驱动循环**（高价值）：行情 WebSocket 订阅，让 agent 从"请求驱动"升级为"事件驱动"（当前已有 30s 轮询版监控与仓位守护，见 13.7，以及实验性持久化 `/trigger`，见 13.8；WebSocket 化可降低延迟）。
 2. **定时/自主运行**：cron 包装 `--print`，或包内实现调度循环。
 3. **回测模式**：`BacktestExchangeClient` 实现同一接口，喂历史 K 线。
 4. **策略 skills**：利用 pi 的 skill 机制把交易策略做成可加载文件（需重新启用 `noSkills` 并补一个受控的内容读取通道）。

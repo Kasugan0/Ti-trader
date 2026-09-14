@@ -19,10 +19,12 @@ import {
 const BINANCE_API = "https://api.binance.com";
 /** Shared with `packages/trading-agent/src/market-lab-bridge.ts` via `Symbol.for`. */
 export const MARKET_LAB_CANDLE_PROVIDER_KEY = Symbol.for("ti.marketLab.candleProvider");
+const MIN_CANDLES = 20;
 const MAX_CANDLES = 200;
 const REQUEST_TIMEOUT_MS = 10_000;
 const MAX_RESPONSE_BYTES = 256 * 1024;
 const TIMEFRAMES = new Set(["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w"]);
+const TIMEFRAME_UNITS_MS: Record<string, number> = { m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000 };
 
 const periodSchema = Type.Optional(
 	Type.Integer({ minimum: 2, maximum: MAX_CANDLES, description: "Indicator period. Integer 2-200." }),
@@ -36,7 +38,7 @@ const marketFields = {
 	symbol: Type.String({ description: 'Session market symbol, e.g. "BTC/USDT" or "BTC/USDT:USDT".' }),
 	timeframe: Type.Optional(Type.String({ description: "Binance interval, e.g. 1m, 15m, 1h, 4h, 1d. Default 1h." })),
 	limit: Type.Optional(
-		Type.Integer({ minimum: 20, maximum: MAX_CANDLES, description: "Closed candles to use. Default 100." }),
+		Type.Integer({ minimum: MIN_CANDLES, maximum: MAX_CANDLES, description: "Closed candles to use. Default 100." }),
 	),
 };
 const indicatorSchema = Type.Object({
@@ -102,6 +104,7 @@ export type MarketLabCandleProvider = (params: {
 	symbol: string;
 	timeframe: string;
 	limit: number;
+	/** Advisory cancellation; fetchCandles also races provider completion against timeout/caller abort. */
 	signal?: AbortSignal;
 }) => Promise<{ candles: Candle[]; source: MarketLabSource }>;
 
@@ -140,6 +143,61 @@ export function parseLabArgs(args: string): {
 	symbol?: string;
 	timeframe?: string;
 	preset?: StrategyPreset;
+	limit?: number;
+	horizon?: number;
+	error?: string;
+} {
+	return parseMarketArgs(args, false);
+}
+
+export function parseReplayArgs(args: string): {
+	symbol?: string;
+	timeframe?: string;
+	preset?: StrategyPreset;
+	limit?: number;
+	horizon?: number;
+	error?: string;
+} {
+	return parseMarketArgs(args, true);
+}
+
+function usage(command: "signal" | "screen" | "replay" | "indicators"): string {
+	if (command === "screen") {
+		return "Usage: /screen BTC/USDT ETH/USDT [1h] [ema-cross|rsi-revert|macd-hist] [limit=20-200]";
+	}
+	if (command === "replay") {
+		return "Usage: /replay BTC/USDT [1h] [ema-cross|rsi-revert|macd-hist] [limit=20-200] [horizon=1-20]";
+	}
+	if (command === "indicators") return "Usage: /indicators BTC/USDT [1h] [limit=20-200]";
+	return "Usage: /signal BTC/USDT [1h] [ema-cross|rsi-revert|macd-hist] [limit=20-200]";
+}
+
+function parseBoundedIntegerOption(
+	part: string,
+	key: "limit" | "horizon",
+	minimum: number,
+	maximum: number,
+): { value: number } | { error: string } | undefined {
+	const prefix = `${key}=`;
+	if (!part.startsWith(prefix)) return undefined;
+	const text = part.slice(prefix.length);
+	if (!/^\d+$/.test(text)) return { error: `Invalid ${key}: integer ${minimum}-${maximum} required` };
+	const value = Number(text);
+	if (!Number.isInteger(value) || value < minimum || value > maximum) {
+		return { error: `Invalid ${key}: integer ${minimum}-${maximum} required` };
+	}
+	return { value };
+}
+
+function parseMarketArgs(
+	args: string,
+	allowHorizon: boolean,
+): {
+	symbol?: string;
+	timeframe?: string;
+	preset?: StrategyPreset;
+	limit?: number;
+	horizon?: number;
 	error?: string;
 } {
 	const parts = args.trim().split(/\s+/).filter(Boolean);
@@ -147,26 +205,55 @@ export function parseLabArgs(args: string): {
 	const symbol = parts[0];
 	let timeframe: string | undefined;
 	let preset: StrategyPreset | undefined;
+	let limit: number | undefined;
+	let horizon: number | undefined;
 	for (const part of parts.slice(1)) {
 		if (isStrategyPreset(part)) {
-			if (preset) return { error: "Usage: /signal BTC/USDT [1h] [ema-cross|rsi-revert|macd-hist]" };
+			if (preset) return { error: usage(allowHorizon ? "replay" : "signal") };
 			preset = part;
 			continue;
 		}
 		if (TIMEFRAMES.has(part)) {
-			if (timeframe) return { error: "Usage: /signal BTC/USDT [1h] [ema-cross|rsi-revert|macd-hist]" };
+			if (timeframe) return { error: usage(allowHorizon ? "replay" : "signal") };
 			timeframe = part;
+			continue;
+		}
+		const parsedLimit = parseBoundedIntegerOption(part, "limit", MIN_CANDLES, MAX_CANDLES);
+		if (parsedLimit) {
+			if ("error" in parsedLimit) return parsedLimit;
+			if (limit !== undefined) return { error: "Duplicate limit option" };
+			limit = parsedLimit.value;
+			continue;
+		}
+		const parsedHorizon = parseBoundedIntegerOption(part, "horizon", 1, 20);
+		if (parsedHorizon) {
+			if (!allowHorizon) return { error: "horizon is only supported by /replay" };
+			if ("error" in parsedHorizon) return parsedHorizon;
+			if (horizon !== undefined) return { error: "Duplicate horizon option" };
+			horizon = parsedHorizon.value;
 			continue;
 		}
 		return { error: `Unknown argument: ${part}` };
 	}
-	return { symbol, timeframe, preset };
+	const parsed: {
+		symbol: string;
+		timeframe?: string;
+		preset?: StrategyPreset;
+		limit?: number;
+		horizon?: number;
+	} = { symbol };
+	if (timeframe !== undefined) parsed.timeframe = timeframe;
+	if (preset !== undefined) parsed.preset = preset;
+	if (limit !== undefined) parsed.limit = limit;
+	if (horizon !== undefined) parsed.horizon = horizon;
+	return parsed;
 }
 
 export function parseScreenArgs(args: string): {
 	symbols?: string[];
 	timeframe?: string;
 	preset?: StrategyPreset;
+	limit?: number;
 	error?: string;
 } {
 	const parts = args.trim().split(/\s+/).filter(Boolean);
@@ -174,37 +261,109 @@ export function parseScreenArgs(args: string): {
 	const symbols: string[] = [];
 	let timeframe: string | undefined;
 	let preset: StrategyPreset | undefined;
+	let limit: number | undefined;
 	for (const part of parts) {
 		if (isStrategyPreset(part)) {
-			if (preset) return { error: "Usage: /screen BTC/USDT ETH/USDT [1h] [ema-cross|rsi-revert|macd-hist]" };
+			if (preset) return { error: usage("screen") };
 			preset = part;
 			continue;
 		}
 		if (TIMEFRAMES.has(part)) {
-			if (timeframe) return { error: "Usage: /screen BTC/USDT ETH/USDT [1h] [ema-cross|rsi-revert|macd-hist]" };
+			if (timeframe) return { error: usage("screen") };
 			timeframe = part;
 			continue;
 		}
+		const parsedLimit = parseBoundedIntegerOption(part, "limit", MIN_CANDLES, MAX_CANDLES);
+		if (parsedLimit) {
+			if ("error" in parsedLimit) return parsedLimit;
+			if (limit !== undefined) return { error: "Duplicate limit option" };
+			limit = parsedLimit.value;
+			continue;
+		}
+		if (part.startsWith("horizon=")) return { error: "horizon is only supported by /replay" };
 		symbols.push(part);
 	}
-	if (symbols.length === 0) return { error: "Usage: /screen BTC/USDT ETH/USDT [1h] [ema-cross|rsi-revert|macd-hist]" };
+	if (symbols.length === 0) return { error: usage("screen") };
 	if (symbols.length > MAX_SCREEN_SYMBOLS) return { error: `Screen at most ${MAX_SCREEN_SYMBOLS} symbols` };
-	return { symbols, timeframe, preset };
+	const parsed: { symbols: string[]; timeframe?: string; preset?: StrategyPreset; limit?: number } = { symbols };
+	if (timeframe !== undefined) parsed.timeframe = timeframe;
+	if (preset !== undefined) parsed.preset = preset;
+	if (limit !== undefined) parsed.limit = limit;
+	return parsed;
 }
 
-function uniqueSymbols(symbols: string[]): string[] {
+function uniqueSymbols(symbols: string[]): { symbols: string[]; duplicates: string[] } {
+	if (symbols.length === 0) throw new Error("At least one symbol is required");
+	if (symbols.length > MAX_SCREEN_SYMBOLS) throw new Error(`Screen at most ${MAX_SCREEN_SYMBOLS} symbols`);
 	const seen = new Set<string>();
 	const output: string[] = [];
+	const duplicates: string[] = [];
 	for (const raw of symbols) {
 		const symbol = raw.trim().toUpperCase();
-		if (!symbol) continue;
-		if (seen.has(symbol)) continue;
+		if (!symbol) throw new Error("Screen symbols must be non-empty");
+		if (seen.has(symbol)) {
+			duplicates.push(symbol);
+			continue;
+		}
 		seen.add(symbol);
 		output.push(symbol);
 	}
 	if (output.length === 0) throw new Error("At least one symbol is required");
-	if (output.length > MAX_SCREEN_SYMBOLS) throw new Error(`Screen at most ${MAX_SCREEN_SYMBOLS} symbols`);
-	return output;
+	return { symbols: output, duplicates };
+}
+
+function resolveTimeframe(timeframe?: string): string {
+	const value = timeframe?.trim() || "1h";
+	if (!TIMEFRAMES.has(value)) throw new Error(`Unsupported timeframe: ${value}`);
+	return value;
+}
+
+function resolveCandleLimit(limit?: number): number {
+	const value = limit === undefined ? 100 : limit;
+	if (!Number.isInteger(value) || value < MIN_CANDLES || value > MAX_CANDLES) {
+		throw new Error(`Invalid limit: integer ${MIN_CANDLES}-${MAX_CANDLES} required`);
+	}
+	return value;
+}
+
+async function withMarketDataAbort<T>(signal: AbortSignal | undefined, operation: (signal: AbortSignal) => Promise<T>) {
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+	const relay = (): void => controller.abort();
+	if (signal) {
+		if (signal.aborted) controller.abort();
+		else signal.addEventListener("abort", relay, { once: true });
+	}
+	if (controller.signal.aborted) {
+		clearTimeout(timeout);
+		if (signal) signal.removeEventListener("abort", relay);
+		throw new Error("Market data request timed out or was cancelled");
+	}
+	let rejectAbort: (() => void) | undefined;
+	const cancelled = new Promise<never>((_, reject) => {
+		rejectAbort = () => reject(new Error("Market data request timed out or was cancelled"));
+		if (controller.signal.aborted) rejectAbort();
+		else controller.signal.addEventListener("abort", rejectAbort, { once: true });
+	});
+	try {
+		const result = await Promise.race([
+			Promise.resolve().then(() => {
+				controller.signal.throwIfAborted();
+				return operation(controller.signal);
+			}),
+			cancelled,
+		]);
+		controller.signal.throwIfAborted();
+		return result;
+	} catch (error) {
+		if (controller.signal.aborted) throw new Error("Market data request timed out or was cancelled");
+		controller.abort(error);
+		throw error;
+	} finally {
+		clearTimeout(timeout);
+		if (signal) signal.removeEventListener("abort", relay);
+		if (rejectAbort) controller.signal.removeEventListener("abort", rejectAbort);
+	}
 }
 
 function binanceSymbol(symbol: string): string {
@@ -250,44 +409,48 @@ function candleFromValues(values: number[]): Candle {
 	};
 }
 
-function finalizeCandles(candles: Candle[], symbol: string, timeframe: string, source: MarketLabSource) {
+function finalizeCandles(candles: Candle[], symbol: string, timeframe: string, source: MarketLabSource, limit: number) {
 	for (const candle of candles)
 		candleFromValues([candle.timestamp, candle.open, candle.high, candle.low, candle.close, candle.volume]);
 	for (let index = 1; index < candles.length; index++)
 		if (candles[index].timestamp <= candles[index - 1].timestamp)
 			throw new Error("Market data candles were not ordered");
-	if (candles.length < 20) throw new Error("Not enough closed candles for analysis");
-	return { symbol: symbol.toUpperCase(), timeframe, candles, source };
+	const duration = Number(timeframe.slice(0, -1)) * TIMEFRAME_UNITS_MS[timeframe.slice(-1)];
+	const now = Date.now();
+	const closed = candles.filter((candle) => candle.timestamp + duration <= now).slice(-limit);
+	if (closed.length < MIN_CANDLES) throw new Error("Not enough closed candles for analysis");
+	return {
+		symbol: symbol.trim().toUpperCase(),
+		timeframe,
+		candles: closed,
+		source,
+		startedAt: new Date(closed[0].timestamp).toISOString(),
+		closedThrough: new Date(closed[closed.length - 1].timestamp + duration).toISOString(),
+	};
 }
 
-async function fetchCandles(
-	params: MarketParams,
-	signal?: AbortSignal,
-): Promise<{ symbol: string; timeframe: string; candles: Candle[]; source: MarketLabSource }> {
-	const timeframe = params.timeframe?.trim() || "1h";
-	if (!TIMEFRAMES.has(timeframe)) throw new Error(`Unsupported timeframe: ${timeframe}`);
-	const limit = Math.min(Math.max(Math.floor(params.limit ?? 100), 20), MAX_CANDLES);
+async function fetchCandles(params: MarketParams, signal?: AbortSignal) {
+	const timeframe = resolveTimeframe(params.timeframe);
+	const limit = resolveCandleLimit(params.limit);
 	const provider = getMarketLabCandleProvider();
 	if (provider) {
 		const symbol = sessionSymbol(params.symbol);
-		const result = await provider({ symbol, timeframe, limit, signal });
-		return finalizeCandles(result.candles, params.symbol, timeframe, result.source);
+		const result = await withMarketDataAbort(signal, (requestSignal) =>
+			provider({ symbol, timeframe, limit, signal: requestSignal }),
+		);
+		if (result.candles.length > limit) {
+			throw new Error(`Market data provider returned ${result.candles.length} candles; requested limit ${limit}`);
+		}
+		return finalizeCandles(result.candles, params.symbol, timeframe, result.source, limit);
 	}
 	const symbol = binanceSymbol(params.symbol);
-	const controller = new AbortController();
-	const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-	const relay = (): void => controller.abort();
-	if (signal) {
-		if (signal.aborted) controller.abort();
-		else signal.addEventListener("abort", relay, { once: true });
-	}
-	try {
+	return withMarketDataAbort(signal, async (requestSignal) => {
 		const response = await fetch(
 			`${BINANCE_API}/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(timeframe)}&limit=${limit + 1}`,
 			{
 				method: "GET",
 				redirect: "error",
-				signal: controller.signal,
+				signal: requestSignal,
 			},
 		);
 		if (!response.ok) throw new Error(`Market data request failed with HTTP ${response.status}`);
@@ -317,22 +480,19 @@ async function fetchCandles(
 		}
 		const payload: unknown = JSON.parse(new TextDecoder().decode(body));
 		if (!Array.isArray(payload)) throw new Error("Market data response was invalid");
-		const candles = payload.slice(0, -1).map((row): Candle => {
+		if (payload.length > limit + 1) throw new Error("Market data response exceeded the requested candle limit");
+		const candles = payload.map((row): Candle => {
 			if (!Array.isArray(row) || row.length < 6) throw new Error("Market data candle was invalid");
 			return candleFromValues(row.slice(0, 6).map(Number));
 		});
-		return finalizeCandles(candles, params.symbol, timeframe, {
-			venue: "binance",
-			market: "spot",
-			kind: "binance-public-klines",
-		});
-	} catch (error) {
-		if (controller.signal.aborted) throw new Error("Market data request timed out or was cancelled");
-		throw error;
-	} finally {
-		clearTimeout(timeout);
-		if (signal) signal.removeEventListener("abort", relay);
-	}
+		return finalizeCandles(
+			candles,
+			params.symbol,
+			timeframe,
+			{ venue: "binance", market: "spot", kind: "binance-public-klines" },
+			limit,
+		);
+	});
 }
 
 function rounded(point: IndicatorPoint | undefined): Record<string, number | null> {
@@ -376,7 +536,8 @@ async function analyze(params: MarketParams, signal?: AbortSignal) {
 		symbol: data.symbol,
 		timeframe: data.timeframe,
 		candleCount: data.candles.length,
-		closedThrough: new Date(data.candles.at(-1)?.timestamp ?? 0).toISOString(),
+		startedAt: data.startedAt,
+		closedThrough: data.closedThrough,
 		preset: evaluation.preset,
 		periods,
 		latest: { close: latest.close, ...rounded(latest) },
@@ -403,25 +564,44 @@ function screenRank(event: string | undefined, error?: string): number {
 }
 
 async function screenMarkets(params: ScreenParams, signal?: AbortSignal) {
-	const symbols = uniqueSymbols(params.symbols);
+	if (!Array.isArray(params.symbols)) throw new Error("symbols must be an array");
+	const { symbols, duplicates } = uniqueSymbols(params.symbols);
+	const timeframe = resolveTimeframe(params.timeframe);
+	const limit = resolveCandleLimit(params.limit);
 	const preset: StrategyPreset = params.preset ?? "ema-cross";
 	if (params.preset !== undefined && !isStrategyPreset(params.preset)) {
 		throw new Error(`Unsupported strategy preset: ${params.preset}`);
 	}
-	const rows: Array<Record<string, unknown>> = [];
+	const rows: Array<{
+		symbol: string;
+		source?: MarketLabSource;
+		timeframe?: string;
+		closedThrough?: string;
+		candleCount?: number;
+		close?: number;
+		bias?: string;
+		event?: string;
+		confidence?: string;
+		reasons?: string[];
+		warnings?: string[];
+		error?: string;
+	}> = [];
 	for (const symbol of symbols) {
 		if (signal?.aborted) throw new Error("Market data request timed out or was cancelled");
 		try {
-			const result = await analyze({ symbol, timeframe: params.timeframe, limit: params.limit, preset }, signal);
+			const result = await analyze({ symbol, timeframe, limit, preset }, signal);
 			rows.push({
 				source: result.source,
 				symbol: result.symbol,
 				timeframe: result.timeframe,
+				closedThrough: result.closedThrough,
+				candleCount: result.candleCount,
 				close: result.latest.close,
 				bias: result.bias,
 				event: result.event,
 				confidence: result.confidence,
 				reasons: result.reasons,
+				warnings: result.warnings,
 			});
 		} catch (error) {
 			if (signal?.aborted) throw new Error("Market data request timed out or was cancelled");
@@ -432,29 +612,46 @@ async function screenMarkets(params: ScreenParams, signal?: AbortSignal) {
 		}
 	}
 	rows.sort((left, right) => {
-		const rank =
-			screenRank(left.event as string | undefined, left.error as string | undefined) -
-			screenRank(right.event as string | undefined, right.error as string | undefined);
+		const rank = screenRank(left.event, left.error) - screenRank(right.event, right.error);
 		if (rank !== 0) return rank;
 		return String(left.symbol).localeCompare(String(right.symbol));
 	});
-	const source = (rows.find((row) => row.source !== undefined)?.source ?? {
-		venue: getMarketLabCandleProvider() ? "session" : "binance",
-		market: "spot",
-		kind: getMarketLabCandleProvider() ? "session-klines" : "binance-public-klines",
-	}) as MarketLabSource;
+	const sources = rows.flatMap((row) => (row.source ? [row.source] : []));
+	const firstSource = sources[0];
+	const mixedSources = sources.some(
+		(source) =>
+			source.venue !== firstSource.venue ||
+			source.market !== firstSource.market ||
+			source.kind !== firstSource.kind ||
+			source.mode !== firstSource.mode,
+	);
+	const source = mixedSources ? null : (firstSource ?? null);
+	const failed = rows.filter((row) => row.error !== undefined).length;
+	const status = failed === 0 ? "ok" : failed === rows.length ? "failed" : "partial-failure";
+	const warnings = [
+		source
+			? sourceWarning(source)
+			: mixedSources
+				? "Scan contains different market data sources; use each row's source instead of assuming one venue or market."
+				: "Every symbol failed; no market data source was confirmed.",
+		"This is a read-only scan; no order was created.",
+		"Volume ranking from get_top_markets is not a signal.",
+	];
+	if (duplicates.length > 0) {
+		warnings.push(`Duplicate symbols skipped after normalization: ${[...new Set(duplicates)].join(", ")}`);
+	}
 	return {
 		source,
-		timeframe: params.timeframe?.trim() || "1h",
+		status,
+		timeframe,
+		limit,
 		preset,
+		requested: params.symbols.length,
 		scanned: symbols.length,
-		failed: rows.filter((row) => row.error !== undefined).length,
+		failed,
+		duplicates,
 		rows,
-		warnings: [
-			sourceWarning(source),
-			"This is a read-only scan; no order was created.",
-			"Volume ranking from get_top_markets is not a signal.",
-		],
+		warnings,
 	};
 }
 
@@ -476,7 +673,8 @@ async function replayRule(params: MarketParams, signal?: AbortSignal) {
 		source: data.source,
 		symbol: data.symbol,
 		timeframe: data.timeframe,
-		closedThrough: new Date(data.candles.at(-1)?.timestamp ?? 0).toISOString(),
+		startedAt: data.startedAt,
+		closedThrough: data.closedThrough,
 		periods,
 		preset: replay.preset,
 		horizon: replay.horizon,
@@ -533,7 +731,8 @@ export default function marketLabExtension(pi: ExtensionAPI): void {
 				symbol: data.symbol,
 				timeframe: data.timeframe,
 				candleCount: points.length,
-				closedThrough: new Date(points.at(-1)?.timestamp ?? 0).toISOString(),
+				startedAt: data.startedAt,
+				closedThrough: data.closedThrough,
 				periods,
 				latest: { close: points.at(-1)?.close, ...rounded(points.at(-1)) },
 				warnings: [
@@ -570,28 +769,41 @@ export default function marketLabExtension(pi: ExtensionAPI): void {
 		},
 	});
 	pi.registerCommand("indicators", {
-		description: "Show read-only technical indicators: /indicators SYMBOL [TIMEFRAME]",
+		description: "Show read-only technical indicators: /indicators SYMBOL [TIMEFRAME] [limit=20-200]",
 		handler: async (args, ctx) => {
 			const parsed = parseLabArgs(args);
 			if (parsed.error) return ctx.ui.notify(parsed.error, "warning");
-			if (!parsed.symbol) return ctx.ui.notify("Usage: /indicators BTC/USDT [1h]", "warning");
+			if (!parsed.symbol) return ctx.ui.notify(usage("indicators"), "warning");
 			ctx.ui.notify(
-				JSON.stringify(await analyze({ symbol: parsed.symbol, timeframe: parsed.timeframe }), null, 2),
+				JSON.stringify(
+					await analyze({ symbol: parsed.symbol, timeframe: parsed.timeframe, limit: parsed.limit }, ctx.signal),
+					null,
+					2,
+				),
 				"info",
 			);
 		},
 	});
 	pi.registerCommand("signal", {
-		description: "Show a read-only market signal: /signal SYMBOL [TIMEFRAME] [ema-cross|rsi-revert|macd-hist]",
+		description:
+			"Show a read-only market signal: /signal SYMBOL [TIMEFRAME] [ema-cross|rsi-revert|macd-hist] [limit=20-200]",
 		handler: async (args, ctx) => {
 			const parsed = parseLabArgs(args);
 			if (parsed.error) return ctx.ui.notify(parsed.error, "warning");
 			if (!parsed.symbol) {
-				return ctx.ui.notify("Usage: /signal BTC/USDT [1h] [ema-cross|rsi-revert|macd-hist]", "warning");
+				return ctx.ui.notify(usage("signal"), "warning");
 			}
 			ctx.ui.notify(
 				JSON.stringify(
-					await analyze({ symbol: parsed.symbol, timeframe: parsed.timeframe, preset: parsed.preset }),
+					await analyze(
+						{
+							symbol: parsed.symbol,
+							timeframe: parsed.timeframe,
+							preset: parsed.preset,
+							limit: parsed.limit,
+						},
+						ctx.signal,
+					),
 					null,
 					2,
 				),
@@ -600,38 +812,50 @@ export default function marketLabExtension(pi: ExtensionAPI): void {
 		},
 	});
 	pi.registerCommand("screen", {
-		description: "Read-only multi-symbol scan: /screen BTC/USDT ETH/USDT [1h] [ema-cross|rsi-revert|macd-hist]",
+		description:
+			"Read-only multi-symbol scan: /screen BTC/USDT ETH/USDT [1h] [ema-cross|rsi-revert|macd-hist] [limit=20-200]",
 		handler: async (args, ctx) => {
 			const parsed = parseScreenArgs(args);
 			if (parsed.error) return ctx.ui.notify(parsed.error, "warning");
 			if (!parsed.symbols || parsed.symbols.length === 0) {
-				return ctx.ui.notify("Usage: /screen BTC/USDT ETH/USDT [1h] [ema-cross|rsi-revert|macd-hist]", "warning");
+				return ctx.ui.notify(usage("screen"), "warning");
 			}
+			const result = await screenMarkets(
+				{
+					symbols: parsed.symbols,
+					timeframe: parsed.timeframe,
+					preset: parsed.preset,
+					limit: parsed.limit,
+				},
+				ctx.signal,
+			);
 			ctx.ui.notify(
-				JSON.stringify(
-					await screenMarkets({
-						symbols: parsed.symbols,
-						timeframe: parsed.timeframe,
-						preset: parsed.preset,
-					}),
-					null,
-					2,
-				),
-				"info",
+				JSON.stringify(result, null, 2),
+				result.status === "failed" ? "error" : result.status === "partial-failure" ? "warning" : "info",
 			);
 		},
 	});
 	pi.registerCommand("replay", {
-		description: "Read-only closed-candle replay: /replay SYMBOL [TIMEFRAME] [ema-cross|rsi-revert|macd-hist]",
+		description:
+			"Read-only closed-candle replay: /replay SYMBOL [TIMEFRAME] [ema-cross|rsi-revert|macd-hist] [limit=20-200] [horizon=1-20]",
 		handler: async (args, ctx) => {
-			const parsed = parseLabArgs(args);
+			const parsed = parseMarketArgs(args, true);
 			if (parsed.error) return ctx.ui.notify(parsed.error, "warning");
 			if (!parsed.symbol) {
-				return ctx.ui.notify("Usage: /replay BTC/USDT [1h] [ema-cross|rsi-revert|macd-hist]", "warning");
+				return ctx.ui.notify(usage("replay"), "warning");
 			}
 			ctx.ui.notify(
 				JSON.stringify(
-					await replayRule({ symbol: parsed.symbol, timeframe: parsed.timeframe, preset: parsed.preset }),
+					await replayRule(
+						{
+							symbol: parsed.symbol,
+							timeframe: parsed.timeframe,
+							preset: parsed.preset,
+							limit: parsed.limit,
+							horizon: parsed.horizon,
+						},
+						ctx.signal,
+					),
 					null,
 					2,
 				),

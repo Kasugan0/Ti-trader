@@ -18,6 +18,8 @@ export interface RecoveryReport {
 	issues: Array<{ executionId: string; issue: ExecutionIssue }>;
 }
 export interface RecoveryOptions {
+	/** Running supervisors must not revoke prepared or still-submitting work. */
+	unknownOnly?: boolean;
 	maxRecords?: number;
 	attemptsPerRecord?: number;
 	lookupTimeoutMs?: number;
@@ -156,7 +158,7 @@ export function executionEvidence(
 	return { evidence, notional, outcome: notional === 0 ? "release" : "commit" };
 }
 
-async function boundedLookup<T>(lookup: () => Promise<T>, timeoutMs: number): Promise<T> {
+export async function boundedLookup<T>(lookup: () => Promise<T>, timeoutMs: number): Promise<T> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
 		return await Promise.race([
@@ -198,6 +200,7 @@ export async function recoverJournal(
 	const pending = journal
 		.list()
 		.filter(isUnresolvedExecution)
+		.filter((entry) => !options.unknownOnly || entry.status === "unknown")
 		.sort(
 			(left, right) =>
 				Number(sameExecutionScope(right.scope, journal.scope)) -

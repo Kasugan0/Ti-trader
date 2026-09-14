@@ -4,17 +4,27 @@ All notable changes to `ti-trader` are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Explicit headless autonomous Paper mode with persistent events, model-controlled wakes, separate AgentSession workers, reviewed research tools, independent risk supervision and start/status/pause/resume/stop controls. Autonomous live startup fails closed until adapters provide complete account-risk evidence.
+
 ### Changed
 
 - Paper futures now accepts the same limit and conditional order types as Paper spot. Prompts, tool descriptions and capability output no longer describe Paper futures as market-only. Futures OCO remains unsupported.
 - Trading query cards retain labeled fields and wrap narrow layouts instead of hiding order conditions or PnL. Market charts wrap Chinese explanations and use terminal display widths for styled content.
 - Live approval is visible beside the trading venue. A local health widget refreshes entry blocks and monitor observations every five seconds without exchange requests.
 - Slash completion keeps common commands first while showing all available commands. Risk limits and allowed symbols are editable in Settings; the Agent TUI row prepares its built-in settings command in the editor.
+- Market-lab commands accept explicit candle limits and replay horizons. Screens retain per-symbol source, closed sample time and warnings, and distinguish partial failure, total failure and mixed market sources.
+- Rule replays enter at the next candle's open after a closed-bar signal and exit at the configured candle horizon. RSI entries require an observed transition into an extreme; zero-trade statistics are unavailable rather than zero.
+- Conditional changes use shared durable one-hour history with explicit baseline tolerances, including autonomous wakes. Hedge PnL facts accept explicit `LONG`/`SHORT` suffixes; ordinary trigger commands do not modify autonomous-owned triggers.
 
 ### Fixed
 
 - Settings allowed-symbol edits drop empty tokens such as a trailing comma, instead of failing validation.
 - Live futures prompts no longer treat reduce-only conditionals as unconditionally available; the model must check `get_trading_capabilities`.
+- Market-lab replay percentage fields now return percentages (`10` for 10%) instead of fractions. Additive returns are explicitly distinguished from compounded or account returns.
+- Market-lab rejects invalid candle limits, unclosed data and stale session-runtime results, and propagates cancellation and request timeouts through tools and slash commands.
+- Trigger crossings reject stale or unordered baselines, unknown conditions preserve edge arming, and unsupported or ambiguous facts no longer silently select a position. Bounded history survives restarts and faster concurrent pollers.
 
 ## [0.2.2] - 2026-09-11
 

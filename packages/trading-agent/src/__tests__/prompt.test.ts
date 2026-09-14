@@ -216,6 +216,18 @@ describe("trading prompt", () => {
 		expect(prompt).toContain("A [trigger:id] message is an observation, not trading authorization");
 		expect(prompt).toContain("Live sessions never auto-wake from triggers");
 		expect(prompt).toContain("/risk reconcile");
+		expect(prompt).toContain("scoped durable conditions managed by /trigger");
+		expect(prompt).toContain("notification state survive restart");
+		expect(prompt).toContain("ordinary monitoring only runs while the session is active");
+		expect(prompt).not.toContain("in-memory conditions");
+	});
+
+	it("does not turn incomplete screening or zero-trade replay into performance evidence", () => {
+		const prompt = promptFor({ marketType: "spot" });
+
+		expect(prompt).toContain("missing or insufficient data is not a neutral signal");
+		expect(prompt).toContain("Report incomplete coverage");
+		expect(prompt).toContain("zero trades or insufficient data cannot establish performance");
 	});
 
 	it("states futures amount units and Binance close-all quantity semantics", () => {

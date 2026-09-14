@@ -15,6 +15,7 @@ import {
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { parseTradingArgs, printHelp } from "./args.ts";
+import { autonomousCommand } from "./autonomous/daemon.ts";
 import {
 	optionalBundledResearchToolNames,
 	resolveBundledMarketChartExtension,
@@ -90,6 +91,10 @@ export async function main(argv: string[]): Promise<void> {
 	}
 	if (parsed.version) {
 		console.log(`ti ${VERSION}`);
+		return;
+	}
+	if (parsed.autonomous) {
+		await autonomousCommand(parsed.autonomous);
 		return;
 	}
 

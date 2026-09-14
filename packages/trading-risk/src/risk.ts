@@ -1,4 +1,10 @@
 import { randomUUID } from "node:crypto";
+import {
+	type AccountRiskLimits,
+	type AccountRiskMemory,
+	validateAccountRiskLimits,
+	validateAccountRiskMemory,
+} from "./account-risk.ts";
 
 export type MarketType = "spot" | "usdm-futures" | "both";
 
@@ -8,6 +14,59 @@ export interface RiskLimits {
 	maxOrderNotional: number;
 	maxDailyNotional: number;
 	allowedSymbols: string[];
+	account?: AccountRiskLimits;
+}
+
+export type AccountRiskMutation = { symbol: string } & (
+	| { kind: "cancel"; orderIds: string[] }
+	| { kind: "leverage"; leverage: number }
+	| { kind: "margin"; marginType: "isolated" | "cross" }
+);
+export interface AccountRiskState {
+	limits: AccountRiskLimits;
+	memory?: AccountRiskMemory;
+	blockedReasons: string[];
+	revision: number;
+	mutation?: AccountRiskMutation & { id: string };
+}
+
+export function validateAccountRiskStates(value: unknown): asserts value is Record<string, AccountRiskState> {
+	if (!isRecord(value)) throw new Error("Invalid account risk state");
+	for (const [id, state] of Object.entries(value)) {
+		if (!/^[A-Za-z0-9_-]{1,80}$/.test(id) || !isRecord(state)) throw new Error("Invalid account risk identity");
+		validateAccountRiskLimits(state.limits);
+		if (state.memory !== undefined) validateAccountRiskMemory(state.memory);
+		if (
+			!Number.isSafeInteger(state.revision) ||
+			Number(state.revision) < 0 ||
+			!Array.isArray(state.blockedReasons) ||
+			state.blockedReasons.some((reason) => typeof reason !== "string")
+		) {
+			throw new Error("Invalid account risk revision/block");
+		}
+		if (state.mutation !== undefined) {
+			const mutation = state.mutation;
+			if (
+				!isRecord(mutation) ||
+				typeof mutation.id !== "string" ||
+				!/^[A-Za-z0-9_-]{1,80}$/.test(mutation.id) ||
+				typeof mutation.symbol !== "string" ||
+				!mutation.symbol ||
+				!(
+					(mutation.kind === "cancel" &&
+						Array.isArray(mutation.orderIds) &&
+						mutation.orderIds.length > 0 &&
+						mutation.orderIds.every((id) => typeof id === "string" && id.length > 0)) ||
+					(mutation.kind === "leverage" &&
+						typeof mutation.leverage === "number" &&
+						Number.isFinite(mutation.leverage) &&
+						mutation.leverage > 0) ||
+					(mutation.kind === "margin" && ["isolated", "cross"].includes(String(mutation.marginType)))
+				)
+			)
+				throw new Error("Invalid pending account mutation");
+		}
+	}
 }
 
 export interface RiskConfig {
@@ -119,6 +178,7 @@ export interface TradingRiskState {
 	paper: RiskUsageState;
 	live: RiskUsageState;
 	audit?: TradingAuditState;
+	accountRisk?: Record<string, AccountRiskState>;
 }
 
 export type RiskStateMutator<T> = (state: TradingRiskState) => T;
@@ -416,6 +476,7 @@ function normalizedUsage(usage: unknown, mode: TradingMode): RiskUsageState {
 function normalizedState(state: unknown): TradingRiskState {
 	if (!isRecord(state)) throw stateError("Invalid trading risk state");
 	if (state.audit !== undefined && !isTradingAuditState(state.audit)) throw stateError("Invalid audit history");
+	if (state.accountRisk !== undefined) validateAccountRiskStates(state.accountRisk);
 	return {
 		paper: normalizedUsage(state.paper, "paper"),
 		live: normalizedUsage(state.live, "live"),
@@ -452,6 +513,7 @@ function validateConfig(config: RiskConfig): RiskConfig {
 		throw new Error("quoteCurrency must contain only uppercase letters, numbers, '_' or '-'");
 	}
 	if (!isRecord(config.risk)) throw new Error("risk must be an object");
+	if (config.risk.account !== undefined) validateAccountRiskLimits(config.risk.account);
 	const maxOrderNotional = config.risk.maxOrderNotional;
 	const maxDailyNotional = config.risk.maxDailyNotional;
 	if (typeof maxOrderNotional !== "number" || !Number.isFinite(maxOrderNotional) || maxOrderNotional <= 0) {
@@ -585,7 +647,7 @@ export class RiskLedger {
 
 	check(symbol: string, notional: number, options: { countTowardsDailyLimit?: boolean } = {}): string | null {
 		const count = options.countTowardsDailyLimit ?? true;
-		const inputError = this.validateOrder(symbol, notional);
+		const inputError = this.validateOrder(symbol, notional, count);
 		if (inputError) return inputError;
 		if (!count) return null;
 
@@ -613,7 +675,7 @@ export class RiskLedger {
 		options: { countTowardsDailyLimit?: boolean; executionId?: string } = {},
 	): RiskReservation {
 		const count = options.countTowardsDailyLimit ?? true;
-		const inputError = this.validateOrder(symbol, notional);
+		const inputError = this.validateOrder(symbol, notional, count);
 		if (inputError) throw new Error(`Risk limit: ${inputError}`);
 		const { mode, risk, quoteCurrency } = this.config;
 		const id = randomUUID();
@@ -765,11 +827,12 @@ export class RiskLedger {
 		};
 	}
 
-	private validateOrder(symbol: string, notional: number): string | null {
+	private validateOrder(symbol: string, notional: number, increasing: boolean): string | null {
 		const { risk, quoteCurrency, marketType } = this.config;
 		const symbolError = validateTradingSymbol(symbol, marketType, quoteCurrency);
 		if (symbolError) return symbolError;
 		if (!Number.isFinite(notional) || notional <= 0) return "Order notional must be a positive finite number";
+		if (!increasing) return null;
 		if (risk.allowedSymbols.length > 0 && !risk.allowedSymbols.includes(symbol)) {
 			return `Symbol ${symbol} is not in risk.allowedSymbols (${risk.allowedSymbols.join(", ")})`;
 		}

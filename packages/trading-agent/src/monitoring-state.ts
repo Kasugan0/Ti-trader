@@ -3,14 +3,18 @@ import { dirname, join } from "node:path";
 import { withFileLockSync } from "@nikopack/ti-trading-engine";
 import {
 	type Condition,
+	type FactHistorySample,
 	type RuntimeState,
 	type TriggerDefinition,
 	validateTriggerDefinition,
 } from "@nikopack/ti-triggers";
+import { type AutonomousState, validateAutonomousState } from "./autonomous/state.ts";
 import { readJsonFile, TRADING_STATE_PATH, writeJsonFile } from "./config.ts";
+import { syncTradingStateFile } from "./state-durability.ts";
 
 export const MONITORING_MAX_AGE_MS = 5 * 60_000;
 export const MONITORING_LEASE_MS = 30_000;
+export const MONITORING_FACT_HISTORY_LIMIT = 1024;
 const MAX_NOTIFICATIONS = 256;
 const RETENTION_MS = 7 * 24 * 60 * 60_000;
 
@@ -56,6 +60,15 @@ export interface OrderMonitorState {
 	guards: Array<{ key: string; firstSeenAt?: number; lastAlertAt?: number }>;
 }
 
+export interface StoredFact extends FactHistorySample {
+	key: string;
+}
+
+export interface StoredFactHistory {
+	key: string;
+	samples: FactHistorySample[];
+}
+
 export interface MonitoringNotification {
 	id: string;
 	source: "triggers" | "orders";
@@ -79,10 +92,12 @@ export interface MonitoringScopeState {
 	scope: MonitoringScope;
 	updatedAt: number;
 	triggers: StoredTrigger[];
-	facts: Array<{ key: string; value: number; observedAt: number }>;
+	facts: StoredFact[];
+	factHistory?: StoredFactHistory[];
 	orders: OrderMonitorState;
 	health: { triggers: MonitorObservation; orders: MonitorObservation };
 	notifications: MonitoringNotification[];
+	autonomous?: AutonomousState;
 }
 
 export interface MonitoringState {
@@ -332,7 +347,18 @@ export function validateMonitoringState(value: unknown): asserts value is Monito
 	if (root.version !== 1) throw new Error("Unsupported monitoring state version");
 	const scopes = array(root.scopes, 64);
 	for (const value of scopes) {
-		const scope = object(value, ["scope", "updatedAt", "triggers", "facts", "orders", "health", "notifications"]);
+		const scope = object(value, [
+			"scope",
+			"updatedAt",
+			"triggers",
+			"facts",
+			"factHistory",
+			"orders",
+			"health",
+			"notifications",
+			"autonomous",
+		]);
+		if (scope.autonomous !== undefined) validateAutonomousState(scope.autonomous);
 		validateMonitoringScope(scope.scope);
 		time(scope.updatedAt);
 		const triggers = array(scope.triggers, 256);
@@ -346,7 +372,23 @@ export function validateMonitoringState(value: unknown): asserts value is Monito
 			number(fact.value);
 			time(fact.observedAt);
 		}
-		unique((facts as MonitoringScopeState["facts"]).map((fact) => fact.key));
+		unique((facts as StoredFact[]).map((fact) => fact.key));
+		if (scope.factHistory !== undefined) {
+			const histories = array(scope.factHistory, 7680);
+			for (const value of histories) {
+				const history = object(value, ["key", "samples"]);
+				text(history.key, 256);
+				let lastObservedAt = -1;
+				for (const sample of array(history.samples, MONITORING_FACT_HISTORY_LIMIT)) {
+					const fact = object(sample, ["value", "observedAt"]);
+					number(fact.value);
+					time(fact.observedAt);
+					if ((fact.observedAt as number) <= lastObservedAt) throw new Error("Invalid fact history order");
+					lastObservedAt = fact.observedAt as number;
+				}
+			}
+			unique((histories as StoredFactHistory[]).map((history) => history.key));
+		}
 		const orders = object(scope.orders, ["seeded", "cursor", "known", "missing", "guards"]);
 		oneOf(orders.seeded, [true, false]);
 		optionalTimes(orders, ["cursor"]);
@@ -413,14 +455,19 @@ export function createFileMonitoringStore(
 	return {
 		read,
 		transact: (operation) =>
-			withFileLockSync(`${path}.lock`, () => {
-				const state = read();
-				const result = operation(state);
-				if (result instanceof Promise) throw new Error("Monitoring transactions must be synchronous");
-				validateMonitoringState(state);
-				writeJsonFile(path, state);
-				return structuredClone(result);
-			}),
+			withFileLockSync(
+				`${path}.lock`,
+				() => {
+					const state = read();
+					const result = operation(state);
+					if (result instanceof Promise) throw new Error("Monitoring transactions must be synchronous");
+					validateMonitoringState(state);
+					writeJsonFile(path, state);
+					syncTradingStateFile(path);
+					return structuredClone(result);
+				},
+				{ staleMs: Number.POSITIVE_INFINITY, reclaimDeadOwner: true },
+			),
 	};
 }
 

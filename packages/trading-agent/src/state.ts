@@ -1,4 +1,5 @@
 import {
+	type AccountRiskState,
 	type ExchangeCredentials,
 	type ExecutionJournalState,
 	type FuturesMarginType,
@@ -10,6 +11,8 @@ import {
 	type RiskNewExposurePause,
 	type TradingAuditState,
 	type TradingMode,
+	validateAccountRiskLimits,
+	validateAccountRiskStates,
 	validateExecutionRiskState,
 	validateTradingSymbol,
 	withFileLockSync,
@@ -197,6 +200,7 @@ export function loadTradingConfig(modeOverride?: TradingMode): TradingConfig {
 }
 
 export function validateTradingConfig(config: TradingConfig): void {
+	if (config.risk.account !== undefined) validateAccountRiskLimits(config.risk.account);
 	if (config.language !== "zh-CN" && config.language !== "en-US")
 		throw new Error(`Invalid language: ${String(config.language)}`);
 	if (config.mode !== "paper" && config.mode !== "live")
@@ -264,6 +268,7 @@ export function saveTradingConfig(config: TradingConfig): void {
 		},
 		{
 			staleMs: Number.POSITIVE_INFINITY,
+			reclaimDeadOwner: true,
 			timeoutMessage: (path) => `Timed out waiting for trading configuration lock ${path}`,
 		},
 	);
@@ -328,6 +333,7 @@ export interface TradingState {
 	live: RiskUsageState;
 	executions?: ExecutionJournalState;
 	audit?: TradingAuditState;
+	accountRisk?: Record<string, AccountRiskState>;
 }
 
 export type TradingStateMutator<T> = (state: TradingState) => T;
@@ -355,8 +361,9 @@ export function transactTradingState<T>(mutator: TradingStateMutator<T>): T {
 /** Run one state-file operation while owning the lock for its complete read/write lifecycle. */
 function withStateLock<T>(lockPath: string, operation: () => T): T {
 	return withFileLockSync(lockPath, operation, {
-		// A suspended writer is not dead. Abandoned locks require verified operator removal, never a TTL takeover.
+		// Never revoke suspended writers based on age; only reclaim a verified dead local owner.
 		staleMs: Number.POSITIVE_INFINITY,
+		reclaimDeadOwner: true,
 		timeoutMessage: (path) => `Timed out waiting for trading state lock ${path}`,
 	});
 }
@@ -421,6 +428,7 @@ function isTradingState(value: unknown): value is TradingState {
 	)
 		return false;
 	try {
+		if (candidate.accountRisk !== undefined) validateAccountRiskStates(candidate.accountRisk);
 		validateExecutionRiskState(value as TradingState);
 	} catch {
 		return false;

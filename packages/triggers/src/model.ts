@@ -1,5 +1,7 @@
 export type TriState = "true" | "false" | "unknown";
 export type CompareOperator = "eq" | "neq" | "gt" | "gte" | "lt" | "lte";
+export const MAX_CHANGE_WINDOW_SEC = 60 * 60;
+export const CHANGE_WINDOW_BASELINE_TOLERANCE_MS = 15_000;
 
 export type FactRef = { key: string };
 export type Condition =
@@ -37,11 +39,16 @@ export interface RuntimeState {
 	lastFiredAt?: number;
 	lastEvaluationAt?: number;
 }
+export interface FactHistorySample {
+	value: number;
+	observedAt: number;
+}
 export interface FactValue {
 	value: number | string | boolean;
 	observedAt: number;
 	previousValue?: number;
 	previousObservedAt?: number;
+	history?: readonly FactHistorySample[];
 	quality?: "live" | "delayed" | "recovered";
 }
 export type FactSnapshot = Readonly<Record<string, FactValue>>;

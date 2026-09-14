@@ -13,6 +13,7 @@ import {
 	utimesSync,
 	writeFileSync,
 } from "node:fs";
+import { hostname } from "node:os";
 import { dirname, resolve } from "node:path";
 
 export const DEFAULT_FILE_LOCK = {
@@ -29,6 +30,7 @@ export interface FileLock {
 }
 
 export interface FileLockOptions {
+	reclaimDeadOwner?: boolean;
 	timeoutMs?: number;
 	staleMs?: number;
 	retryMs?: number;
@@ -107,8 +109,10 @@ function resolvedLockOptions(options: FileLockOptions = {}): {
 	staleMs: number;
 	retryMs: number;
 	timeoutMessage: (path: string) => string;
+	reclaimDeadOwner: boolean;
 } {
 	return {
+		reclaimDeadOwner: options.reclaimDeadOwner ?? false,
 		timeoutMs: options.timeoutMs ?? DEFAULT_FILE_LOCK.timeoutMs,
 		staleMs: options.staleMs ?? DEFAULT_FILE_LOCK.staleMs,
 		retryMs: options.retryMs ?? DEFAULT_FILE_LOCK.retryMs,
@@ -128,6 +132,8 @@ function isStaleLock(path: string, staleMs: number): boolean {
 function tryCreateLock(path: string): FileLock {
 	const fd = openSync(path, "wx", 0o600);
 	try {
+		writeFileSync(fd, JSON.stringify({ pid: process.pid, host: hostname() }));
+		fsyncSync(fd);
 		const stats = fstatSync(fd);
 		return { fd, path, device: stats.dev, inode: stats.ino };
 	} catch (error) {
@@ -144,11 +150,52 @@ function tryCreateLock(path: string): FileLock {
 	}
 }
 
+function reclaimDeadOwner(path: string): boolean {
+	let gate: FileLock;
+	try {
+		gate = tryCreateLock(`${path}.reclaim`);
+	} catch (error) {
+		if (fsErrorCode(error) === "EEXIST") return false;
+		throw error;
+	}
+	try {
+		let owner: unknown;
+		try {
+			owner = readJsonFile(path);
+		} catch (error) {
+			if (error instanceof SyntaxError || fsErrorCode(error) === "ENOENT") return false;
+			throw error;
+		}
+		if (
+			!owner ||
+			typeof owner !== "object" ||
+			!("host" in owner) ||
+			owner.host !== hostname() ||
+			!("pid" in owner) ||
+			typeof owner.pid !== "number" ||
+			!Number.isSafeInteger(owner.pid) ||
+			owner.pid <= 0
+		)
+			return false;
+		try {
+			process.kill(owner.pid, 0);
+			return false;
+		} catch (error) {
+			if (fsErrorCode(error) !== "ESRCH") throw error;
+		}
+		removeFileDurable(path);
+		return true;
+	} finally {
+		releaseFileLock(gate);
+	}
+}
+
 function reclaimOrWaitForLock(
 	path: string,
 	options: ReturnType<typeof resolvedLockOptions>,
 	deadline: number,
 ): "retry" | "wait" {
+	if (options.reclaimDeadOwner && reclaimDeadOwner(path)) return "retry";
 	if (isStaleLock(path, options.staleMs)) {
 		try {
 			unlinkSync(path);

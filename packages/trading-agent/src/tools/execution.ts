@@ -277,6 +277,7 @@ export async function executeOrder(
 				...(confirm === undefined ? {} : { confirm }),
 				...liveSubmissionOverride(trading),
 				submissionStatusUnknown: isSubmissionStatusUnknown,
+				...(params.protectionStopPrice === undefined ? {} : { protectionStopPrice: params.protectionStopPrice }),
 			},
 			signal,
 		);
@@ -360,6 +361,7 @@ export async function executeOco(
 				...(confirm === undefined ? {} : { confirm }),
 				...liveSubmissionOverride(trading),
 				submissionStatusUnknown: isSubmissionStatusUnknown,
+				...(params.protectionStopPrice === undefined ? {} : { protectionStopPrice: params.protectionStopPrice }),
 			},
 			signal,
 		);

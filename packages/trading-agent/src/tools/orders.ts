@@ -1,11 +1,13 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
+	AccountRiskError,
 	evaluateOrderCapability,
 	isBinanceCloseAllTrigger,
 	isFuturesSymbol,
 	type OrderIntent,
 	OrderPreparationError,
 	type PreparedOrder,
+	PreparedPlanError,
 } from "@nikopack/ti-trading-engine";
 import { getTrading } from "../context.ts";
 import {
@@ -205,6 +207,17 @@ export function createCheckOrderTool(
 			const riskError = trading.tradingEngine.risk.check(plan.input.symbol, plan.notional, {
 				countTowardsDailyLimit: plan.countTowardsDailyLimit,
 			});
+			let accountRiskError: string | undefined;
+			let accountRiskUnknown: string | undefined;
+			if (trading.tradingEngine.accountRisk?.state()) {
+				try {
+					await trading.tradingEngine.previewOrder(plan, { protectionStopPrice: params.protectionStopPrice });
+				} catch (error) {
+					if (error instanceof AccountRiskError || error instanceof PreparedPlanError)
+						accountRiskError = error.message;
+					else accountRiskUnknown = "Account risk or final execution facts are unavailable; placement is blocked";
+				}
+			}
 			const usage = trading.tradingEngine.risk.usage();
 			const futures = isFuturesSymbol(plan.input.symbol, trading.config.quoteCurrency);
 			const closeAllTrigger = isBinanceCloseAllTrigger(trading.tradingEngine.planningContext, plan);
@@ -266,6 +279,7 @@ export function createCheckOrderTool(
 				plan.input,
 			);
 			const hardReasons = [
+				...(accountRiskError ? [accountRiskError] : []),
 				...(riskError ? [riskError] : []),
 				...(balanceSufficient === false ? [`Insufficient available ${balanceAsset} for this estimate`] : []),
 				...(balance !== undefined &&
@@ -318,6 +332,7 @@ export function createCheckOrderTool(
 					: []),
 			];
 			const unknownReasons = [
+				...(accountRiskUnknown ? [accountRiskUnknown] : []),
 				...(marketInfoError ? [`Market filters unavailable during preflight: ${marketInfoError}`] : []),
 				...(balancesError ? [`Balance unavailable during preflight: ${balancesError}`] : []),
 				...(marketInfo === undefined && !marketInfoError
@@ -417,8 +432,8 @@ export function createCheckOrderTool(
 					source: trading.mode === "paper" ? "paper.feeRate" : "exchange-dependent; not exposed by adapter",
 				},
 				risk: {
-					allowed: riskError === null,
-					reason: riskError,
+					allowed: riskError === null && !accountRiskError && !accountRiskUnknown,
+					reason: riskError ?? accountRiskError ?? accountRiskUnknown ?? null,
 					countTowardsDailyLimit: plan.countTowardsDailyLimit,
 					usage,
 					remainingDailyNotional: Math.max(0, usage.limit - usage.used - usage.reserved),

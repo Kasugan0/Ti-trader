@@ -1,13 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import {
-	type Condition,
-	evaluateCondition,
-	type FactSnapshot,
-	type FactValue,
-	transitionTrigger,
-	validateTriggerDefinition,
-} from "@nikopack/ti-triggers";
+import { type Condition, type FactSnapshot, type FactValue, validateTriggerDefinition } from "@nikopack/ti-triggers";
 import { getTrading } from "./context.ts";
 import { t, translate } from "./i18n.ts";
 import {
@@ -25,27 +18,32 @@ import {
 	recordMonitoringObservation,
 	type StoredTrigger,
 } from "./monitoring-state.ts";
+import {
+	collectTriggerFactKeys,
+	parsePositionPnlFactKey,
+	prepareTriggerFacts,
+	transitionObservedTrigger,
+} from "./trigger-facts.ts";
 
 export interface TriggerMonitorOptions {
 	store?: MonitoringStore;
 	getScope?: (runtime: ReturnType<typeof getTrading>) => MonitoringScope;
 }
 
-function factKeys(condition: Condition, keys: Set<string>): void {
-	switch (condition.kind) {
-		case "compare":
-		case "cross":
-		case "change":
-			keys.add(condition.fact.key);
-			return;
-		case "all":
-		case "any":
-			for (const child of condition.conditions) factKeys(child, keys);
-			return;
-		case "not":
-		case "stable_for":
-			factKeys(condition.condition, keys);
+function isAutonomousTrigger(trigger: StoredTrigger, triggerIds: readonly string[] | undefined): boolean {
+	return triggerIds?.includes(trigger.definition.id) ?? false;
+}
+
+function validateMonitorFactKeys(condition: Condition): void {
+	if ("fact" in condition) {
+		if (condition.fact.key.startsWith("price:")) {
+			if (condition.fact.key.slice("price:".length).trim() === "") throw new Error("price fact symbol is required");
+		} else if (condition.fact.key.startsWith("position_pnl_pct:")) {
+			parsePositionPnlFactKey(condition.fact.key);
+		} else throw new Error(`unsupported fact key "${condition.fact.key}"`);
 	}
+	if ("conditions" in condition) for (const child of condition.conditions) validateMonitorFactKeys(child);
+	if ("condition" in condition) validateMonitorFactKeys(condition.condition);
 }
 
 function warning(ctx: ExtensionContext, message: string): void {
@@ -92,14 +90,13 @@ export function createTriggerMonitorExtension(options: TriggerMonitorOptions = {
 		};
 
 		const factsFor = async (
-			triggers: StoredTrigger[],
+			keys: Iterable<string>,
 			ctx: ExtensionContext,
 			engine: TradingEngine,
 			marketData: MarketData,
 			isCurrent: () => boolean,
 		): Promise<{ facts: FactSnapshot; failed: boolean } | undefined> => {
-			const keys = new Set<string>();
-			for (const trigger of triggers) if (trigger.state.status === "active") factKeys(trigger.definition.when, keys);
+			const requestedKeys = [...keys];
 			const facts: Record<string, FactValue> = {};
 			let failed = false;
 			const report = (source: string, error: unknown): void => {
@@ -110,7 +107,7 @@ export function createTriggerMonitorExtension(options: TriggerMonitorOptions = {
 			};
 			let positions: Awaited<ReturnType<TradingEngine["getPositions"]>> | undefined;
 			let positionsObservedAt: number | undefined;
-			if ([...keys].some((key) => key.startsWith("position_pnl_pct:"))) {
+			if (requestedKeys.some((key) => key.startsWith("position_pnl_pct:"))) {
 				try {
 					positions = await engine.getPositions();
 					positionsObservedAt = Date.now();
@@ -120,7 +117,7 @@ export function createTriggerMonitorExtension(options: TriggerMonitorOptions = {
 				}
 			}
 			if (!isCurrent()) return undefined;
-			for (const key of keys) {
+			for (const key of requestedKeys) {
 				let value: number | undefined;
 				let observedAt: number | undefined;
 				if (key.startsWith("price:")) {
@@ -134,7 +131,23 @@ export function createTriggerMonitorExtension(options: TriggerMonitorOptions = {
 						report(key, error);
 					}
 				} else if (key.startsWith("position_pnl_pct:")) {
-					value = positions?.find((p) => p.symbol === key.slice("position_pnl_pct:".length))?.unrealizedPnlPct;
+					const requested = parsePositionPnlFactKey(key);
+					const matches = (positions ?? []).filter((position) => {
+						if (position.symbol !== requested.symbol) return false;
+						return requested.positionSide === undefined || position.positionSide === requested.positionSide;
+					});
+					if (matches.length > 1) {
+						failed = true;
+						if (!warnedFactKeys.has(key)) {
+							warnedFactKeys.add(key);
+							warning(
+								ctx,
+								`ambiguous position fact "${key}"; use position_pnl_pct:${requested.symbol}:LONG or position_pnl_pct:${requested.symbol}:SHORT`,
+							);
+						}
+						continue;
+					}
+					value = matches[0]?.unrealizedPnlPct;
 					observedAt = positionsObservedAt;
 				} else {
 					failed = true;
@@ -226,38 +239,29 @@ export function createTriggerMonitorExtension(options: TriggerMonitorOptions = {
 				key = { token, engine, marketData };
 				pollingKey = key;
 				deliver(scope, ctx, isCurrent);
-				const triggers = findMonitoringScope(store.read(), scope)?.triggers ?? [];
-				const collected = await factsFor(triggers, ctx, engine, marketData, isCurrent);
+				const monitoring = findMonitoringScope(store.read(), scope);
+				const triggers =
+					monitoring?.triggers.filter(
+						(trigger) => !isAutonomousTrigger(trigger, monitoring.autonomous?.triggerIds),
+					) ?? [];
+				const keys = new Set<string>();
+				for (const trigger of triggers)
+					if (trigger.state.status === "active") collectTriggerFactKeys(trigger.definition.when, keys);
+				const collected = await factsFor(keys, ctx, engine, marketData, isCurrent);
 				if (!collected || !isCurrent()) return;
 				const now = Date.now();
 				const freshDeliveries = new Set<string>();
 				store.transact((state) => {
 					const entry = ensureMonitoringScope(state, capturedScope, now);
-					const facts: Record<string, FactValue> = {};
-					const advanced = new Set<string>();
-					let failed = collected.failed;
-					for (const [factKey, fact] of Object.entries(collected.facts)) {
-						if (fact.observedAt > now || now - fact.observedAt > MONITORING_MAX_AGE_MS) {
-							failed = true;
-							continue;
-						}
-						const previous = entry.facts.find((item) => item.key === factKey);
-						if (previous && fact.observedAt < previous.observedAt) continue;
-						const isNew = !previous || fact.observedAt > previous.observedAt;
-						const baseline =
-							isNew && previous && now - previous.observedAt <= MONITORING_MAX_AGE_MS ? previous : undefined;
-						facts[factKey] = {
-							...fact,
-							previousValue: baseline?.value,
-							previousObservedAt: baseline?.observedAt,
-						};
-						if (isNew) advanced.add(factKey);
-					}
+					const { facts, advanced, failed } = prepareTriggerFacts(
+						entry,
+						collected.facts,
+						now,
+						MONITORING_MAX_AGE_MS,
+					);
 					for (const trigger of entry.triggers) {
 						if (!triggers.some((item) => item.revision === trigger.revision)) continue;
 						const definition = trigger.definition;
-						const keys = new Set<string>();
-						factKeys(definition.when, keys);
 						const previous = { ...trigger.state };
 						if (previous.lastEvaluationAt !== undefined && previous.lastEvaluationAt >= now) continue;
 						// A long observation gap cannot prove continuous truth. Cooldown and
@@ -273,32 +277,9 @@ export function createTriggerMonitorExtension(options: TriggerMonitorOptions = {
 							trigger.state = { ...previous, status: "expired", lastEvaluationAt: now };
 							continue;
 						}
-						const result = transitionTrigger(definition, previous, facts, now, { futureToleranceMs: 0 });
-						if (result.evaluation.state === "unknown") result.state.armed = previous.armed;
-						// Keep continuity invalidation even without new facts. Repeated
-						// snapshots cannot fire again unless clock branches independently
-						// establish truth under the same nested evaluator semantics.
-						if (
-							result.shouldFire &&
-							keys.size > 0 &&
-							![...keys].some((factKey) => advanced.has(factKey)) &&
-							evaluateCondition(
-								definition.when,
-								{},
-								now,
-								previous.stableSince,
-								{ futureToleranceMs: 0 },
-								previous.stableSinceByPath,
-							).state !== "true"
-						) {
-							result.shouldFire = false;
-							result.state = {
-								...result.state,
-								status: previous.status,
-								lastFiredAt: previous.lastFiredAt,
-								armed: previous.armed,
-							};
-						}
+						const result = transitionObservedTrigger(definition, previous, facts, advanced, now, {
+							futureToleranceMs: 0,
+						});
 						trigger.state = result.state;
 						trigger.updatedAt = now;
 						if (!result.shouldFire) continue;
@@ -329,24 +310,13 @@ export function createTriggerMonitorExtension(options: TriggerMonitorOptions = {
 						trigger.lastDeliveryId = id;
 						freshDeliveries.add(id);
 					}
-					const activeKeys = new Set<string>();
-					for (const trigger of entry.triggers) factKeys(trigger.definition.when, activeKeys);
-					const nextFacts = new Map(
-						entry.facts.filter((fact) => activeKeys.has(fact.key)).map((fact) => [fact.key, fact]),
-					);
-					for (const factKey of advanced) {
-						const fact = facts[factKey];
-						if (activeKeys.has(factKey) && typeof fact.value === "number")
-							nextFacts.set(factKey, { key: factKey, value: fact.value, observedAt: fact.observedAt });
-					}
-					entry.facts = [...nextFacts.values()];
 					const observed = Object.values(facts).map((fact) => fact.observedAt);
 					recordMonitoringObservation(
 						entry,
 						"triggers",
 						now,
 						observed.length > 0 ? Math.min(...observed) : undefined,
-						failed,
+						failed || collected.failed,
 					);
 				});
 				deliver(scope, ctx, isCurrent, freshDeliveries);
@@ -403,9 +373,16 @@ export function createTriggerMonitorExtension(options: TriggerMonitorOptions = {
 						if (!rest) throw new Error("add requires one-line JSON TriggerDefinition");
 						const value: unknown = JSON.parse(rest);
 						validateTriggerDefinition(value);
+						validateMonitorFactKeys(value.when);
 						store.transact((state) => {
 							const entry = ensureMonitoringScope(state, scope, Date.now());
-							const old = entry.triggers.find((trigger) => trigger.definition.id === value.id);
+							if (entry.autonomous?.triggerIds.includes(value.id))
+								throw new Error(`Cannot modify autonomous-owned trigger: ${value.id}`);
+							const old = entry.triggers.find(
+								(trigger) =>
+									trigger.definition.id === value.id &&
+									!isAutonomousTrigger(trigger, entry.autonomous?.triggerIds),
+							);
 							entry.triggers = entry.triggers.filter((trigger) => trigger !== old);
 							if (old) cancelTriggerNotifications(entry, [old.revision], Date.now());
 							entry.triggers.push({
@@ -418,7 +395,11 @@ export function createTriggerMonitorExtension(options: TriggerMonitorOptions = {
 						if (ctx.hasUI)
 							ctx.ui.notify(translate(getTrading().config.language, "triggerAdded", { id: value.id }), "info");
 					} else if (command === "list") {
-						const triggers = findMonitoringScope(store.read(), scope)?.triggers ?? [];
+						const monitoring = findMonitoringScope(store.read(), scope);
+						const triggers =
+							monitoring?.triggers.filter(
+								(trigger) => !isAutonomousTrigger(trigger, monitoring.autonomous?.triggerIds),
+							) ?? [];
 						if (ctx.hasUI)
 							ctx.ui.notify(
 								triggers.length === 0
@@ -432,7 +413,9 @@ export function createTriggerMonitorExtension(options: TriggerMonitorOptions = {
 						store.transact((state) => {
 							const entry = ensureMonitoringScope(state, scope, Date.now());
 							const removed = entry.triggers.filter(
-								(trigger) => command === "clear" || trigger.definition.id === rest,
+								(trigger) =>
+									!isAutonomousTrigger(trigger, entry.autonomous?.triggerIds) &&
+									(command === "clear" || trigger.definition.id === rest),
 							);
 							if (command === "remove" && (!rest || removed.length === 0))
 								throw new Error(`Trigger not found: ${rest}`);
@@ -443,8 +426,10 @@ export function createTriggerMonitorExtension(options: TriggerMonitorOptions = {
 								Date.now(),
 							);
 							const keys = new Set<string>();
-							for (const trigger of entry.triggers) factKeys(trigger.definition.when, keys);
+							for (const trigger of entry.triggers) collectTriggerFactKeys(trigger.definition.when, keys);
 							entry.facts = entry.facts.filter((fact) => keys.has(fact.key));
+							entry.factHistory = entry.factHistory?.filter((history) => keys.has(history.key));
+							if (entry.factHistory?.length === 0) delete entry.factHistory;
 						});
 					} else warning(ctx, "usage: /trigger add <JSON>|list|remove <id>|clear");
 				} catch (error) {

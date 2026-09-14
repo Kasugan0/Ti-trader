@@ -353,7 +353,7 @@ function buildToolNotes(input: {
 	];
 	if (has("screen_markets")) {
 		discover.push(
-			"screen_markets: read-only scan of 1-8 session-market symbols with a named preset. Failures stay on that row; a ranked bias is not a trading signal.",
+			"screen_markets: read-only scan of 1-8 session-market symbols with a named preset. Failures stay on that row; missing or insufficient data is not a neutral signal. Report incomplete coverage and compare each row's source and observation time before ranking opportunities. A ranked bias is not a trading signal.",
 		);
 	}
 
@@ -415,7 +415,7 @@ function buildToolNotes(input: {
 	}
 	if (has("simulate_rule")) {
 		analyze.push(
-			"simulate_rule: closed-candle replay of a named preset. Reports tradeCount/winRate/avgReturnPct without fees or fills. Not a backtest and not an order.",
+			"simulate_rule: closed-candle replay of a named preset. Reports tradeCount/winRate/avgReturnPct without fees or fills. State the sample range and holding horizon; zero trades or insufficient data cannot establish performance. Not a backtest and not an order.",
 		);
 	}
 	if (has("freqtrade_status") || has("freqtrade_backtest") || has("freqtrade_signals")) {
@@ -460,7 +460,7 @@ function buildToolNotes(input: {
 	const background: string[] = [
 		"Order monitor: a background monitor polls open orders and injects an [order monitor] message when a resting order fills. When you receive one, verify with get_positions / get_order_history and decide the follow-up (e.g. place a protective bracket after an entry fill).",
 		"Position guard: the monitor also watches open positions and injects a [position guard] message when a position has no stop-loss protection or its unrealized loss breaches the alert threshold. Treat these as action items: protect, adjust, or close the position via the tools, or briefly report to the user why no action is needed. Never ignore them.",
-		"Triggers: experimental in-memory conditions. A [trigger:id] message is an observation, not trading authorization and not a risk approval. Re-check portfolio and call check_order before any order. Live sessions never auto-wake from triggers; they notify only.",
+		"Triggers: scoped durable conditions managed by /trigger. Definitions, baselines, cooldowns and notification state survive restart, but ordinary monitoring only runs while the session is active. Missing observations are unknown; restarting cannot reconstruct unobserved crossings. A [trigger:id] message is an observation, not trading authorization and not a risk approval. Re-check portfolio and call check_order before any order. Live sessions never auto-wake from triggers; they notify only.",
 	];
 
 	const loadedResearch = RESEARCH_TOOL_NAMES.filter((name) => has(name));
