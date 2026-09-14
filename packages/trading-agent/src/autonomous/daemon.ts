@@ -13,7 +13,12 @@ import {
 } from "@nikopack/ti-trading-engine";
 import { AGENT_DIR, ensureAgentDir } from "../config.ts";
 import { TradingRuntime } from "../context.ts";
-import { createFileMonitoringStore, validateMonitoringScope } from "../monitoring-state.ts";
+import {
+	createFileMonitoringStore,
+	findMonitoringScope,
+	monitoringScopeKey,
+	validateMonitoringScope,
+} from "../monitoring-state.ts";
 import { loadTradingConfig, loadTradingState, saveTradingState, transactTradingState } from "../state.ts";
 import { loadAutonomousConfig } from "./config.ts";
 import { ModelProcess } from "./model-process.ts";
@@ -29,6 +34,44 @@ interface DaemonManifest {
 	startedAt: number;
 }
 const manifestPath = join(AGENT_DIR, "autonomous-process.json");
+const expectedScopeEnvironmentKey = "TI_AUTONOMOUS_EXPECTED_SCOPE";
+
+export function assertAutonomousScope(expected: ExecutionScope, actual: ExecutionScope): void {
+	if (monitoringScopeKey(expected) !== monitoringScopeKey(actual))
+		throw new Error(
+			"Autonomous account differs from the active TUI account; switch to the matching account before controlling it",
+		);
+}
+
+function readStatus(existing: DaemonManifest, state: AutonomousStore) {
+	const current = state.read();
+	const risk = loadTradingState();
+	return {
+		mode: existing.scope.mode,
+		exchange: existing.scope.exchange,
+		marketType: existing.scope.marketType,
+		pid: existing.pid,
+		processAlive: processExists(existing.pid),
+		control: current.control,
+		heartbeat: current.heartbeat,
+		pendingEvents: current.events.length,
+		currentDecision: current.decision,
+		wakes: findMonitoringScope(state.store.read(), existing.scope)?.triggers.filter((trigger) =>
+			current.triggerIds.includes(trigger.definition.id),
+		),
+		lastDecision: current.summaries.at(-1),
+		failures: current.failures.slice(-10),
+		risk: risk.accountRisk,
+		userPause: risk[existing.scope.mode].newExposurePause,
+	};
+}
+
+export type AutonomousStatus = ReturnType<typeof readStatus>;
+export interface AutonomousCommandOptions {
+	expectedScope?: ExecutionScope;
+	output?: (message: string) => void;
+	onStatus?: (status: AutonomousStatus) => void;
+}
 
 function manifest(): DaemonManifest | undefined {
 	const value = readJsonFile(manifestPath);
@@ -57,8 +100,12 @@ function processExists(pid: number): boolean {
 	}
 }
 
-export async function autonomousCommand(command: AutonomousCommand): Promise<void> {
+export async function autonomousCommand(
+	command: AutonomousCommand,
+	options: AutonomousCommandOptions = {},
+): Promise<void> {
 	ensureAgentDir();
+	const output = options.output ?? console.log;
 	if (command === "run") {
 		await runDaemon();
 		return;
@@ -68,12 +115,24 @@ export async function autonomousCommand(command: AutonomousCommand): Promise<voi
 		const config = loadAutonomousConfig();
 		const tradingConfig = loadTradingConfig();
 		validateAccountRiskLimits(tradingConfig.risk.account);
+		if (options.expectedScope) {
+			validateMonitoringScope(options.expectedScope);
+			for (const key of ["mode", "exchange", "marketType", "quoteCurrency"] as const)
+				if (config[key] !== options.expectedScope[key] || tradingConfig[key] !== options.expectedScope[key])
+					throw new Error(`Autonomous configuration differs from the active TUI account: ${key}`);
+			if (tradingConfig.positionMode !== options.expectedScope.positionMode)
+				throw new Error("Autonomous position mode differs from the active TUI account");
+		}
 		if (existing && processExists(existing.pid)) throw new Error("Autonomous process is already running");
 		const logPath = join(AGENT_DIR, "autonomous.log");
 		const log = openSync(logPath, "a", 0o600);
 		const child = fork(process.argv[1], ["--autonomous", "run"], {
 			detached: true,
 			stdio: ["ignore", log, log, "ipc"],
+			env: {
+				...process.env,
+				[expectedScopeEnvironmentKey]: options.expectedScope ? JSON.stringify(options.expectedScope) : undefined,
+			},
 		});
 		closeSync(log);
 		try {
@@ -98,40 +157,16 @@ export async function autonomousCommand(command: AutonomousCommand): Promise<voi
 			if (child.connected) child.disconnect();
 			child.unref();
 		}
-		console.log(`Autonomous runtime started. pid=${child.pid} mode=${config.mode} log=${logPath}`);
+		output(`Autonomous runtime started. pid=${child.pid} mode=${config.mode} log=${logPath}`);
 		return;
 	}
 	if (!existing) throw new Error("No autonomous runtime has been initialized");
+	if (options.expectedScope) assertAutonomousScope(options.expectedScope, existing.scope);
 	const state = new AutonomousStore(createFileMonitoringStore(), existing.scope);
 	if (command === "status") {
-		const current = state.read();
-		console.log(
-			JSON.stringify(
-				{
-					mode: existing.scope.mode,
-					exchange: existing.scope.exchange,
-					marketType: existing.scope.marketType,
-					pid: existing.pid,
-					processAlive: processExists(existing.pid),
-					control: current.control,
-					heartbeat: current.heartbeat,
-					pendingEvents: current.events.length,
-					currentDecision: current.decision,
-					wakes: state.store
-						.read()
-						.scopes.find(
-							(scope) =>
-								scope.scope.accountId === existing.scope.accountId && scope.scope.mode === existing.scope.mode,
-						)?.triggers,
-					lastDecision: current.summaries.at(-1),
-					failures: current.failures.slice(-10),
-					risk: loadTradingState().accountRisk,
-					userPause: loadTradingState()[existing.scope.mode].newExposurePause,
-				},
-				null,
-				2,
-			),
-		);
+		const status = readStatus(existing, state);
+		if (options.onStatus) options.onStatus(status);
+		else output(JSON.stringify(status, null, 2));
 		return;
 	}
 	const config = loadTradingConfig(existing.scope.mode);
@@ -145,7 +180,7 @@ export async function autonomousCommand(command: AutonomousCommand): Promise<voi
 		state.mutate((state) => {
 			state.control = "paused";
 		});
-		console.log(
+		output(
 			"Model paused; new exposure blocked. Independent risk monitoring and existing protection remain active. No implicit cancellation or liquidation.",
 		);
 	} else if (command === "resume") {
@@ -161,18 +196,26 @@ export async function autonomousCommand(command: AutonomousCommand): Promise<voi
 			at: Date.now(),
 			message: "Operator resumed model decisions. Re-evaluate authoritative account and persistent risk state.",
 		});
-		console.log("Model resumed. Persistent loss trips and unresolved execution blocks are unchanged.");
+		output("Model resumed. Persistent loss trips and unresolved execution blocks are unchanged.");
 	} else {
 		state.mutate((state) => {
 			state.control = "stopped";
 		});
-		console.log(
+		output(
 			"Stop requested. Model and daemon will stop; no orders are cancelled and no positions are closed. Exchange-native protection remains.",
 		);
 	}
 }
 
 export async function runDaemon(): Promise<void> {
+	let expectedScope: ExecutionScope | undefined;
+	const capturedScope = process.env[expectedScopeEnvironmentKey];
+	if (capturedScope !== undefined) {
+		const parsed: unknown = JSON.parse(capturedScope);
+		validateMonitoringScope(parsed);
+		if (parsed.positionMode === undefined) throw new Error("Expected autonomous position mode is missing");
+		expectedScope = { ...parsed, positionMode: parsed.positionMode };
+	}
 	const config = loadAutonomousConfig();
 	const tradingConfig = loadTradingConfig();
 	for (const key of ["mode", "exchange", "marketType", "quoteCurrency"] as const) {
@@ -203,6 +246,7 @@ export async function runDaemon(): Promise<void> {
 		trading = await TradingRuntime.init();
 		monitor = await TradingRuntime.init();
 		const scope = trading.getExecutionScope();
+		if (expectedScope) assertAutonomousScope(expectedScope, scope);
 		const state = new AutonomousStore(createFileMonitoringStore(), scope);
 		const model = new ModelProcess(config, AGENT_DIR, new AutonomousTools(trading.tradingEngine, state, config));
 		const monitorEngine = monitor.tradingEngine;

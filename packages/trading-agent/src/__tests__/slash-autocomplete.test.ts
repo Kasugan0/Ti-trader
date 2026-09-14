@@ -8,6 +8,12 @@ function item(value: string, description = `${value} desc`): AutocompleteItem {
 }
 
 describe("pinSlashSuggestions", () => {
+	it("pins and localizes the autonomous command", () => {
+		const result = pinSlashSuggestions([item("autonomous", "fallback"), item("settings")], "");
+		expect(result.map((entry) => entry.value)).toEqual(["settings", "autonomous"]);
+		expect(result[1]?.description).toBe(MENU_EN.cmdAutonomous);
+	});
+
 	it("keeps the pinned order when the prefix is empty", () => {
 		const items = [item("quit"), item("balance"), item("hotkeys"), item("settings"), item("model"), item("language")];
 		expect(pinSlashSuggestions(items, "").map((entry) => entry.value)).toEqual([

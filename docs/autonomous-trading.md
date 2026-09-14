@@ -85,6 +85,20 @@ Reviewed service names are `market-lab`, `web-search`, `zhihu-research`, `freqtr
 
 ## Start and control the runtime
 
+In a Ti TUI launched with the same `TI_DATA_DIR`, use:
+
+```text
+/autonomous start
+/autonomous status
+/autonomous pause
+/autonomous resume
+/autonomous stop
+```
+
+Bare `/autonomous` shows status. Subcommands appear in slash completion. Configuration above is still required: this command does not invent risk limits, enable live trading or select a model for you. Errors appear in the transcript with configuration guidance.
+
+Controls are bound to the TUI's active account, including Paper/live, exchange, market, quote currency and position mode. An account mismatch is rejected; switch to the matching account before controlling its daemon. `start` and `resume` wait for the current TUI model turn to finish. `pause`, `stop` and `status` do not wait. The daemon remains independent: exiting the TUI does not stop it, and `/autonomous stop` does not close positions.
+
 For an installed candidate:
 
 ```bash

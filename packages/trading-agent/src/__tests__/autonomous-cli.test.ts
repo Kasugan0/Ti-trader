@@ -1,5 +1,5 @@
 import { execFile, fork } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,6 +15,7 @@ const execute = promisify(execFile);
 const require = createRequire(import.meta.url);
 const loader = require.resolve("tsx");
 const cli = fileURLToPath(new URL("../cli.ts", import.meta.url));
+const control = fileURLToPath(new URL("./fixtures/autonomous-control.ts", import.meta.url));
 const tsconfig = fileURLToPath(new URL("../../../../tsconfig.json", import.meta.url));
 let directory: string;
 beforeEach(() => {
@@ -29,7 +30,7 @@ function environment(): NodeJS.ProcessEnv {
 }
 
 describe("headless CLI and worker process boundaries", () => {
-	it("refuses autonomous live mode before loading trading credentials or contacting a venue", async () => {
+	it("refuses mismatched TUI startup and autonomous live mode before loading credentials or contacting a venue", async () => {
 		const agentDir = join(directory, "agent");
 		writeJsonFileDurable(join(agentDir, "trading.json"), {
 			...DEFAULT_CONFIG,
@@ -76,6 +77,13 @@ describe("headless CLI and worker process boundaries", () => {
 			protectionAttempts: 1,
 		});
 		await expect(
+			execute(process.execPath, ["--import", loader, control, "start"], {
+				env: environment(),
+				timeout: 10000,
+			}),
+		).rejects.toThrow("Autonomous configuration differs from the active TUI account: mode");
+		expect(existsSync(join(agentDir, "autonomous.log"))).toBe(false);
+		await expect(
 			execute(process.execPath, ["--import", loader, cli, "--autonomous", "run"], {
 				env: environment(),
 				timeout: 10000,
@@ -109,13 +117,61 @@ describe("headless CLI and worker process boundaries", () => {
 			});
 		const status = await run("status");
 		expect(JSON.parse(status.stdout)).toMatchObject({ control: "running", processAlive: true });
+		const callbackStatus = await execute(process.execPath, ["--import", loader, control, "status"], {
+			env: environment(),
+			timeout: 10000,
+		});
+		expect(JSON.parse(callbackStatus.stdout)).toMatchObject({ status: { control: "running", processAlive: true } });
 		await run("pause");
 		expect(store.read().control).toBe("paused");
+		const callbackResume = await execute(process.execPath, ["--import", loader, control, "resume"], {
+			env: environment(),
+			timeout: 10000,
+		});
+		expect(JSON.parse(callbackResume.stdout).output).toContain("Model resumed");
+		expect(store.read().control).toBe("running");
 		await run("resume");
 		expect(store.read().control).toBe("running");
 		await run("stop");
 		expect(store.read().control).toBe("stopped");
-	}, 20000);
+	}, 25000);
+
+	it.each(["paper", "live"] as const)(
+		"rejects controls of a different %s account without modifying state",
+		async (mode) => {
+			const agentDir = join(directory, "agent");
+			const scope = {
+				mode,
+				exchange: "binance",
+				marketType: "spot" as const,
+				quoteCurrency: "USDT",
+				positionMode: "one-way" as const,
+				accountId: mode === "paper" ? "other" : "fixture",
+			};
+			writeJsonFileDurable(join(agentDir, "autonomous-process.json"), {
+				version: 1,
+				scope,
+				pid: process.pid,
+				startedAt: Date.now(),
+			});
+			const store = new AutonomousStore(createFileMonitoringStore(join(agentDir, "monitoring-state.json")), scope);
+			store.mutate((state) => {
+				state.control = "running";
+			});
+			const before = store.read();
+			for (const action of ["status", "pause", "resume", "stop"]) {
+				await expect(
+					execute(process.execPath, ["--import", loader, control, action], {
+						env: environment(),
+						timeout: 10000,
+					}),
+				).rejects.toThrow("Autonomous account differs");
+			}
+			expect(store.read()).toEqual(before);
+			expect(existsSync(join(agentDir, "trading-state.json"))).toBe(false);
+		},
+		25000,
+	);
 
 	it("boots the actual isolated worker and rejects an unavailable model before inference", async () => {
 		const worker = fileURLToPath(new URL("../autonomous/worker.ts", import.meta.url));

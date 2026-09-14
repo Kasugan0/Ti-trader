@@ -71,6 +71,7 @@ describe("menu i18n", () => {
 			"recovery",
 			"audit",
 			"health",
+			"autonomous",
 			"paper",
 			"monitor",
 			"exchange-login",

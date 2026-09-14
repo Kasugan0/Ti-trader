@@ -15,6 +15,7 @@ import {
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { parseTradingArgs, printHelp } from "./args.ts";
+import { createAutonomousCommandExtension } from "./autonomous/command.ts";
 import { autonomousCommand } from "./autonomous/daemon.ts";
 import {
 	optionalBundledResearchToolNames,
@@ -213,6 +214,7 @@ export async function main(argv: string[]): Promise<void> {
 						},
 					},
 					{ name: "ti-trading", hidden: true, factory: createTradingExtension() },
+					{ name: "ti-autonomous", hidden: true, factory: createAutonomousCommandExtension() },
 					{ name: "ti-health", hidden: true, factory: createOperationalHealthExtension() },
 					{ name: "ti-order-monitor", hidden: true, factory: createOrderMonitorExtension() },
 					{ name: "ti-trigger-monitor", hidden: true, factory: createTriggerMonitorExtension() },

@@ -7,6 +7,7 @@ All notable changes to `ti-trader` are documented in this file.
 ### Added
 
 - Explicit headless autonomous Paper mode with persistent events, model-controlled wakes, separate AgentSession workers, reviewed research tools, independent risk supervision and start/status/pause/resume/stop controls. Autonomous live startup fails closed until adapters provide complete account-risk evidence.
+- TUI `/autonomous` controls the background runtime with account binding, subcommand completion and localized status. Pause and stop do not wait for an active model turn; exiting the TUI leaves the daemon running.
 
 ### Changed
 
