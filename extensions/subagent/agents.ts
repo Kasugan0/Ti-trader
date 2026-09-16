@@ -6,14 +6,12 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
+import { Value } from "typebox/value";
+import { type AnalysisBudget, analysisBudgetSchema, LAB_TOOLS, READ_ONLY_TOOLS } from "./protocol.ts";
 
-export const ALLOWED_CHILD_TOOLS = [
-	"calculate_indicators",
-	"evaluate_strategy",
-	"screen_markets",
-	"simulate_rule",
-	"propose_order",
-] as const;
+export const ALLOWED_CHILD_TOOLS = [...READ_ONLY_TOOLS, "propose_order"] as const;
+export const DEFAULT_CHILD_TOOLS = [...LAB_TOOLS, "propose_order"];
+export const DEFAULT_BUDGET: AnalysisBudget = {};
 
 const ALLOWED_CHILD_TOOL_SET = new Set<string>(ALLOWED_CHILD_TOOLS);
 
@@ -27,6 +25,7 @@ export interface AgentConfig {
 	description: string;
 	tools?: string[];
 	model?: string;
+	budget?: AnalysisBudget;
 	systemPrompt: string;
 	source: AgentSource;
 	filePath: string;
@@ -42,6 +41,10 @@ type AgentFrontmatter = {
 	description?: unknown;
 	tools?: unknown;
 	model?: unknown;
+	timeoutMs?: unknown;
+	maxTurns?: unknown;
+	maxToolCalls?: unknown;
+	maxTokens?: unknown;
 };
 
 export function parseToolList(value: unknown): string[] | undefined {
@@ -54,7 +57,7 @@ export function parseToolList(value: unknown): string[] | undefined {
 }
 
 export function resolveChildTools(requested: string[] | undefined): { tools: string[]; rejected: string[] } {
-	if (requested === undefined) return { tools: [...ALLOWED_CHILD_TOOLS], rejected: [] };
+	if (requested === undefined) return { tools: [...DEFAULT_CHILD_TOOLS], rejected: [] };
 	const tools: string[] = [];
 	const rejected: string[] = [];
 	const seen = new Set<string>();
@@ -71,33 +74,44 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 	const agents: AgentConfig[] = [];
 	if (!fs.existsSync(dir)) return agents;
 
-	let entries: fs.Dirent[];
-	try {
-		entries = fs.readdirSync(dir, { withFileTypes: true });
-	} catch {
-		return agents;
-	}
+	const entries = fs
+		.readdirSync(dir, { withFileTypes: true })
+		.sort((left, right) => left.name.localeCompare(right.name));
 
 	for (const entry of entries) {
 		if (!entry.name.endsWith(".md")) continue;
 		if (!entry.isFile() && !entry.isSymbolicLink()) continue;
 
 		const filePath = path.join(dir, entry.name);
-		let content: string;
-		try {
-			content = fs.readFileSync(filePath, "utf-8");
-		} catch {
-			continue;
-		}
+		const content = fs.readFileSync(filePath, "utf-8");
 
 		const { frontmatter, body } = parseFrontmatter<AgentFrontmatter>(content);
-		if (typeof frontmatter.name !== "string" || typeof frontmatter.description !== "string") continue;
+		if (
+			typeof frontmatter.name !== "string" ||
+			!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(frontmatter.name) ||
+			typeof frontmatter.description !== "string" ||
+			frontmatter.description.trim().length === 0 ||
+			frontmatter.description.length > 500
+		)
+			throw new Error(`Invalid subagent name or description: ${filePath}`);
+		const budget = { ...DEFAULT_BUDGET };
+		for (const key of ["timeoutMs", "maxTurns", "maxToolCalls", "maxTokens"] as const) {
+			if (frontmatter[key] === undefined) continue;
+			const raw = frontmatter[key];
+			const value = typeof raw === "number" || (typeof raw === "string" && /^\d+$/.test(raw)) ? Number(raw) : NaN;
+			if (!Value.Check(analysisBudgetSchema.properties[key], value))
+				throw new Error(
+					`Invalid subagent ${key} in ${filePath}; omit for unlimited or use a positive integer within the supported numeric range`,
+				);
+			budget[key] = value;
+		}
 
 		agents.push({
 			name: frontmatter.name,
 			description: frontmatter.description,
 			tools: parseToolList(frontmatter.tools),
 			model: typeof frontmatter.model === "string" ? frontmatter.model : undefined,
+			budget,
 			systemPrompt: body,
 			source,
 			filePath,

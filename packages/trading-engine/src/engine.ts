@@ -82,6 +82,9 @@ function combineFailures(message: string, first: unknown, second: unknown): Erro
 	return new AggregateError([first, second], message);
 }
 
+const LIVE_CANCELLATION_REQUIRES_OPEN_IDENTITY =
+	"Cancellation requires current open order identities on the requested symbol";
+
 export interface TradingEngineConfig extends RiskConfig {
 	positionMode: FuturesPositionMode;
 }
@@ -735,9 +738,7 @@ export class TradingEngine {
 	async cancelOrder(id: string, symbol: string, signal?: AbortSignal, intentId?: string): Promise<void> {
 		if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("Operation cancelled");
 		if (this.mode === "live" && !this.accountRisk?.state()) {
-			const openOrders = await this.exchangeClient.getOpenOrders(symbol);
-			const target = openOrders.find((order) => order.id === id);
-			if (target) await this.assertLiveCancellationKeepsProtection([target]);
+			await this.assertLiveCancellationKeepsProtection([await this.requireLiveOpenOrder(id, symbol)]);
 		}
 		const revision = await this.accountRisk?.checkCancellation([id], symbol);
 		signal?.throwIfAborted();
@@ -767,10 +768,24 @@ export class TradingEngine {
 				});
 		} else if (this.mode === "live") {
 			const list = await this.exchangeClient.getOrderList(orderListId);
+			if (!list.orders.length) throw new Error(LIVE_CANCELLATION_REQUIRES_OPEN_IDENTITY);
 			await this.assertLiveCancellationKeepsProtection(list.orders);
 		}
 		await this.exchangeClient.cancelOrderList(orderListId, symbol);
 		if (mutationId) this.accountRisk!.finishMutation(mutationId);
+	}
+
+	/** A missing open-orders snapshot is not proof the target is unprotected. */
+	private async requireLiveOpenOrder(id: string, symbol: string): Promise<Order> {
+		const listed = (await this.exchangeClient.getOpenOrders(symbol)).find((order) => order.id === id);
+		if (listed) return listed;
+		try {
+			const lookedUp = await this.exchangeClient.getOrder(id, symbol);
+			if (lookedUp.id === id && lookedUp.symbol === symbol && lookedUp.status === "open") return lookedUp;
+		} catch {
+			// Lookup failure is not proof the order is unprotected.
+		}
+		throw new Error(LIVE_CANCELLATION_REQUIRES_OPEN_IDENTITY);
 	}
 
 	/**

@@ -1131,6 +1131,49 @@ describe("Live cancellation protection without account hard risk", () => {
 		expect(cancel).toHaveBeenCalledOnce();
 	});
 
+	it("looks up a stop missing from the open-orders snapshot instead of skipping the guard", async () => {
+		const exchange = liveClient([], { getOrder: async () => stopOrder });
+		const cancel = vi.spyOn(exchange, "cancelOrder");
+		const trading = new TradingEngine({ ...config, mode: "live" }, exchange, stateStore());
+		await expect(trading.cancelOrder("stop-1", "BTC/USDT")).rejects.toThrow(/Cancellation would remove protection/);
+		expect(cancel).not.toHaveBeenCalled();
+	});
+
+	it("refuses a live cancellation when the target identity cannot be proven open", async () => {
+		const exchange = liveClient([], {
+			getOrder: async () => {
+				throw new Error("order not found");
+			},
+		});
+		const cancel = vi.spyOn(exchange, "cancelOrder");
+		const trading = new TradingEngine({ ...config, mode: "live" }, exchange, stateStore());
+		await expect(trading.cancelOrder("stop-1", "BTC/USDT")).rejects.toThrow(/current open order identities/);
+		expect(cancel).not.toHaveBeenCalled();
+	});
+
+	it("still cancels a non-protective order found only by lookup", async () => {
+		const exchange = liveClient([], { getOrder: async () => entryOrder });
+		const cancel = vi.spyOn(exchange, "cancelOrder");
+		const trading = new TradingEngine({ ...config, mode: "live" }, exchange, stateStore());
+		await trading.cancelOrder("entry-1", "BTC/USDT");
+		expect(cancel).toHaveBeenCalledOnce();
+	});
+
+	it("refuses cancelling a live order list that returns no legs", async () => {
+		const exchange = liveClient([], {
+			getOrderList: async () => ({
+				id: "list-1",
+				listOrderStatus: "EXECUTING",
+				status: "open",
+				orders: [],
+			}),
+		});
+		const cancel = vi.spyOn(exchange, "cancelOrderList");
+		const trading = new TradingEngine({ ...config, mode: "live" }, exchange, stateStore());
+		await expect(trading.cancelOrderList("list-1", "BTC/USDT")).rejects.toThrow(/current open order identities/);
+		expect(cancel).not.toHaveBeenCalled();
+	});
+
 	it("requires a reduce-only constraint for futures stops to count as protection", async () => {
 		const futuresPosition: Position = { symbol: "BTC/USDT:USDT", asset: "BTC", amount: 1, positionSide: "LONG" };
 		const nakedStop: Order = { ...stopOrder, id: "naked-1", symbol: "BTC/USDT:USDT" };

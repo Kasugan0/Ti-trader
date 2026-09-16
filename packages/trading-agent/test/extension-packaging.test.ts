@@ -74,6 +74,14 @@ describe("extension packaging", () => {
 
 	it("ships bundled subagent definitions next to the extension entry", () => {
 		const agentsDir = fileURLToPath(new URL("../../../extensions/subagent/agents", import.meta.url));
-		expect(readdirSync(agentsDir).sort()).toEqual(["researcher.md", "reviewer.md", "scanner.md"]);
+		expect(readdirSync(agentsDir).sort()).toEqual([
+			"derivatives-analyst.md",
+			"event-analyst.md",
+			"researcher.md",
+			"reviewer.md",
+			"scanner.md",
+			"strategy-analyst.md",
+			"technical-analyst.md",
+		]);
 	});
 });

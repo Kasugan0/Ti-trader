@@ -7,11 +7,21 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import * as path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { extractProposedOrder, PROPOSE_ORDER_TOOL, type ProposedOrder } from "./child-orders.ts";
+import {
+	type AnalysisReport,
+	asRecord,
+	type ChildManifest,
+	type Evidence,
+	extractEvidence,
+	FINISH_ANALYSIS_TOOL,
+	FORCE_KILL_DELAY_MS,
+	parseReport,
+} from "./protocol.ts";
 
-export const CHILD_TIMEOUT_MS = 120_000;
-export const FORCE_KILL_DELAY_MS = 2_000;
+export { FORCE_KILL_DELAY_MS };
 export const MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 
 export type IsolatedChildContent =
@@ -44,10 +54,16 @@ export type IsolatedChildRequest = {
 	systemPrompt: string;
 	tools: readonly string[];
 	extensionPaths: readonly string[];
+	sessionFile: string;
+	sessionId: string;
+	manifest: ChildManifest;
+	onRequest: (name: string, args: unknown, signal: AbortSignal) => Promise<unknown>;
+	onSpawn?: (pid: number) => void;
 	model?: string;
 	thinkingLevel?: string;
 	timeoutMs?: number;
 	maxOutputBytes?: number;
+	maxTokens?: number;
 	signal: AbortSignal;
 	onEvent?: (event: IsolatedChildEvent) => void;
 };
@@ -56,6 +72,8 @@ export type IsolatedChildResult = {
 	exitCode: number;
 	messages: IsolatedChildMessage[];
 	proposals?: ProposedOrder[];
+	report?: AnalysisReport;
+	evidence?: Evidence[];
 	stderr: string;
 	aborted: boolean;
 	timedOut: boolean;
@@ -63,7 +81,7 @@ export type IsolatedChildResult = {
 	error?: string;
 };
 
-type Termination = "abort" | "timeout" | "output";
+type Termination = "abort" | "timeout" | "output" | "protocol" | "budget";
 
 export function resolveCodingAgentCli(): string {
 	const packageEntry = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"));
@@ -98,6 +116,15 @@ export function resolveChildOrdersExtension(fromFile: string): string {
 	const source = path.join(extensionDirectory, "child-orders.ts");
 	if (existsSync(source)) return source;
 	throw new Error("Unable to locate the bundled subagent order-proposal extension");
+}
+
+export function resolveChildToolsExtension(fromFile: string): string {
+	const directory = path.dirname(fromFile);
+	const compiled = path.join(directory, "child-tools.js");
+	if (existsSync(compiled)) return compiled;
+	const source = path.join(directory, "child-tools.ts");
+	if (existsSync(source)) return source;
+	throw new Error("Unable to locate child research tools");
 }
 
 function emptyChildResult(error: string, aborted = false): IsolatedChildResult {
@@ -135,20 +162,28 @@ export function childEnvironment(): NodeJS.ProcessEnv {
 	return env;
 }
 
-function killChild(child: ReturnType<typeof spawn>, signal: NodeJS.Signals): void {
-	if (child.pid !== undefined && process.platform !== "win32") {
+export function signalProcessGroup(pid: number, signal: NodeJS.Signals): boolean {
+	if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return false;
+	let signaled = false;
+	if (process.platform !== "win32") {
 		try {
-			process.kill(-child.pid, signal);
-			return;
+			process.kill(-pid, signal);
+			signaled = true;
 		} catch {
-			// The child may not have created its process group yet.
+			// The process may not have become a group leader yet.
 		}
 	}
-	child.kill(signal);
+	try {
+		process.kill(pid, signal);
+		signaled = true;
+	} catch {
+		// Already gone, or the process-group signal was enough.
+	}
+	return signaled;
 }
 
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-	return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : undefined;
+function killChild(child: ReturnType<typeof spawn>, signal: NodeJS.Signals): void {
+	if (child.pid === undefined || !signalProcessGroup(child.pid, signal)) child.kill(signal);
 }
 
 function parseContent(value: unknown): IsolatedChildContent[] {
@@ -231,16 +266,21 @@ function writePromptFile(agentLabel: string, prompt: string): { dir: string; fil
 export async function runIsolatedChild(request: IsolatedChildRequest): Promise<IsolatedChildResult> {
 	if (request.signal.aborted) return emptyChildResult("Subagent was cancelled", true);
 	if (request.tools.length === 0) return emptyChildResult("Subagent tool allowlist is empty");
+	if (!request.sessionFile || !existsSync(request.sessionFile) || !request.sessionId)
+		return emptyChildResult("Persistent subagent history is required");
 
-	const timeoutMs = request.timeoutMs ?? CHILD_TIMEOUT_MS;
+	const timeoutMs = request.timeoutMs;
 	const maxOutputBytes = request.maxOutputBytes ?? MAX_OUTPUT_BYTES;
 	const tmp = writePromptFile("system", request.systemPrompt);
+	const manifestFile = path.join(tmp.dir, "manifest.json");
+	writeFileSync(manifestFile, JSON.stringify(request.manifest), { mode: 0o600 });
 	const args = [
 		resolveCodingAgentCli(),
 		"--mode",
 		"json",
 		"--print",
-		"--no-session",
+		"--session",
+		request.sessionFile,
 		"--no-extensions",
 		"--no-skills",
 		"--no-prompt-templates",
@@ -260,20 +300,29 @@ export async function runIsolatedChild(request: IsolatedChildRequest): Promise<I
 
 	const messages: IsolatedChildMessage[] = [];
 	const proposals: ProposedOrder[] = [];
+	const evidence: Evidence[] = [...request.manifest.evidence];
+	let report: AnalysisReport | undefined;
+	let headerSeen = false;
+	let tokens = 0;
 	let stderr = "";
 	let outputBytes = 0;
 	let termination: Termination | undefined;
 	let spawnError: Error | undefined;
+	let protocolError: string | undefined;
+	const rpcAbort = new AbortController();
+	const rpcSignal = AbortSignal.any([request.signal, rpcAbort.signal]);
 
 	try {
 		const exitCode = await new Promise<number>((resolve, reject) => {
 			const child = spawn(process.execPath, args, {
 				cwd: request.cwd,
-				stdio: ["ignore", "pipe", "pipe"],
+				stdio: ["ignore", "pipe", "pipe", "ipc"],
 				shell: false,
 				detached: process.platform !== "win32",
-				env: childEnvironment(),
+				env: { ...childEnvironment(), TI_SUBAGENT_MANIFEST: manifestFile },
 			});
+			const decoder = new StringDecoder("utf8");
+			const requestIds = new Set<string>();
 			let buffer = "";
 			let settled = false;
 			let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
@@ -283,23 +332,77 @@ export async function runIsolatedChild(request: IsolatedChildRequest): Promise<I
 				settled = true;
 				clearTimeout(timeout);
 				if (forceKillTimer) clearTimeout(forceKillTimer);
+				rpcAbort.abort();
 				request.signal.removeEventListener("abort", abort);
 				callback();
 			};
 			const terminate = (reason: Termination): void => {
 				if (termination) return;
 				termination = reason;
+				rpcAbort.abort();
+				if (settled) return;
 				killChild(child, "SIGTERM");
 				forceKillTimer = setTimeout(() => killChild(child, "SIGKILL"), FORCE_KILL_DELAY_MS);
 				forceKillTimer.unref?.();
 			};
-			const timeout = setTimeout(() => terminate("timeout"), timeoutMs);
-			timeout.unref?.();
+			const timeout = timeoutMs === undefined ? undefined : setTimeout(() => terminate("timeout"), timeoutMs);
+			timeout?.unref();
 			const abort = (): void => terminate("abort");
 			request.signal.addEventListener("abort", abort, { once: true });
 			if (request.signal.aborted) abort();
+			try {
+				if (child.pid !== undefined) request.onSpawn?.(child.pid);
+			} catch (error) {
+				protocolError = error instanceof Error ? error.message : String(error);
+				terminate("protocol");
+			}
+			child.on("message", (message: unknown) => {
+				const event = asRecord(message);
+				if (
+					event?.kind !== "ti-subagent-call" ||
+					typeof event.id !== "string" ||
+					typeof event.name !== "string" ||
+					event.id.length > 160 ||
+					requestIds.has(event.id) ||
+					(request.manifest.maxToolCalls !== undefined && requestIds.size >= request.manifest.maxToolCalls * 8) ||
+					Buffer.byteLength(JSON.stringify(event.args) ?? "", "utf8") > 16 * 1024
+				) {
+					protocolError = "Invalid or excessive child research request";
+					terminate("protocol");
+					return;
+				}
+				requestIds.add(event.id);
+				const id = event.id;
+				const send = (payload: Record<string, unknown>): void => {
+					if (!child.connected || settled || termination) return;
+					child.send({ kind: "ti-subagent-result", id, ...payload }, (error) => {
+						if (!error || settled) return;
+						protocolError = "Research bridge disconnected";
+						terminate("protocol");
+					});
+				};
+				void request.onRequest(event.name, event.args, rpcSignal).then(
+					(result) => send({ result }),
+					(error) => send({ error: error instanceof Error ? error.message : "Research request failed" }),
+				);
+			});
 
 			const processLine = (line: string): void => {
+				if (termination) return;
+				let raw: unknown;
+				try {
+					raw = JSON.parse(line);
+				} catch {
+					return;
+				}
+				const header = asRecord(raw);
+				if (header?.type === "session") {
+					if (header.id !== request.sessionId) {
+						protocolError = "Child resumed a different session";
+						terminate("protocol");
+					} else headerSeen = true;
+					return;
+				}
 				const event = parseEvent(line);
 				if (!event) return;
 				if (event.type === "tool_execution_end") {
@@ -307,10 +410,30 @@ export async function runIsolatedChild(request: IsolatedChildRequest): Promise<I
 						const proposal = extractProposedOrder(event.result);
 						if (proposal) proposals.push(proposal);
 					}
+					const item = extractEvidence(event.result);
+					if (item) evidence.push(item);
+					if (event.toolName === FINISH_ANALYSIS_TOOL && !event.isError) {
+						try {
+							report = parseReport(asRecord(event.result)?.details, evidence);
+						} catch (error) {
+							protocolError = error instanceof Error ? error.message : "Invalid analysis report";
+							terminate("protocol");
+						}
+					}
 				} else {
 					messages.push(event.message);
+					if (event.message.role === "assistant" && event.message.usage) {
+						const usage = event.message.usage;
+						tokens += (usage.input ?? 0) + (usage.output ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
+						if (request.maxTokens !== undefined && tokens > request.maxTokens) terminate("budget");
+					}
 				}
-				request.onEvent?.(event);
+				try {
+					request.onEvent?.(event);
+				} catch (error) {
+					protocolError = error instanceof Error ? error.message : "Unable to persist research progress";
+					terminate("protocol");
+				}
 			};
 
 			const append = (target: "output" | "error", chunk: Buffer): void => {
@@ -324,7 +447,7 @@ export async function runIsolatedChild(request: IsolatedChildRequest): Promise<I
 					stderr += chunk.toString();
 					return;
 				}
-				buffer += chunk.toString();
+				buffer += decoder.write(chunk);
 				const lines = buffer.split("\n");
 				buffer = lines.pop() || "";
 				for (const line of lines) processLine(line);
@@ -337,10 +460,9 @@ export async function runIsolatedChild(request: IsolatedChildRequest): Promise<I
 				finish(() => reject(spawnError));
 			});
 			child.on("close", (code) => {
-				finish(() => {
-					if (buffer.trim()) processLine(buffer);
-					resolve(code ?? 0);
-				});
+				buffer += decoder.end();
+				if (buffer.trim()) processLine(buffer);
+				finish(() => resolve(code ?? 1));
 			});
 		});
 
@@ -351,11 +473,15 @@ export async function runIsolatedChild(request: IsolatedChildRequest): Promise<I
 					? "Subagent timed out"
 					: termination === "output"
 						? "Subagent output was too large"
-						: undefined;
+						: termination === "budget"
+							? "Subagent token budget exhausted"
+							: (protocolError ?? (!headerSeen ? "Child did not confirm its persistent session" : undefined));
 		return {
 			exitCode: error ? 1 : exitCode,
 			messages,
 			proposals,
+			report,
+			evidence,
 			stderr,
 			aborted: termination === "abort",
 			timedOut: termination === "timeout",
@@ -363,10 +489,13 @@ export async function runIsolatedChild(request: IsolatedChildRequest): Promise<I
 			error,
 		};
 	} finally {
+		rpcAbort.abort();
 		try {
 			rmSync(tmp.dir, { recursive: true, force: true });
-		} catch {
-			// Temp prompt files are best-effort cleanup.
+		} catch (error) {
+			console.error(
+				`Unable to remove subagent temporary files: ${error instanceof Error ? error.message : String(error)}`,
+			);
 		}
 	}
 }

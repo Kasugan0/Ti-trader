@@ -19,6 +19,9 @@ const RESEARCH_TOOL_NAMES = [
 	"zhihu_global_search",
 	"market_research",
 	"subagent",
+	"subagent_agents",
+	"subagent_sessions",
+	"subagent_evidence",
 ] as const;
 
 const FREQTRADE_TOOL_NAMES = ["freqtrade_status", "freqtrade_backtest", "freqtrade_signals"] as const;
@@ -238,6 +241,7 @@ function buildAnalyzeStep(has: (name: string) => boolean): LoopStep {
 	const hasLab =
 		has("calculate_indicators") || has("evaluate_strategy") || has("simulate_rule") || has("screen_markets");
 	const tools = analyzeToolNames(has);
+	if (has("subagent")) tools.push("`subagent`");
 	const rules: string[] = [
 		hasLab
 			? "Do not invent EMA/RSI/MACD/ATR values from raw klines. These tools never place orders."
@@ -245,6 +249,12 @@ function buildAnalyzeStep(has: (name: string) => boolean): LoopStep {
 	];
 	if (!hasLab) {
 		rules.push("Indicator and strategy tools are not loaded in this session; say so if asked for those values.");
+	}
+	if (has("subagent")) {
+		rules.push(
+			"Delegate substantial multi-step research to appropriate specialists; keep simple price or indicator reads direct. Fresh, correctly scoped specialist evidence can satisfy Observe and Analyze without repeating the same work in the parent.",
+			"Choose only the analysis types needed. Independent tasks may run in parallel; use optional review for complex or conflicting reports, not mandatory voting. Account checks, final decisions and execution remain yours.",
+		);
 	}
 	if (has("simulate_rule")) {
 		rules.push(
@@ -495,9 +505,26 @@ function buildToolNotes(input: {
 				];
 	if (has("subagent")) {
 		research.push(
-			"subagent: isolated children (`researcher`, `scanner`, `reviewer`). They may `propose_order`; that is not a fill. You must `check_order` then `buy`/`sell` to submit. Paper/unattended: your tool call is the approval. Live/confirm: the operator confirmation box still appears.",
+			"subagent: persistent specialist research sessions. New: agent + task. Continue the same research thread: sessionId + task; do not resend its whole history. tasks runs independent analyses; chain uses {previous}; review optionally critiques the completed batch. A busy session cannot be written concurrently.",
+			"Use the same venue, market family and timestamps when comparing reports. Unknown or failed research is missing evidence, never a neutral vote. Historical conclusions must be refreshed. Children may propose_order; that is not a fill. You must check_order then buy/sell. Paper/unattended: your tool call is the approval. Live/confirm: the operator confirmation box still appears.",
 		);
 	}
+	if (has("subagent_agents"))
+		research.push(
+			"subagent_agents: discover the effective role catalog and missing tools before substantial delegation. Choose scanner, technical-analyst, event-analyst, derivatives-analyst, strategy-analyst or reviewer as appropriate; user/project definitions can differ.",
+		);
+	if (has("subagent_sessions"))
+		research.push(
+			"subagent_sessions: recover owned research session IDs and short summaries after compaction or restart. A role can have multiple independent research threads.",
+		);
+	if (has("subagent_evidence"))
+		research.push(
+			"subagent_evidence: read a saved report or paged evidence by sessionId/runId. Resolve omitted reports or disputed claims before deciding; reading history does not refresh it. Child citation IDs are not decision-ledger observation IDs; record_decision must cite observations captured by the parent.",
+		);
+	if (has("market_research"))
+		research.push(
+			"market_research: persistent read-only technical research. Use sessionId to continue or listSessions=true to recover prior IDs. It cannot propose orders.",
+		);
 
 	const extra: string[] = [];
 	const extraTools = [...toolSet].filter((name) => !KNOWN_PROMPT_TOOL_NAMES.has(name)).sort();

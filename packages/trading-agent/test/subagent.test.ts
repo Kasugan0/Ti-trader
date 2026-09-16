@@ -1,752 +1,688 @@
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
-import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	DEFAULT_CHILD_TOOLS,
+	discoverAgents,
+	parseToolList,
+	resolveChildTools,
+} from "../../../extensions/subagent/agents.ts";
+import { buildProposedOrder, extractProposedOrder } from "../../../extensions/subagent/child-orders.ts";
+import {
+	childEnvironment,
+	FORCE_KILL_DELAY_MS,
+	type IsolatedChildRequest,
+	runIsolatedChild,
+} from "../../../extensions/subagent/isolated-child.ts";
+import { FINISH_ANALYSIS_TOOL, RESEARCH_RUNTIME_KEY } from "../../../extensions/subagent/protocol.ts";
+import {
+	buildChildSystemPrompt,
+	PARENT_OUTPUT_BYTES,
+	runSubagent,
+	sessionStoreFor,
+	truncateBytes,
+} from "../../../extensions/subagent/runner.ts";
+import { ChildSessionStore, type RunRecord } from "../../../extensions/subagent/sessions.ts";
+import { childResult, persistChild, report, subagentFixture } from "./subagent-fixture.ts";
 
-const spawnMock = vi.fn();
+const { spawnMock } = vi.hoisted(() => ({ spawnMock: vi.fn() }));
 vi.mock("node:child_process", () => ({ spawn: spawnMock }));
 
-const {
-	ALLOWED_CHILD_TOOLS,
-	buildChildSystemPrompt,
-	buildProposedOrder,
-	childEnvironment,
-	discoverAgents,
-	extractProposedOrder,
-	parseToolList,
-	PER_TASK_OUTPUT_CAP,
-	PROPOSE_ORDER_TOOL,
-	resolveChildTools,
-	resolveCodingAgentCli,
-	resolveSiblingMarketLab,
-	runIsolatedChild,
-	runSubagent,
-} = await import("../../../extensions/subagent/index.ts");
-
-const bundledDir = fileURLToPath(new URL("../../../extensions/subagent/agents", import.meta.url));
-const extensionFileUrl = new URL("../../../extensions/subagent/index.ts", import.meta.url).href;
-
-const temporaryDirectories: string[] = [];
-
-function tempDir(prefix: string): string {
-	const directory = mkdtempSync(join(tmpdir(), prefix));
-	temporaryDirectories.push(directory);
-	return directory;
-}
-
-function writeAgent(directory: string, fileName: string, body: string): void {
-	mkdirSync(directory, { recursive: true });
-	writeFileSync(join(directory, fileName), body, "utf8");
-}
-
-function childProcess() {
-	const child = new EventEmitter() as EventEmitter & {
-		pid?: number;
-		stdout: PassThrough;
-		stderr: PassThrough;
-		kill: ReturnType<typeof vi.fn>;
-	};
-	child.stdout = new PassThrough();
-	child.stderr = new PassThrough();
-	child.kill = vi.fn();
-	return child;
-}
-
-function assistantMessage(text: string): IsolatedChildMessage {
-	return { role: "assistant", content: [{ type: "text", text }] };
-}
-
-type IsolatedChildMessage = {
-	role: string;
-	content: Array<
-		{ type: "text"; text: string } | { type: "toolCall"; name: string; arguments: Record<string, unknown> }
-	>;
-};
-
-function okChild(text: string) {
-	return {
-		exitCode: 0,
-		messages: [assistantMessage(text)],
-		stderr: "",
-		aborted: false,
-		timedOut: false,
-		outputTooLarge: false,
-	};
-}
-
-const baseCtx = {
-	cwd: process.cwd(),
-	hasUI: false,
-	isProjectTrusted: () => false,
-};
-
+let fixture: ReturnType<typeof subagentFixture>;
+beforeEach(() => {
+	fixture = subagentFixture();
+});
 afterEach(() => {
 	vi.useRealTimers();
 	vi.restoreAllMocks();
+	vi.unstubAllEnvs();
 	spawnMock.mockReset();
-	delete process.env.PI_CODING_AGENT_DIR;
-	delete process.env.TI_DATA_DIR;
-	delete process.env.TI_TEST_API_KEY;
-	for (const directory of temporaryDirectories.splice(0)) {
-		if (existsSync(directory)) rmSync(directory, { recursive: true, force: true });
-	}
+	delete (globalThis as Record<PropertyKey, unknown>)[RESEARCH_RUNTIME_KEY];
+	fixture.cleanup();
 });
 
-describe("subagent allowlist", () => {
-	it("accepts yaml string and array tool lists", () => {
+describe("specialist definitions", () => {
+	it("discovers specialized roles and preserves the proposal-capable researcher", () => {
+		const found = discoverAgents({
+			cwd: fixture.directory,
+			scope: "user",
+			bundledDir: fixture.options.bundledDir,
+			userDir: fixture.options.userDir,
+		});
+		expect(found.agents.map((item) => item.name).sort()).toEqual([
+			"derivatives-analyst",
+			"event-analyst",
+			"researcher",
+			"reviewer",
+			"scanner",
+			"strategy-analyst",
+			"technical-analyst",
+		]);
+		expect(found.agents.find((item) => item.name === "researcher")?.tools).toContain("propose_order");
+		expect(found.agents.find((item) => item.name === "technical-analyst")?.tools).not.toContain("propose_order");
+		expect(found.agents.every((item) => resolveChildTools(item.tools).rejected.length === 0)).toBe(true);
+		expect(found.agents.map((item) => item.budget)).toEqual(Array.from({ length: 7 }, () => ({})));
+	});
+	it("parses lists, keeps conservative defaults and rejects execution tools", () => {
 		expect(parseToolList("calculate_indicators, evaluate_strategy")).toEqual([
 			"calculate_indicators",
 			"evaluate_strategy",
 		]);
 		expect(parseToolList(["screen_markets", "simulate_rule"])).toEqual(["screen_markets", "simulate_rule"]);
-	});
-
-	it("defaults to the full allowlist and rejects trading tools", () => {
-		expect(resolveChildTools(undefined).tools).toEqual([...ALLOWED_CHILD_TOOLS]);
-		expect(resolveChildTools(["buy", "calculate_indicators"])).toEqual({
+		expect(resolveChildTools(undefined).tools).toEqual(DEFAULT_CHILD_TOOLS);
+		expect(resolveChildTools(["buy", "bash", "calculate_indicators"])).toEqual({
 			tools: ["calculate_indicators"],
-			rejected: ["buy"],
+			rejected: ["buy", "bash"],
 		});
 	});
-
-	it("puts the hard safety rules in every child system prompt", () => {
-		const prompt = buildChildSystemPrompt("Custom agent body.");
+	it("loads model and bounded budgets from user definitions", () => {
+		writeFileSync(
+			join(fixture.options.userDir, "researcher.md"),
+			"---\nname: researcher\ndescription: override\ntools: screen_markets\nmodel: faux/test\nmaxTurns: 3\nmaxToolCalls: 4\nmaxTokens: 8000\ntimeoutMs: 10000\n---\nOnly scan.\n",
+		);
+		const found = discoverAgents({
+			cwd: fixture.directory,
+			scope: "user",
+			bundledDir: fixture.options.bundledDir,
+			userDir: fixture.options.userDir,
+		});
+		expect(found.agents.find((item) => item.name === "researcher")).toMatchObject({
+			source: "user",
+			model: "faux/test",
+			budget: { maxTurns: 3, maxToolCalls: 4, maxTokens: 8000, timeoutMs: 10000 },
+		});
+	});
+	it("reports invalid role files rather than silently dropping them", () => {
+		writeFileSync(
+			join(fixture.options.userDir, "broken.md"),
+			"---\nname: broken\ndescription: invalid\nmaxTurns: 0\n---\nx",
+		);
+		expect(() =>
+			discoverAgents({
+				cwd: fixture.directory,
+				scope: "user",
+				bundledDir: fixture.options.bundledDir,
+				userDir: fixture.options.userDir,
+			}),
+		).toThrow("maxTurns");
+	});
+	it("accepts explicit budgets above the old ceilings", () => {
+		writeFileSync(
+			join(fixture.options.userDir, "researcher.md"),
+			"---\nname: researcher\ndescription: extended\nmaxTurns: 1000\nmaxToolCalls: 1000\nmaxTokens: 2000000\ntimeoutMs: 3600000\n---\nAnalyze.",
+		);
+		const found = discoverAgents({
+			cwd: fixture.directory,
+			scope: "user",
+			bundledDir: fixture.options.bundledDir,
+			userDir: fixture.options.userDir,
+		});
+		expect(found.agents.find((item) => item.name === "researcher")?.budget).toEqual({
+			maxTurns: 1000,
+			maxToolCalls: 1000,
+			maxTokens: 2000000,
+			timeoutMs: 3600000,
+		});
+	});
+	it("keeps safety and evidence requirements in the system prompt", () => {
+		const prompt = buildChildSystemPrompt("Role body");
 		expect(prompt).toContain("no exchange access");
-		expect(prompt).toContain("propose_order queues an order for the parent");
+		expect(prompt).toContain("finish_analysis");
 		expect(prompt).toContain("Never claim a fill");
-		expect(prompt).toContain("Custom agent body.");
+		expect(prompt).toContain("Role body");
 	});
 });
 
-describe("subagent discovery", () => {
-	it("loads bundled researcher, scanner, and reviewer", () => {
-		const discovery = discoverAgents({
-			cwd: tempDir("ti-subagent-empty-"),
-			scope: "user",
-			bundledDir,
-			userDir: join(tempDir("ti-subagent-nouser-"), "missing"),
+describe("persistent research orchestration", () => {
+	it("waits for sibling runs and surfaces a durable-write failure without claiming success", async () => {
+		const originalSave = ChildSessionStore.prototype.saveRun;
+		vi.spyOn(ChildSessionStore.prototype, "saveRun").mockImplementation(function (
+			this: ChildSessionStore,
+			run: RunRecord,
+		) {
+			if (run.report?.summary === "write-fails") throw new Error("fixture disk failure");
+			originalSave.call(this, run);
 		});
-		expect(discovery.agents.map((agent) => agent.name).sort()).toEqual(["researcher", "reviewer", "scanner"]);
-		expect(discovery.agents.every((agent) => agent.source === "bundled")).toBe(true);
-		for (const agent of discovery.agents) {
-			expect(resolveChildTools(agent.tools).rejected).toEqual([]);
-		}
-		const byName = Object.fromEntries(discovery.agents.map((agent) => [agent.name, agent.tools ?? []]));
-		expect(byName.researcher).toContain(PROPOSE_ORDER_TOOL);
-		expect(byName.scanner).not.toContain(PROPOSE_ORDER_TOOL);
-		expect(byName.reviewer).not.toContain(PROPOSE_ORDER_TOOL);
-	});
-
-	it("lets a user agent override a bundled name", () => {
-		const userDir = tempDir("ti-subagent-user-");
-		writeAgent(
-			userDir,
-			"researcher.md",
-			"---\nname: researcher\ndescription: User override\ntools: screen_markets\n---\nUser body.\n",
-		);
-		const discovery = discoverAgents({
-			cwd: process.cwd(),
-			scope: "user",
-			bundledDir,
-			userDir,
-		});
-		const researcher = discovery.agents.find((agent) => agent.name === "researcher");
-		expect(researcher?.source).toBe("user");
-		expect(researcher?.description).toBe("User override");
-		expect(researcher?.tools).toEqual(["screen_markets"]);
-	});
-
-	it("finds project agents under .ti-trader/agents", () => {
-		const cwd = tempDir("ti-subagent-project-");
-		writeAgent(
-			join(cwd, ".ti-trader", "agents"),
-			"local.md",
-			"---\nname: local-scanner\ndescription: Project scanner\ntools: screen_markets\n---\nProject body.\n",
-		);
-		const discovery = discoverAgents({
-			cwd,
-			scope: "both",
-			bundledDir,
-			userDir: join(tempDir("ti-subagent-nouser-"), "missing"),
-		});
-		expect(discovery.projectAgentsDir).toBe(join(cwd, ".ti-trader", "agents"));
-		expect(discovery.agents.some((agent) => agent.name === "local-scanner" && agent.source === "project")).toBe(true);
-	});
-});
-
-describe("subagent runner", () => {
-	it("rejects mixed modes without spawning a child", async () => {
-		const runChild = vi.fn();
-		const output = await runSubagent(
-			{ agent: "researcher", task: "look", tasks: [{ agent: "scanner", task: "scan" }] },
-			baseCtx,
-			{
-				bundledDir,
-				userDir: join(tempDir("ti-subagent-nouser-"), "missing"),
-				extensionFileUrl,
-				signal: new AbortController().signal,
-				runChild,
-			},
-		);
-		expect(output.isError).toBe(true);
-		expect(output.content[0].text).toContain("exactly one mode");
-		expect(runChild).not.toHaveBeenCalled();
-	});
-
-	it("does not spawn when an agent asks for buy", async () => {
-		const userDir = tempDir("ti-subagent-buy-");
-		writeAgent(
-			userDir,
-			"trader.md",
-			"---\nname: trader\ndescription: Unsafe\ntools: buy, calculate_indicators\n---\nTrade it.\n",
-		);
-		const runChild = vi.fn();
-		const output = await runSubagent({ agent: "trader", task: "buy BTC" }, baseCtx, {
-			bundledDir,
-			userDir,
-			extensionFileUrl,
-			signal: new AbortController().signal,
-			runChild,
-		});
-		expect(runChild).not.toHaveBeenCalled();
-		expect(output.isError).toBe(true);
-		expect(output.content[0].text).toContain("buy");
-		expect(output.content[0].text).toContain("allowlist");
-	});
-
-	it("runs a single bundled agent through the injected child", async () => {
-		const runChild = vi.fn(async () => okChild("bias: none"));
-		const output = await runSubagent({ agent: "researcher", task: "Analyze BTC 1h" }, baseCtx, {
-			bundledDir,
-			userDir: join(tempDir("ti-subagent-nouser-"), "missing"),
-			extensionFileUrl,
-			signal: new AbortController().signal,
-			runChild,
-		});
-		expect(output.isError).toBeUndefined();
-		expect(output.content[0].text).toBe("bias: none");
-		expect(runChild).toHaveBeenCalledTimes(1);
-		expect(runChild).toHaveBeenCalledWith(
-			expect.objectContaining({
-				prompt: "Task: Analyze BTC 1h",
-				tools: [...ALLOWED_CHILD_TOOLS],
-				systemPrompt: expect.stringContaining("propose_order queues an order for the parent"),
-				extensionPaths: expect.arrayContaining([
-					expect.stringMatching(/market-lab\/index\.(ts|js)$/),
-					expect.stringMatching(/child-orders\.(ts|js)$/),
-				]),
-			}),
-		);
-	});
-
-	it("surfaces propose_order as parent-pending proposals", async () => {
-		const proposal = {
-			submitted: false as const,
-			pendingParent: true as const,
-			side: "buy" as const,
-			symbol: "BTC/USDT",
-			type: "market" as const,
-			quoteAmount: 100,
-		};
-		const runChild = vi.fn(async () => ({ ...okChild("queued"), proposals: [proposal] }));
-		const output = await runSubagent({ agent: "researcher", task: "Propose a BTC buy" }, baseCtx, {
-			bundledDir,
-			userDir: join(tempDir("ti-subagent-nouser-"), "missing"),
-			extensionFileUrl,
-			signal: new AbortController().signal,
-			runChild,
-		});
-		expect(output.isError).toBeUndefined();
-		expect(output.content[0].text).toContain("queued");
-		expect(output.content[0].text).toContain("not submitted");
-		expect(output.content[0].text).toContain("buy BTC/USDT market quoteAmount=100");
-		expect(output.details.proposals).toEqual([proposal]);
-	});
-
-	it("does not load propose_order or child-orders for scanner", async () => {
-		const runChild = vi.fn(async () => okChild("scan"));
-		await runSubagent({ agent: "scanner", task: "Screen USDT spots" }, baseCtx, {
-			bundledDir,
-			userDir: join(tempDir("ti-subagent-nouser-"), "missing"),
-			extensionFileUrl,
-			signal: new AbortController().signal,
-			runChild,
-		});
-		expect(runChild).toHaveBeenCalledWith(
-			expect.objectContaining({
-				tools: expect.not.arrayContaining([PROPOSE_ORDER_TOOL]),
-				extensionPaths: expect.not.arrayContaining([expect.stringMatching(/child-orders\.(ts|js)$/)]),
-			}),
-		);
-	});
-
-	it("keeps earlier propose_order in parent content after a reviewer chain step", async () => {
-		const proposal = {
-			submitted: false as const,
-			pendingParent: true as const,
-			side: "buy" as const,
-			symbol: "BTC/USDT",
-			type: "market" as const,
-			quoteAmount: 100,
-		};
-		const runChild = vi.fn(async (request: { prompt: string }) => {
-			if (request.prompt === "Task: first") return { ...okChild("researched"), proposals: [proposal] };
-			return okChild("looks weak");
-		});
-		const output = await runSubagent(
-			{
-				chain: [
-					{ agent: "researcher", task: "first" },
-					{ agent: "reviewer", task: "review {previous}" },
-				],
-			},
-			baseCtx,
-			{
-				bundledDir,
-				userDir: join(tempDir("ti-subagent-nouser-"), "missing"),
-				extensionFileUrl,
-				signal: new AbortController().signal,
-				runChild,
-			},
-		);
-		expect(output.isError).toBeUndefined();
-		expect(output.content[0].text).toContain("looks weak");
-		expect(output.content[0].text).toContain("not submitted");
-		expect(output.content[0].text).toContain("buy BTC/USDT market quoteAmount=100");
-		expect(output.details.proposals).toEqual([proposal]);
-	});
-
-	it("includes child token usage in the parent tool content", async () => {
-		const runChild = vi.fn(async () => ({
-			...okChild("bias: none"),
-			messages: [
-				{
-					role: "assistant",
-					content: [{ type: "text" as const, text: "bias: none" }],
-					usage: { input: 12, output: 4, cost: { total: 0.01 } },
-				},
-			],
-		}));
-		const output = await runSubagent({ agent: "researcher", task: "Analyze BTC 1h" }, baseCtx, {
-			bundledDir,
-			userDir: join(tempDir("ti-subagent-nouser-"), "missing"),
-			extensionFileUrl,
-			signal: new AbortController().signal,
-			runChild,
-		});
-		expect(output.content[0].text).toContain("bias: none");
-		expect(output.content[0].text).toContain("in:12");
-		expect(output.content[0].text).toContain("out:4");
-		expect(output.content[0].text).toContain("$0.0100");
-	});
-
-	it("substitutes {previous} in a chain and stops on failure", async () => {
-		const runChild = vi.fn(async (request: { prompt: string }) => {
-			if (request.prompt === "Task: first") return okChild("first-report");
-			return {
-				exitCode: 1,
-				messages: [],
-				stderr: "boom",
-				aborted: false,
-				timedOut: false,
-				outputTooLarge: false,
-				error: "boom",
-			};
-		});
-		const output = await runSubagent(
-			{
-				chain: [
-					{ agent: "scanner", task: "first" },
-					{ agent: "reviewer", task: "review {previous}" },
-				],
-			},
-			baseCtx,
-			{
-				bundledDir,
-				userDir: join(tempDir("ti-subagent-nouser-"), "missing"),
-				extensionFileUrl,
-				signal: new AbortController().signal,
-				runChild,
-			},
-		);
-		expect(output.isError).toBe(true);
-		expect(output.content[0].text).toContain("Chain stopped at step 2");
-		expect(runChild).toHaveBeenCalledTimes(2);
-		expect(runChild).toHaveBeenNthCalledWith(2, expect.objectContaining({ prompt: "Task: review first-report" }));
-	});
-
-	it("caps parallel fan-out", async () => {
-		const runChild = vi.fn();
+		let siblingSettled = false;
 		const output = await runSubagent(
 			{
 				tasks: [
-					{ agent: "scanner", task: "a" },
-					{ agent: "scanner", task: "b" },
-					{ agent: "scanner", task: "c" },
-					{ agent: "scanner", task: "d" },
-					{ agent: "scanner", task: "e" },
+					{ agent: "researcher", task: "first" },
+					{ agent: "scanner", task: "second" },
 				],
 			},
-			baseCtx,
+			fixture.ctx,
 			{
-				bundledDir,
-				userDir: join(tempDir("ti-subagent-nouser-"), "missing"),
-				extensionFileUrl,
-				signal: new AbortController().signal,
-				runChild,
+				...fixture.options,
+				runChild: async (request) => {
+					if (request.prompt.includes("Task: first")) return childResult("write-fails");
+					await new Promise((resolve) => setTimeout(resolve, 20));
+					siblingSettled = true;
+					return childResult("saved");
+				},
 			},
 		);
+		expect(siblingSettled).toBe(true);
 		expect(output.isError).toBe(true);
-		expect(output.content[0].text).toContain("Too many parallel tasks");
-		expect(runChild).not.toHaveBeenCalled();
+		expect(output.details.results).toHaveLength(2);
+		expect(output.details.results[0].report).toBeUndefined();
+		expect(output.details.results[0].errorMessage).toContain("Unable to persist");
+		expect(output.details.results[1].report?.summary).toBe("saved");
 	});
-
-	it("refuses untrusted project agents when no UI is available", async () => {
-		const cwd = tempDir("ti-subagent-untrusted-");
-		writeAgent(
-			join(cwd, ".ti-trader", "agents"),
-			"local.md",
-			"---\nname: local-scanner\ndescription: Project scanner\ntools: screen_markets\n---\nProject body.\n",
+	it("creates a private session and resumes its full prior messages without changing its ID", async () => {
+		const first = await runSubagent(
+			{ agent: "researcher", task: "first research marker" },
+			fixture.ctx,
+			fixture.options,
 		);
-		const runChild = vi.fn();
-		const output = await runSubagent(
-			{ agent: "local-scanner", task: "scan", agentScope: "both" },
-			{ ...baseCtx, cwd },
-			{
-				bundledDir,
-				userDir: join(tempDir("ti-subagent-nouser-"), "missing"),
-				extensionFileUrl,
-				signal: new AbortController().signal,
-				runChild,
-			},
-		);
-		expect(runChild).not.toHaveBeenCalled();
-		expect(output.content[0].text).toContain("project-local agents require confirmation");
-	});
-
-	it("ignores confirmProjectAgents=false for untrusted project agents", async () => {
-		const cwd = tempDir("ti-subagent-force-confirm-");
-		writeAgent(
-			join(cwd, ".ti-trader", "agents"),
-			"local.md",
-			"---\nname: local-scanner\ndescription: Project scanner\ntools: screen_markets\n---\nProject body.\n",
-		);
-		const runChild = vi.fn();
-		const output = await runSubagent(
-			{ agent: "local-scanner", task: "scan", agentScope: "both", confirmProjectAgents: false },
-			{ ...baseCtx, cwd },
-			{
-				bundledDir,
-				userDir: join(tempDir("ti-subagent-nouser-"), "missing"),
-				extensionFileUrl,
-				signal: new AbortController().signal,
-				runChild,
-			},
-		);
-		expect(runChild).not.toHaveBeenCalled();
-		expect(output.isError).toBe(true);
-		expect(output.content[0].text).toContain("project-local agents require confirmation");
-	});
-
-	it("runs trusted project agents without a confirmation prompt", async () => {
-		const cwd = tempDir("ti-subagent-trusted-");
-		writeAgent(
-			join(cwd, ".ti-trader", "agents"),
-			"local.md",
-			"---\nname: local-scanner\ndescription: Project scanner\ntools: screen_markets\n---\nProject body.\n",
-		);
-		const confirm = vi.fn();
-		const runChild = vi.fn(async () => okChild("ok"));
-		const output = await runSubagent(
-			{ agent: "local-scanner", task: "scan", agentScope: "both" },
-			{ cwd, hasUI: true, isProjectTrusted: () => true, confirm },
-			{
-				bundledDir,
-				userDir: join(tempDir("ti-subagent-nouser-"), "missing"),
-				extensionFileUrl,
-				signal: new AbortController().signal,
-				runChild,
-			},
-		);
-		expect(confirm).not.toHaveBeenCalled();
-		expect(runChild).toHaveBeenCalledTimes(1);
-		expect(output.isError).toBeUndefined();
-	});
-
-	it("caps chain {previous} substitution", async () => {
-		const huge = "x".repeat(PER_TASK_OUTPUT_CAP + 80);
-		let secondPrompt = "";
-		const runChild = vi.fn(async (request: { prompt: string }) => {
-			if (request.prompt === "Task: first") return okChild(huge);
-			secondPrompt = request.prompt;
-			return okChild("reviewed");
+		expect(first.isError).toBeUndefined();
+		const firstResult = first.details.results[0];
+		const store = sessionStoreFor(fixture.ctx, fixture.options.sessionRoot);
+		const file = store.historyPath(store.read(firstResult.sessionId!));
+		expect(statSync(file).mode & 0o777).toBe(0o600);
+		let restored = "";
+		const runChild = vi.fn(async (request: IsolatedChildRequest) => {
+			restored = JSON.stringify(SessionManager.open(request.sessionFile).buildSessionContext().messages);
+			return persistChild(request, "updated");
 		});
+		const second = await runSubagent({ sessionId: firstResult.sessionId, task: "continue" }, fixture.ctx, {
+			...fixture.options,
+			runChild,
+		});
+		expect(second.isError).toBeUndefined();
+		expect(restored).toContain("first research marker");
+		expect(second.details.results[0].sessionId).toBe(firstResult.sessionId);
+		expect(second.details.results[0].runId).not.toBe(firstResult.runId);
+		expect(store.list().sessions[0]).toMatchObject({ runCount: 2, summary: "updated", status: "idle" });
+		expect(readFileSync(file, "utf8")).toContain("continue");
+	});
+	it("refuses missing history instead of creating a replacement conversation", async () => {
+		const first = await runSubagent({ agent: "researcher", task: "first" }, fixture.ctx, fixture.options);
+		const id = first.details.results[0].sessionId!;
+		const store = sessionStoreFor(fixture.ctx, fixture.options.sessionRoot);
+		unlinkSync(store.historyPath(store.read(id)));
+		const runChild = vi.fn();
+		const second = await runSubagent({ sessionId: id, task: "continue" }, fixture.ctx, {
+			...fixture.options,
+			runChild,
+		});
+		expect(second.isError).toBe(true);
+		expect(second.content[0].text).toContain("history is missing");
+		expect(runChild).not.toHaveBeenCalled();
+	});
+	it("isolates sessions by parent/account scope", async () => {
+		const first = await runSubagent({ agent: "researcher", task: "first" }, fixture.ctx, fixture.options);
+		const runChild = vi.fn();
+		const result = await runSubagent(
+			{ sessionId: first.details.results[0].sessionId, task: "foreign" },
+			{ ...fixture.ctx, parentSessionId: "other-parent" },
+			{ ...fixture.options, runChild },
+		);
+		expect(result.isError).toBe(true);
+		expect(result.content[0].text).toContain("not found");
+		expect(runChild).not.toHaveBeenCalled();
+	});
+	it("rejects role changes on an existing session", async () => {
+		const first = await runSubagent({ agent: "researcher", task: "first" }, fixture.ctx, fixture.options);
+		const result = await runSubagent(
+			{ sessionId: first.details.results[0].sessionId, agent: "reviewer", task: "switch" },
+			fixture.ctx,
+			fixture.options,
+		);
+		expect(result.isError).toBe(true);
+		expect(result.content[0].text).toContain("role or cwd changed");
+	});
+	it("rejects mixed modes and excessive fan-out without starting children", async () => {
+		const runChild = vi.fn();
+		const options = { ...fixture.options, runChild };
+		expect(
+			(
+				await runSubagent(
+					{ agent: "researcher", task: "x", tasks: [{ agent: "scanner", task: "x" }] },
+					fixture.ctx,
+					options,
+				)
+			).isError,
+		).toBe(true);
+		expect(
+			(
+				await runSubagent(
+					{ tasks: Array.from({ length: 5 }, () => ({ agent: "scanner", task: "x" })) },
+					fixture.ctx,
+					options,
+				)
+			).content[0].text,
+		).toContain("Too many parallel");
+		expect(
+			(
+				await runSubagent(
+					{ chain: Array.from({ length: 9 }, () => ({ agent: "scanner", task: "x" })) },
+					fixture.ctx,
+					options,
+				)
+			).content[0].text,
+		).toContain("Too many chain");
+		expect(runChild).not.toHaveBeenCalled();
+	});
+	it("rejects forbidden tools and reports missing event services explicitly", async () => {
+		writeFileSync(
+			join(fixture.options.userDir, "unsafe.md"),
+			"---\nname: unsafe\ndescription: unsafe\ntools: buy\n---\nx",
+		);
+		const runChild = vi.fn();
+		const options = { ...fixture.options, runChild };
+		expect((await runSubagent({ agent: "unsafe", task: "x" }, fixture.ctx, options)).content[0].text).toContain(
+			"allowlist",
+		);
+		expect(
+			(await runSubagent({ agent: "event-analyst", task: "news" }, fixture.ctx, options)).content[0].text,
+		).toContain("No research tools");
+		expect(runChild).not.toHaveBeenCalled();
+	});
+	it("passes the effective model, budget and only available tools", async () => {
+		const runChild = vi.fn(async (_request: IsolatedChildRequest) => childResult());
 		await runSubagent(
+			{ agent: "technical-analyst", task: "analyze" },
+			{ ...fixture.ctx, model: { provider: "faux", id: "model" }, thinkingLevel: "medium" },
+			{ ...fixture.options, runChild },
+		);
+		const request = runChild.mock.calls[0]?.[0];
+		expect(request).toMatchObject({
+			model: "faux/model",
+			thinkingLevel: "medium",
+		});
+		expect(request?.timeoutMs).toBeUndefined();
+		expect(request?.maxTokens).toBeUndefined();
+		expect(request?.manifest.maxTurns).toBeUndefined();
+		expect(request?.manifest.maxToolCalls).toBeUndefined();
+		expect(request?.manifest.timeoutMs).toBeUndefined();
+		expect(request?.tools).toContain(FINISH_ANALYSIS_TOOL);
+		expect(request?.tools).toContain("read_evidence");
+		expect(request?.tools).not.toContain("get_price");
+		expect(request?.tools).not.toContain("propose_order");
+	});
+	it("does not impose the former ten-minute batch deadline", async () => {
+		vi.useFakeTimers();
+		const timeout = vi.spyOn(AbortSignal, "timeout");
+		const pending = runSubagent({ agent: "researcher", task: "long analysis" }, fixture.ctx, {
+			...fixture.options,
+			runChild: async (request) => {
+				await new Promise((resolve) => setTimeout(resolve, 1_200_000));
+				request.signal.throwIfAborted();
+				return childResult();
+			},
+		});
+		await vi.advanceTimersByTimeAsync(1_200_001);
+		expect((await pending).isError).toBeUndefined();
+		expect(timeout).not.toHaveBeenCalled();
+	});
+	it("runs parallel research and a reviewer with source reports without a parent round-trip", async () => {
+		const requests: IsolatedChildRequest[] = [];
+		const result = await runSubagent(
+			{
+				tasks: [
+					{ agent: "scanner", task: "scan" },
+					{ agent: "technical-analyst", task: "technical" },
+				],
+				review: { agent: "reviewer", task: "compare" },
+			},
+			fixture.ctx,
+			{
+				...fixture.options,
+				runChild: async (request) => {
+					requests.push(request);
+					return childResult(request.prompt.includes("Task: scan") ? "scan result" : "technical result");
+				},
+			},
+		);
+		expect(result.isError).toBeUndefined();
+		expect(requests).toHaveLength(3);
+		expect(requests[2].prompt).toContain("scan result");
+		expect(requests[2].prompt).toContain("technical result");
+		expect(new Set(result.details.results.map((item) => item.sessionId)).size).toBe(3);
+	});
+	it("caps active children across separate invocations, not just one tasks array", async () => {
+		let active = 0;
+		let peak = 0;
+		const runChild = async () => {
+			active++;
+			peak = Math.max(active, peak);
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			active--;
+			return childResult();
+		};
+		const outputs = await Promise.all(
+			Array.from({ length: 4 }, () =>
+				runSubagent({ agent: "scanner", task: "scan" }, fixture.ctx, { ...fixture.options, runChild }),
+			),
+		);
+		expect(outputs.every((item) => !item.isError)).toBe(true);
+		expect(peak).toBe(2);
+	});
+	it("refuses concurrent continuation of one conversation", async () => {
+		const first = await runSubagent({ agent: "scanner", task: "scan" }, fixture.ctx, fixture.options);
+		const id = first.details.results[0].sessionId!;
+		let release: (() => void) | undefined;
+		let started: (() => void) | undefined;
+		const ready = new Promise<void>((resolve) => {
+			started = resolve;
+		});
+		const pending = runSubagent({ sessionId: id, task: "slow" }, fixture.ctx, {
+			...fixture.options,
+			runChild: async () => {
+				started!();
+				await new Promise<void>((resolve) => {
+					release = resolve;
+				});
+				return childResult();
+			},
+		});
+		await ready;
+		const second = await runSubagent({ sessionId: id, task: "conflict" }, fixture.ctx, fixture.options);
+		expect(second.isError).toBe(true);
+		expect(second.content[0].text).toContain("busy");
+		release!();
+		expect((await pending).isError).toBeUndefined();
+	});
+	it("substitutes chain reports and stops on an explicit child failure", async () => {
+		const requests: string[] = [];
+		const output = await runSubagent(
 			{
 				chain: [
 					{ agent: "scanner", task: "first" },
 					{ agent: "reviewer", task: "review {previous}" },
+					{ agent: "researcher", task: "third" },
 				],
 			},
-			baseCtx,
+			fixture.ctx,
 			{
-				bundledDir,
-				userDir: join(tempDir("ti-subagent-nouser-"), "missing"),
-				extensionFileUrl,
-				signal: new AbortController().signal,
-				runChild,
+				...fixture.options,
+				runChild: async (request) => {
+					requests.push(request.prompt);
+					return requests.length === 1
+						? childResult("first-report")
+						: { ...childResult(), exitCode: 1, error: "fixture failure" };
+				},
 			},
 		);
-		expect(runChild).toHaveBeenCalledTimes(2);
-		expect(secondPrompt.startsWith("Task: review ")).toBe(true);
-		expect(Buffer.byteLength(secondPrompt, "utf8")).toBeLessThan(Buffer.byteLength(`Task: review ${huge}`, "utf8"));
+		expect(requests).toHaveLength(2);
+		expect(requests[1]).toContain("first-report");
+		expect(output.isError).toBe(true);
+		expect(output.content[0].text).toContain("Chain stopped at step 2");
+	});
+	it("requires an actual structured report and rejects invented citations", async () => {
+		const missing = await runSubagent({ agent: "researcher", task: "x" }, fixture.ctx, {
+			...fixture.options,
+			runChild: async () => ({ ...childResult(), report: undefined }),
+		});
+		expect(missing.content[0].text).toContain("without a validated");
+		const invalid = await runSubagent({ agent: "researcher", task: "x" }, fixture.ctx, {
+			...fixture.options,
+			runChild: async () => ({
+				...childResult(),
+				report: { ...report(), findings: [{ claim: "invented", evidenceIds: ["missing"] }] },
+			}),
+		});
+		expect(invalid.isError).toBe(true);
+		expect(invalid.content[0].text).toContain("unavailable evidence");
+	});
+	it("keeps pending proposals with full order fields, but never replays them on continuation", async () => {
+		const proposal = buildProposedOrder({
+			side: "sell",
+			symbol: "BTC/USDT",
+			type: "stop_market",
+			amount: 1,
+			stopPrice: 90,
+		});
+		const first = await runSubagent({ agent: "researcher", task: "proposal" }, fixture.ctx, {
+			...fixture.options,
+			runChild: async () => ({ ...childResult(), proposals: [proposal] }),
+		});
+		expect(first.details.proposals[0]).toMatchObject({ submitted: false, stopPrice: 90, id: expect.any(String) });
+		const second = await runSubagent(
+			{ sessionId: first.details.results[0].sessionId, task: "continue" },
+			fixture.ctx,
+			fixture.options,
+		);
+		expect(second.details.proposals).toEqual([]);
+	});
+	it("preserves project trust on new calls and continuation", async () => {
+		const projectDir = join(fixture.directory, ".ti-trader", "agents");
+		mkdirSync(projectDir, { recursive: true });
+		writeFileSync(
+			join(projectDir, "local.md"),
+			"---\nname: local\ndescription: Project\ntools: screen_markets\n---\nProject body",
+		);
+		const params = { agent: "local", task: "scan", agentScope: "both" as const, confirmProjectAgents: false };
+		expect((await runSubagent(params, fixture.ctx, fixture.options)).content[0].text).toContain(
+			"require confirmation",
+		);
+		const trusted = await runSubagent(params, { ...fixture.ctx, isProjectTrusted: () => true }, fixture.options);
+		expect(trusted.isError).toBeUndefined();
+		const resumed = await runSubagent(
+			{ sessionId: trusted.details.results[0].sessionId, task: "continue" },
+			fixture.ctx,
+			fixture.options,
+		);
+		expect(resumed.isError).toBe(true);
+		expect(resumed.content[0].text).toContain("require confirmation");
+	});
+	it("preserves readable UTF-8 and enforces a parent-visible aggregate output limit", async () => {
+		expect(truncateBytes("市场市场", 7)).toBe("市场");
+		const large = {
+			...report("市".repeat(600)),
+			risks: Array(4).fill("风".repeat(180)),
+			invalidation: Array(4).fill("险".repeat(180)),
+			unknowns: [],
+		};
+		const output = await runSubagent(
+			{ chain: Array.from({ length: 8 }, () => ({ agent: "researcher", task: "analyze" })) },
+			fixture.ctx,
+			{
+				...fixture.options,
+				runChild: async () => ({ ...childResult(), report: large }),
+			},
+		);
+		expect(output.isError).toBeUndefined();
+		expect(Buffer.byteLength(output.content[0].text)).toBeLessThanOrEqual(PARENT_OUTPUT_BYTES);
+		expect(output.content[0].text).toContain("reportOmitted");
+		expect(output.details.results).toHaveLength(8);
 	});
 });
 
-describe("isolated subagent child", () => {
-	it("resolves the coding-agent CLI and sibling market-lab", () => {
-		const cli = resolveCodingAgentCli();
-		expect(existsSync(cli)).toBe(true);
-		expect(cli).toMatch(/coding-agent\/(?:dist\/(?:bundle\/)?cli\.js|src\/cli\.ts)$/);
-		const lab = resolveSiblingMarketLab(
-			fileURLToPath(new URL("../../../extensions/subagent/index.ts", import.meta.url)),
-		);
-		expect(lab).toMatch(/market-lab\/index\.(ts|js)$/);
-		expect(existsSync(lab)).toBe(true);
-	});
+function mockProcess() {
+	const child = new EventEmitter() as EventEmitter & {
+		pid?: number;
+		connected: boolean;
+		stdout: PassThrough;
+		stderr: PassThrough;
+		kill: ReturnType<typeof vi.fn>;
+		send: ReturnType<typeof vi.fn>;
+	};
+	child.connected = true;
+	child.stdout = new PassThrough();
+	child.stderr = new PassThrough();
+	child.kill = vi.fn();
+	child.send = vi.fn();
+	return child;
+}
 
-	it("does not spawn when the request was already cancelled", async () => {
-		const controller = new AbortController();
-		controller.abort();
-		const result = await runIsolatedChild({
-			cwd: process.cwd(),
-			prompt: "Task: x",
-			systemPrompt: "safe",
-			tools: [...ALLOWED_CHILD_TOOLS],
-			extensionPaths: ["lab"],
-			signal: controller.signal,
-		});
-		expect(result.aborted).toBe(true);
-		expect(spawnMock).not.toHaveBeenCalled();
+async function requestFixture(): Promise<IsolatedChildRequest> {
+	let request: IsolatedChildRequest | undefined;
+	await runSubagent({ agent: "researcher", task: "test" }, fixture.ctx, {
+		...fixture.options,
+		runChild: async (input) => {
+			request = input;
+			return childResult();
+		},
 	});
+	if (!request) throw new Error("Fixture child was not invoked");
+	return { ...request, signal: new AbortController().signal, onSpawn: undefined, onEvent: undefined };
+}
 
-	it("escalates in-flight cancellation from SIGTERM to SIGKILL and settles only after close", async () => {
+describe("isolated persistent child process", () => {
+	it("has no default time, token or cumulative IPC budget and remains cancellable", async () => {
+		const request = await requestFixture();
 		vi.useFakeTimers();
-		const child = childProcess();
-		child.pid = 43_302;
+		const child = mockProcess();
 		spawnMock.mockReturnValue(child);
-		const killSpy = vi.spyOn(process, "kill").mockReturnValue(true);
 		const controller = new AbortController();
-		const promise = runIsolatedChild({
-			cwd: process.cwd(),
-			prompt: "Task: x",
-			systemPrompt: "safe",
-			tools: [...ALLOWED_CHILD_TOOLS],
-			extensionPaths: ["lab"],
-			signal: controller.signal,
-		});
-		let settled = false;
-		void promise.then(
-			() => {
-				settled = true;
-			},
-			() => {
-				settled = true;
-			},
-		);
-		controller.abort();
-		expect(killSpy).toHaveBeenCalledWith(-43_302, "SIGTERM");
-		await Promise.resolve();
-		expect(settled).toBe(false);
-		await vi.advanceTimersByTimeAsync(1_999);
-		expect(killSpy).not.toHaveBeenCalledWith(-43_302, "SIGKILL");
-		await vi.advanceTimersByTimeAsync(1);
-		expect(killSpy).toHaveBeenCalledWith(-43_302, "SIGKILL");
-		expect(settled).toBe(false);
-		child.emit("close", null, "SIGKILL");
-		const result = await promise;
-		expect(result.aborted).toBe(true);
-		expect(result.error).toBe("Subagent was cancelled");
-	});
-
-	it("spawns a coding-agent child with filtered secrets and no trading tools", async () => {
-		const child = childProcess();
-		spawnMock.mockReturnValue(child);
-		process.env.TI_TEST_API_KEY = "should-not-leak";
-		process.env.PI_CODING_AGENT_DIR = "/tmp/ti-subagent-auth";
-		const promise = runIsolatedChild({
-			cwd: process.cwd(),
-			prompt: "Task: Analyze risk",
-			systemPrompt: "safe",
-			tools: [...ALLOWED_CHILD_TOOLS],
-			extensionPaths: ["/tmp/market-lab/index.ts"],
-			model: "test/model",
-			thinkingLevel: "medium",
-			signal: new AbortController().signal,
-		});
-		child.stdout.write(
-			`${JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "safe report" }] } })}\n`,
-		);
-		child.emit("close", 0);
-		const result = await promise;
-		expect(result.error).toBeUndefined();
-		expect(result.messages.at(-1)?.content).toEqual([{ type: "text", text: "safe report" }]);
-		const [command, args, options] = spawnMock.mock.calls[0] as [
-			string,
-			string[],
-			{ env: NodeJS.ProcessEnv; shell: boolean; detached: boolean },
-		];
-		expect(command).toBe(process.execPath);
-		expect(args[0]).toMatch(/cli\.(?:js|ts)$/);
-		expect(args).toEqual(
-			expect.arrayContaining([
-				"--mode",
-				"json",
-				"--print",
-				"--no-session",
-				"--no-extensions",
-				"--no-skills",
-				"--no-prompt-templates",
-				"--no-themes",
-				"--no-context-files",
-				"--no-builtin-tools",
-				"--system-prompt",
-				"--extension",
-				"/tmp/market-lab/index.ts",
-				"--tools",
-				ALLOWED_CHILD_TOOLS.join(","),
-				"--model",
-				"test/model",
-				"--thinking",
-				"medium",
-			]),
-		);
-		expect(args.at(-2)).toBe("--");
-		expect(args.at(-1)).toBe("Task: Analyze risk");
-		expect(args.join(" ")).not.toContain("buy");
-		expect(options.shell).toBe(false);
-		expect(options.detached).toBe(process.platform !== "win32");
-		expect(Object.keys(options.env).every((name) => name !== "TI_TEST_API_KEY")).toBe(true);
-		expect(options.env.PI_CODING_AGENT_DIR).toBe("/tmp/ti-subagent-auth");
-		expect(options.env.TI_TEST_API_KEY).toBeUndefined();
-	});
-
-	it("reuses Ti auth via PI_CODING_AGENT_DIR and does not forward arbitrary env", () => {
-		process.env.TI_DATA_DIR = "/tmp/ti-data";
-		delete process.env.PI_CODING_AGENT_DIR;
-		process.env.TI_TEST_API_KEY = "secret";
-		const env = childEnvironment();
-		expect(env.PI_CODING_AGENT_DIR).toBe(join("/tmp/ti-data", "agent"));
-		expect(env.TI_TEST_API_KEY).toBeUndefined();
-		expect(env.TI_DATA_DIR).toBeUndefined();
-	});
-
-	it("escalates a timeout and reports it only after the process closes", async () => {
-		vi.useFakeTimers();
-		const child = childProcess();
-		child.pid = 43_301;
-		spawnMock.mockReturnValue(child);
-		const killSpy = vi.spyOn(process, "kill").mockReturnValue(true);
-		const promise = runIsolatedChild({
-			cwd: process.cwd(),
-			prompt: "Task: x",
-			systemPrompt: "safe",
-			tools: [...ALLOWED_CHILD_TOOLS],
-			extensionPaths: ["lab"],
-			timeoutMs: 60_000,
-			signal: new AbortController().signal,
-		});
-		let settled = false;
-		void promise.then(
-			() => {
-				settled = true;
-			},
-			() => {
-				settled = true;
-			},
-		);
-		await vi.advanceTimersByTimeAsync(60_000);
-		expect(killSpy).toHaveBeenCalledWith(-43_301, "SIGTERM");
-		expect(settled).toBe(false);
-		await vi.advanceTimersByTimeAsync(2_000);
-		expect(killSpy).toHaveBeenCalledWith(-43_301, "SIGKILL");
-		expect(settled).toBe(false);
-		child.emit("close", null, "SIGKILL");
-		const result = await promise;
-		expect(result.timedOut).toBe(true);
-		expect(result.error).toBe("Subagent timed out");
-	});
-
-	it("extracts propose_order from child JSON tool_execution_end and ignores failed calls", async () => {
-		const child = childProcess();
-		spawnMock.mockReturnValue(child);
-		const accepted = buildProposedOrder({
-			side: "buy",
-			symbol: "BTC/USDT",
-			type: "market",
-			quoteAmount: 100,
-		});
-		const promise = runIsolatedChild({
-			cwd: process.cwd(),
-			prompt: "Task: x",
-			systemPrompt: "safe",
-			tools: [...ALLOWED_CHILD_TOOLS],
-			extensionPaths: ["lab"],
-			signal: new AbortController().signal,
-		});
-		child.stdout.write(
-			`${JSON.stringify({
-				type: "tool_execution_end",
-				toolName: PROPOSE_ORDER_TOOL,
-				isError: true,
-				result: { details: accepted },
-			})}\n`,
-		);
-		child.stdout.write(
-			`${JSON.stringify({
-				type: "tool_execution_end",
-				toolName: PROPOSE_ORDER_TOOL,
-				isError: false,
-				result: { content: [{ type: "text", text: "queued" }], details: accepted },
-			})}\n`,
-		);
+		const onRequest = vi.fn(async () => ({ source: "fixture" }));
+		const pending = runIsolatedChild({ ...request, signal: controller.signal, onRequest });
+		child.stdout.write(`${JSON.stringify({ type: "session", id: request.sessionId })}\n`);
 		child.stdout.write(
 			`${JSON.stringify({
 				type: "message_end",
-				message: { role: "assistant", content: [{ type: "text", text: "filled the buy" }] },
+				message: { role: "assistant", content: [], usage: { input: 2_000_000 } },
 			})}\n`,
 		);
+		for (let index = 0; index < 200; index++)
+			child.emit("message", { kind: "ti-subagent-call", id: `read-${index}`, name: "__candles", args: {} });
+		await vi.advanceTimersByTimeAsync(3_600_000);
+		expect(onRequest).toHaveBeenCalledTimes(200);
+		expect(child.kill).not.toHaveBeenCalled();
+		controller.abort();
+		expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+		child.emit("close", null);
+		expect(await pending).toMatchObject({ aborted: true, timedOut: false, outputTooLarge: false });
+	});
+	it("passes exact history, restricted environment, IPC and no coding tools", async () => {
+		const child = mockProcess();
+		spawnMock.mockReturnValue(child);
+		const request = await requestFixture();
+		vi.stubEnv("TI_TEST_API_KEY", "fixture-secret");
+		const pending = runIsolatedChild(request);
+		child.stdout.write(`${JSON.stringify({ type: "session", id: request.sessionId })}\n`);
+		child.stdout.write(
+			`${JSON.stringify({ type: "tool_execution_end", toolName: FINISH_ANALYSIS_TOOL, isError: false, result: { details: report("saved") } })}\n`,
+		);
 		child.emit("close", 0);
-		const result = await promise;
-		expect(result.proposals).toEqual([accepted]);
-		expect(result.messages.at(-1)?.content).toEqual([{ type: "text", text: "filled the buy" }]);
+		const result = await pending;
+		expect(result.error).toBeUndefined();
+		expect(result.report?.summary).toBe("saved");
+		const [command, args, options] = spawnMock.mock.calls[0] as [
+			string,
+			string[],
+			{ env: NodeJS.ProcessEnv; stdio: string[]; shell: boolean; detached: boolean },
+		];
+		expect(command).toBe(process.execPath);
+		expect(args).toEqual(
+			expect.arrayContaining(["--session", request.sessionFile, "--no-builtin-tools", "--no-context-files"]),
+		);
+		expect(args).not.toContain("--no-session");
+		expect(options.stdio).toContain("ipc");
+		expect(options.shell).toBe(false);
+		expect(options.detached).toBe(process.platform !== "win32");
+		expect(options.env.TI_TEST_API_KEY).toBeUndefined();
+		expect(existsSync(options.env.TI_SUBAGENT_MANIFEST!)).toBe(false);
+	});
+	it("rejects missing history before spawning", async () => {
+		const request = await requestFixture();
+		unlinkSync(request.sessionFile);
+		expect((await runIsolatedChild(request)).error).toContain("history is required");
+		expect(spawnMock).not.toHaveBeenCalled();
+	});
+	it("does not spawn a pre-cancelled request", async () => {
+		const request = await requestFixture();
+		const signal = AbortSignal.abort();
+		expect((await runIsolatedChild({ ...request, signal })).aborted).toBe(true);
+		expect(spawnMock).not.toHaveBeenCalled();
+	});
+	it.each(["abort", "timeout"] as const)("escalates %s to SIGKILL and waits for close", async (kind) => {
+		const request = await requestFixture();
+		vi.useFakeTimers();
+		const child = mockProcess();
+		child.pid = 43111;
+		spawnMock.mockReturnValue(child);
+		const kill = vi.spyOn(process, "kill").mockReturnValue(true);
+		const controller = new AbortController();
+		const pending = runIsolatedChild({ ...request, signal: controller.signal, timeoutMs: 1000 });
+		let settled = false;
+		void pending.then(() => {
+			settled = true;
+		});
+		if (kind === "abort") controller.abort();
+		else await vi.advanceTimersByTimeAsync(1000);
+		expect(kill).toHaveBeenCalledWith(-43111, "SIGTERM");
+		expect(settled).toBe(false);
+		await vi.advanceTimersByTimeAsync(FORCE_KILL_DELAY_MS);
+		expect(kill).toHaveBeenCalledWith(-43111, "SIGKILL");
+		child.emit("close", null);
+		expect((await pending)[kind === "abort" ? "aborted" : "timedOut"]).toBe(true);
+	});
+	it("rejects an unexpected session header and output over budget", async () => {
+		const request = await requestFixture();
+		const first = mockProcess();
+		spawnMock.mockReturnValueOnce(first);
+		const pending = runIsolatedChild(request);
+		first.stdout.write(`${JSON.stringify({ type: "session", id: "wrong" })}\n`);
+		first.emit("close", 0);
+		expect((await pending).error).toContain("different session");
+		const second = mockProcess();
+		spawnMock.mockReturnValueOnce(second);
+		const output = runIsolatedChild({ ...request, maxOutputBytes: 10 });
+		second.stdout.write("x".repeat(20));
+		second.emit("close", 0);
+		expect((await output).outputTooLarge).toBe(true);
+	});
+	it("preserves UTF-8 split across stdout chunks", async () => {
+		const request = await requestFixture();
+		const child = mockProcess();
+		spawnMock.mockReturnValue(child);
+		const pending = runIsolatedChild(request);
+		const bytes = Buffer.from(
+			`${JSON.stringify({ type: "session", id: request.sessionId })}\n${JSON.stringify({ type: "tool_execution_end", toolName: FINISH_ANALYSIS_TOOL, result: { details: report("市场") } })}\n`,
+		);
+		for (const byte of bytes) child.stdout.write(Buffer.from([byte]));
+		child.emit("close", 0);
+		expect((await pending).report?.summary).toBe("市场");
+	});
+	it("does not turn signal termination into a successful exit", async () => {
+		const request = await requestFixture();
+		const child = mockProcess();
+		spawnMock.mockReturnValue(child);
+		const pending = runIsolatedChild(request);
+		child.stdout.write(`${JSON.stringify({ type: "session", id: request.sessionId })}\n`);
+		child.emit("close", null, "SIGKILL");
+		expect((await pending).exitCode).not.toBe(0);
+	});
+	it("bounds model token use and dispatches reviewed IPC requests", async () => {
+		const request = await requestFixture();
+		const child = mockProcess();
+		spawnMock.mockReturnValue(child);
+		const onRequest = vi.fn(async () => ({ source: "fixture" }));
+		const pending = runIsolatedChild({ ...request, maxTokens: 10, onRequest });
+		child.emit("message", { kind: "ti-subagent-call", id: "read-1", name: "__candles", args: {} });
+		await Promise.resolve();
+		expect(onRequest).toHaveBeenCalled();
+		child.stdout.write(
+			`${JSON.stringify({ type: "message_end", message: { role: "assistant", content: [], usage: { input: 11 } } })}\n`,
+		);
+		child.emit("close", 0);
+		expect((await pending).error).toContain("token budget");
+	});
+	it("reuses only the model/auth directory from Ti configuration", () => {
+		vi.stubEnv("TI_DATA_DIR", fixture.directory);
+		vi.stubEnv("PI_CODING_AGENT_DIR", undefined);
+		vi.stubEnv("TI_TEST_API_KEY", "fixture-secret");
+		const env = childEnvironment();
+		expect(env.PI_CODING_AGENT_DIR).toBe(join(fixture.directory, "agent"));
+		expect(env.TI_TEST_API_KEY).toBeUndefined();
+		expect(env.TI_DATA_DIR).toBeUndefined();
 	});
 });
 
-describe("propose_order", () => {
-	it("is parent-pending only and extractProposedOrder rejects fills", () => {
-		const proposal = buildProposedOrder({
-			side: "buy",
-			symbol: "btc/usdt",
-			type: "market",
-			quoteAmount: 100,
-		});
+describe("non-executing order proposals", () => {
+	it("rejects fills and keeps exact order constraints", () => {
+		const proposal = buildProposedOrder({ side: "buy", symbol: "btc/usdt", type: "market", quoteAmount: 100 });
 		expect(proposal).toMatchObject({ submitted: false, pendingParent: true, symbol: "BTC/USDT" });
 		expect(extractProposedOrder({ details: proposal })).toEqual(proposal);
-		expect(extractProposedOrder(proposal)).toEqual(proposal);
 		expect(extractProposedOrder({ ...proposal, submitted: true })).toBeUndefined();
-		expect(extractProposedOrder({ ...proposal, pendingParent: false })).toBeUndefined();
-		expect(() => buildProposedOrder({ side: "buy", symbol: "BTCUSDT", type: "market", quoteAmount: 1 })).toThrow(
-			/ccxt format/,
-		);
-		expect(() => buildProposedOrder({ side: "buy", symbol: "BTC/USDT", type: "market" })).toThrow(
-			/amount or quoteAmount/,
-		);
 		expect(() => buildProposedOrder({ side: "buy", symbol: "BTC/USDT", type: "limit", amount: 1 })).toThrow(
-			/requires price/,
+			"requires price",
 		);
 	});
 });

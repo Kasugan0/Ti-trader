@@ -22,12 +22,13 @@ export function createPublishedManifest(sourceManifest) {
 	return publishedManifest;
 }
 
-export function packageTradingExtension(extensionName) {
+export function packageTradingExtension(extensionName, root = repoRoot) {
 	if (!/^[a-z0-9-]+$/.test(extensionName)) throw new Error(`Invalid extension name: ${extensionName}`);
 
-	const sourceDir = join(repoRoot, "extensions", extensionName);
-	const compiledDir = join(sourceDir, "dist");
-	const targetDir = join(repoRoot, "packages", "trading-agent", "dist", extensionName);
+	const sourceDir = join(root, "extensions", extensionName);
+	const nestedCompiledDir = join(sourceDir, "dist", extensionName);
+	const compiledDir = existsSync(join(nestedCompiledDir, "index.js")) ? nestedCompiledDir : join(sourceDir, "dist");
+	const targetDir = join(root, "packages", "trading-agent", "dist", extensionName);
 	const packageJsonPath = join(sourceDir, "package.json");
 	if (!existsSync(packageJsonPath)) throw new Error(`Missing extension package.json: ${extensionName}`);
 	if (!existsSync(compiledDir)) throw new Error(`Missing compiled extension directory: ${extensionName}`);

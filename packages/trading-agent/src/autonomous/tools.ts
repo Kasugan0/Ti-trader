@@ -168,6 +168,9 @@ export class AutonomousTools {
 	recordServiceFailure(source: string, reason: string): void {
 		this.state.recordFailure(source, reason);
 	}
+	researchScope() {
+		return this.engine.getExecutionScope();
+	}
 	async callWithDeadline(
 		decisionId: string,
 		ordinal: number,

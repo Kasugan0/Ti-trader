@@ -5,7 +5,7 @@ import type { RiskSupervisionReport } from "@nikopack/ti-trading-engine";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { parseTradingArgs } from "../args.ts";
 import { type AutonomousConfig, validateAutonomousConfig } from "../autonomous/config.ts";
-import { modelWorkerEnvironment } from "../autonomous/model-process.ts";
+import { modelWorkerEnvironment, WORKER_FORCE_KILL_MS } from "../autonomous/model-process.ts";
 import { type AutonomousModel, AutonomousRuntime } from "../autonomous/runtime.ts";
 import { AutonomousStore } from "../autonomous/state.ts";
 import { createFileMonitoringStore, createMemoryMonitoringStore, type MonitoringScope } from "../monitoring-state.ts";
@@ -142,6 +142,7 @@ describe("headless autonomous runtime", () => {
 		expect(() => parseTradingArgs(["--autonomous", "start", "--extension", "/tmp/untrusted.ts"])).toThrow();
 		expect(() => validateAutonomousConfig({ ...config, enabled: false })).toThrow("enabled");
 		expect(() => validateAutonomousConfig({ ...config, modelTimeoutMs: 3_000_000_000 })).toThrow("timer range");
+		expect(WORKER_FORCE_KILL_MS).toBeGreaterThan(2000);
 		expect(
 			modelWorkerEnvironment({
 				BINANCE_API_KEY: "fixture-secret",

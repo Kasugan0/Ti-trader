@@ -39,6 +39,7 @@ import {
 	DEFAULT_TRADING_PROMPT_TOOLS,
 	extraToolGuidelines,
 } from "./prompt.ts";
+import { installResearchRuntime } from "./research-bridge.ts";
 import { createTradingTools } from "./tools/index.ts";
 import { createTriggerMonitorExtension } from "./trigger-monitor.ts";
 import { TradingHeader } from "./tui.ts";
@@ -126,6 +127,7 @@ export async function main(argv: string[]): Promise<void> {
 		sessionStartEvent,
 		projectTrustContext,
 	}) => {
+		let uninstallResearchRuntime: (() => void) | undefined;
 		const isInitialRuntime = sessionStartEvent === undefined;
 		const cachedProjectTrust = projectTrustByCwd.get(runtimeCwd);
 		const hasTrustRequiringResources = hasTrustRequiringProjectResources(runtimeCwd, {
@@ -191,6 +193,7 @@ export async function main(argv: string[]): Promise<void> {
 						name: "ti-system",
 						hidden: true,
 						factory: (pi) => {
+							pi.on("session_shutdown", () => uninstallResearchRuntime?.());
 							pi.on("session_start", (_event, ctx) => {
 								if (ctx.mode !== "tui" || (!parsed.verbose && runtimeSettingsManager.getQuietStartup())) return;
 								const header = new TradingHeader(VERSION, () => ({
@@ -239,6 +242,9 @@ export async function main(argv: string[]): Promise<void> {
 			customTools: createTradingTools(),
 			providerAttribution: TI_ATTRIBUTION,
 		});
+		uninstallResearchRuntime = installResearchRuntime(created.session, () =>
+			JSON.stringify(getTrading().getExecutionScope()),
+		);
 		return { ...created, services, diagnostics: services.diagnostics };
 	};
 

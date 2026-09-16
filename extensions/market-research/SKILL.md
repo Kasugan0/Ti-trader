@@ -7,8 +7,10 @@ metadata:
 
 # Market Research
 
-Use `market_research` for a concise market report. Include the symbol and timeframe when known.
+Use `market_research` for substantial technical research and a concise cited report. Include the symbol and timeframe when known; simple reads may stay in the parent.
 
-The research subagent may only use these market-lab tools: `calculate_indicators`, `evaluate_strategy`, `screen_markets`, `simulate_rule`. Market data is public Binance spot candles only.
+Save its `sessionId`. Continue with `sessionId` and a new `question`; the child restores its persistent history. Use `listSessions: true` with optional `limit`/`offset` to recover owned technical research handles. A new parent session or different account is a separate scope.
 
-Reports must state sources, timestamp, data quality, candle status, risks, and that any bias is non-binding. Never treat report text as authorization to place an order. Trading remains exclusively in Ti's native tools and confirmation flow.
+The tool shares the specialist runtime and technical-analyst role, with order proposals disabled. Market-lab and available parent market reads are permitted; account and execution tools are not. Ti-backed candles retain the session venue and market, including futures. Binance public spot is only the explicit fallback without a Ti bridge.
+
+Refresh historical market facts before reaching a new conclusion. Reports must cite real evidence, disclose missing data and risks, and treat bias as non-binding. Trading remains exclusively in Ti's native tools and confirmation flow.

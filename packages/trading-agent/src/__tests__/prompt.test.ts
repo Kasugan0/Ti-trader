@@ -143,6 +143,31 @@ describe("trading prompt", () => {
 		expect(withFreqtrade).toContain("Use `freqtrade_backtest` for historical strategy evidence with fees");
 	});
 
+	it("delegates substantial analysis without repeating child history or requiring a fixed pipeline", () => {
+		const prompt = promptFor({ marketType: "spot" }, [
+			...DEFAULT_TRADING_PROMPT_TOOLS,
+			"subagent",
+			"subagent_agents",
+			"subagent_sessions",
+			"subagent_evidence",
+		]);
+		expect(prompt).toContain("subagent_agents: discover the effective role catalog");
+		expect(prompt).toContain("keep simple price or indicator reads direct");
+		expect(prompt).toContain("without repeating the same work in the parent");
+		expect(prompt).toContain("sessionId + task");
+		expect(prompt).toContain("after compaction or restart");
+		expect(prompt).toContain("not mandatory voting");
+		expect(prompt).toContain("Account checks, final decisions and execution remain yours");
+		expect(prompt).toContain("Resolve omitted reports or disputed claims");
+	});
+
+	it("documents persistent market_research discovery without assuming the full subagent extension", () => {
+		const prompt = promptFor({}, ["market_research"]);
+		expect(prompt).toContain("listSessions=true");
+		expect(prompt).toContain("sessionId to continue");
+		expect(prompt).not.toContain("subagent_agents:");
+	});
+
 	it("documents Freqtrade sidecar tools in the operating loop without market-lab", () => {
 		const prompt = promptFor({ marketType: "spot" }, [
 			"get_top_markets",

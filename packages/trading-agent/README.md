@@ -58,6 +58,14 @@ Ti 与 Pi 的配置完全隔离。首次启动创建 `~/.ti-trader/agent/`，不
 
 默认 25 个原生交易工具（行情、账户、预检、买卖、风控）加上 market-lab / market-chart。清单与参数见 [DESIGN.md](DESIGN.md)。交易所连接、规划、风控在 `@nikopack/ti-trading-engine`。
 
+### 专业子代理与历史续接
+
+Unreleased 源码中，`subagent` 支持筛选、技术、事件、衍生品、策略和复核角色，并保留通用 `researcher`。主 agent 先用 `subagent_agents` 查看实际能力，再按需并行委派复杂分析；不强制每个任务跑完全部角色，也不重复注入子代理的完整对话。
+
+新研究传 `agent` + `task`，继续时传返回的 `sessionId` + `task`。`subagent_sessions` 找回当前作用域的会话，`subagent_evidence` 按需读取已保存报告和证据。历史在 `agent/subagents` 持久化，子进程每次结束后退出。交互重启须恢复同一父会话、cwd 和账户；自主运行时跨临时 worker 继续历史。新父会话不会继承其他父会话的研究。
+
+`market_research` 复用同一运行时，通过 `sessionId` + `question` 继续，或 `listSessions: true` 列表发现，但不允许订单提案。两种入口在 Ti 内都使用父会话的同源行情；旧报告不是最新账户事实。存储、预算、工具边界和示例见 [Subagent](../../extensions/subagent/README.md)。
+
 ## 从源码运行
 
 ```bash

@@ -116,7 +116,7 @@ export function optionalBundledResearchToolNames(): string[] {
 		names.push("market_research");
 	}
 	if (envIsTruthyFlag("TI_SUBAGENT")) {
-		names.push("subagent");
+		names.push("subagent", "subagent_agents", "subagent_sessions", "subagent_evidence");
 	}
 	if (envHasNonEmptyValue("TI_FREQTRADE_URL")) {
 		names.push("freqtrade_status", "freqtrade_backtest", "freqtrade_signals");

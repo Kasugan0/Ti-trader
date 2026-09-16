@@ -10,6 +10,7 @@ All notable changes to `ti-trader` are documented in this file.
 
 ### Added
 
+- Persistent specialist research sessions with exact history continuation, role/session discovery, cited bounded reports, paged evidence and optional batch review. Interactive ownership is parent/account-scoped; autonomous workers retain child sessions across wakes and restarts.
 - Durable, account-scoped trade plans with immutable rationale versions, operator-confirmed tracking, read-only condition observations, Paper-reset invalidation, execution provenance and `/plan` reviews/exports.
 - Plan-linked order and account-protection observations reuse bounded read-only recovery, durable notification leases/retries and `/health`, without waking a model. Localized paginated reviews compare frozen proposals with recorded executions; independent-install probes require cross-process plan continuity and actual evidence extension registration.
 - Private decision evidence records capture public rationales, bounded numeric observations and actual mutation attempts. `/decisions` evaluates citation freshness, missing/retrospective rationale and unknown outcomes without claiming model reliability or profitability.
@@ -20,6 +21,8 @@ All notable changes to `ti-trader` are documented in this file.
 
 ### Changed
 
+- Subagent and `market_research` analysis budgets are unlimited by default: no implicit time, turn, tool-call, token or batch deadline. Explicit role limits remain optional; cancellation, outer runtime deadlines, concurrency and output-size protections are unchanged.
+- `subagent` now includes technical, event, derivatives and strategy analysts alongside scanner, researcher and reviewer. Parent prompts delegate substantial analysis without requiring every specialist or repeating child history; `market_research` shares the persistent runtime with proposals disabled.
 - Documented autonomous Paper, optional `risk.account` hard limits, live protective-cancel refusal and credential-file mode-600 tightening in the design doc, package README and operator guides.
 - Replaced the interactive Ti wordmark with a compact solid block mark in muted gray.
 - Native trading tools use compact, localized summaries with original parameters and output available through tool expansion. Warnings, incomplete data, order identifiers and ambiguous execution outcomes remain visible.
@@ -34,6 +37,8 @@ All notable changes to `ti-trader` are documented in this file.
 
 ### Fixed
 
+- Research children use a supervised read-only bridge to the parent's actual market and enabled services, preserving futures symbols, source metadata and batch candle cutoffs instead of silently reverting Ti research to public spot data.
+- Reclaiming a research session kills an orphaned detached child instead of leaving the session busy; worker stop waits past the child SIGKILL watchdog; busy errors and session listings expose `childPid`.
 - Plan-linked `intentId` reuse fingerprints stable order identity only. A moved ticker snapshot no longer throws before the engine can reuse a released identity or block an unknown one.
 - Cancelling a live protective stop without account hard risk is refused (engine-enforced), matching the account-risk cancellation guard; `cancel_order` and `cancel_order_list` document the refusal.
 - A group/world-readable `~/.ti-trader/agent/keys.json`, Zhihu access-secret file or freqtrade auth file is tightened to mode 600 on read, mirroring the enforced permissions on managed writes.

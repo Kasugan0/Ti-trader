@@ -83,6 +83,12 @@ All numeric operational settings must be supplied. Millisecond settings and the 
 
 Reviewed service names are `market-lab`, `web-search`, `zhihu-research`, `freqtrade`, `market-research` and `subagent`. Enable only installed/configured services. Their normal service credentials and endpoint requirements still apply. The runtime does not discover arbitrary user extensions. Freqtrade is a research-only sidecar, never an independent live executor.
 
+With `subagent` enabled, the model also gets `subagent_agents`, `subagent_sessions` and `subagent_evidence`. It can select technical, event, derivatives, strategy or review specialists, use independent parallel tasks, and continue an existing research thread with `sessionId` + `task`. No fixed research order or voting is required. The internal candle bridge and reviewed market-query adapters remain available to children even if `market-lab` is not exposed directly to the parent; news and Freqtrade still require their corresponding services.
+
+Child JSONL histories and run records live under `agent/subagents`, scoped to this actual account and stable autonomous ownership, not the temporary model worker's session ID. A later wake or restarted worker can discover and resume the same child sessions. Only one writer may use a child conversation at a time; missing or corrupt history is an error, not a new conversation. There are no permanently running child agents, and histories are not automatically deleted. Monitor disk growth and include them in stopped-directory backups. Historical reports must be refreshed before market decisions; neither reports, reviews nor proposals grant execution authority.
+
+The narrower `market-research` service uses the same persistent runtime with proposals disabled. It accepts `sessionId` + `question`, or `listSessions: true` to recover its technical sessions. Child analysis time, turns, tool calls and cumulative tokens have no default limits, and there is no default child-batch deadline; explicitly configured role budgets still apply. The supervisor's required `modelTimeoutMs` remains an independent outer deadline and can interrupt research even when child budgets are omitted. Set it deliberately for the intended decision duration; unlimited child budgets do not override it.
+
 ## Start and control the runtime
 
 In a Ti TUI launched with the same `TI_DATA_DIR`, use:

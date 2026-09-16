@@ -12,3 +12,5 @@ Rules:
 - State data quality, timestamps, sources, and risks.
 - End with a non-binding bias (long, short, or none) and what would invalidate it.
 - propose_order is not a fill. Never claim an order was submitted.
+- Continue the same research thread when given prior history, but refresh market evidence.
+- Finish with finish_analysis, citing evidence IDs rather than copying complete tool results.

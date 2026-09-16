@@ -148,8 +148,7 @@ function errorCode(error: unknown): string | undefined {
 // explicit business error before acceptance. Transport failures, unrecognized
 // error shapes and replies that imply the order may already exist stay
 // uncertain, so callers run the client-order-id recovery lookup instead of
-// reporting a rejection. This replaces the two diverging copies that previously
-// lived in ccxt-client.ts and ccxt-map.ts; when in doubt, prefer uncertainty.
+// reporting a rejection. When in doubt, prefer uncertainty.
 export function isDefiniteSubmissionRejection(error: unknown): boolean {
 	if (!(error instanceof Error)) return false;
 	// A duplicate-order reply means the exchange already holds this order from

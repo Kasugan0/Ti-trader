@@ -15,6 +15,7 @@ import {
 	resolveBundledWebSearchExtension,
 	resolveBundledZhihuResearchExtension,
 } from "../bundled-extensions.ts";
+import { autonomousResearchTools, installResearchRuntime } from "../research-bridge.ts";
 import type { ModelWorkerRequest } from "./model-process.ts";
 import { failureCode } from "./runtime.ts";
 
@@ -30,7 +31,10 @@ const serviceDefinitions = {
 		tools: ["freqtrade_status", "freqtrade_backtest", "freqtrade_signals"],
 	},
 	"market-research": { resolve: resolveBundledMarketResearchExtension, tools: ["market_research"] },
-	subagent: { resolve: resolveBundledSubagentExtension, tools: ["subagent"] },
+	subagent: {
+		resolve: resolveBundledSubagentExtension,
+		tools: ["subagent", "subagent_agents", "subagent_sessions", "subagent_evidence"],
+	},
 };
 
 export function autonomousPrompt(request: ModelWorkerRequest): string {
@@ -44,6 +48,8 @@ When configured hard limits require protection, provide your chosen protectionSt
 An unknown submission is not a rejection: never recreate it under a new identity. The engine reconciles it.
 Use schedule_wake, cancel_wake and list_wakes to control your own next time/market-condition wake. Fill, position and risk changes can also wake you. You may finish without scheduling another task.
 Available reviewed research services: ${request.config.services.join(", ") || "none"}. Research children can propose trades but cannot execute them.
+${request.config.services.includes("subagent") ? "For substantial research, use subagent_agents to discover specialists and delegate only the needed analyses. Keep simple reads direct. Use subagent_sessions to recover persistent account-scoped research across wakes, then sessionId + task to continue. Optional review can examine conflicting reports; no fixed pipeline or voting is required. Refresh stale facts and use subagent_evidence for missing details; history and proposals never authorize a mutation." : ""}
+${request.config.services.includes("market-research") ? "market_research retains technical research history. Pass sessionId to continue, or listSessions=true to find prior sessions." : ""}
 Finish each event with a concise decision/progress summary, including waits and incomplete actions.`;
 }
 
@@ -114,6 +120,7 @@ export async function runModelWorker(request: ModelWorkerRequest): Promise<void>
 		};
 	};
 	let session: AgentSession | undefined;
+	let uninstallResearchRuntime: (() => void) | undefined;
 	let stopping = false;
 	const stop = (): void => {
 		stopping = true;
@@ -162,7 +169,9 @@ export async function runModelWorker(request: ModelWorkerRequest): Promise<void>
 						};
 						return {
 							content: [
-								...(event.isError ? [] : event.content),
+								...(event.isError && event.toolName !== "subagent" && event.toolName !== "market_research"
+									? []
+									: event.content),
 								{ type: "text" as const, text: JSON.stringify(provenance) },
 							],
 							details: { provenance, ...(event.isError ? {} : { data: event.details }) },
@@ -195,6 +204,10 @@ export async function runModelWorker(request: ModelWorkerRequest): Promise<void>
 			customTools,
 		});
 		session = created.session;
+		uninstallResearchRuntime = installResearchRuntime(session, () => JSON.stringify(request.researchScope), {
+			ownerId: "autonomous",
+			extraTools: autonomousResearchTools((args) => call("query_trading", args, false)),
+		});
 		if (
 			created.modelFallbackMessage ||
 			session.model?.provider !== request.config.provider ||
@@ -217,6 +230,7 @@ export async function runModelWorker(request: ModelWorkerRequest): Promise<void>
 		if (text === undefined) throw new Error("Model returned no decision summary");
 		process.send({ kind: "done", text });
 	} finally {
+		uninstallResearchRuntime?.();
 		session?.dispose();
 		process.removeListener("SIGTERM", stop);
 		process.removeListener("message", onMessage);

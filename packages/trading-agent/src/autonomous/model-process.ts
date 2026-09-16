@@ -1,6 +1,7 @@
 import { type ChildProcess, fork } from "node:child_process";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { ExecutionScope } from "@nikopack/ti-trading-engine";
 import type { TSchema } from "typebox";
 import type { AutonomousConfig } from "./config.ts";
 import { type AutonomousModel, failureCode } from "./runtime.ts";
@@ -11,6 +12,7 @@ export interface ModelWorkerRequest {
 	config: AutonomousConfig;
 	agentDir: string;
 	context: string;
+	researchScope: ExecutionScope;
 	tools: Array<{ name: string; description: string; parameters: TSchema; mutating: boolean }>;
 }
 export type ModelWorkerMessage =
@@ -18,6 +20,9 @@ export type ModelWorkerMessage =
 	| { kind: "done"; text: string }
 	| { kind: "error"; reason: string }
 	| { kind: "service-failure"; source: string; reason: string };
+
+/** Isolated children escalate to SIGKILL after 2s; the worker must outlive that watchdog. */
+export const WORKER_FORCE_KILL_MS = 4_000;
 
 export function modelWorkerEnvironment(env = process.env): NodeJS.ProcessEnv {
 	const selected: NodeJS.ProcessEnv = {};
@@ -141,6 +146,7 @@ export class ModelProcess implements AutonomousModel {
 					config: this.config,
 					agentDir: this.agentDir,
 					context,
+					researchScope: this.tools.researchScope(),
 					tools: AUTONOMOUS_TOOLS,
 				};
 				child.send({ kind: "start", request });
@@ -155,7 +161,7 @@ export class ModelProcess implements AutonomousModel {
 		this.child = undefined;
 		if (child.exitCode !== null || child.signalCode !== null) return;
 		await new Promise<void>((resolve) => {
-			const timer = setTimeout(() => child.kill("SIGKILL"), 2000);
+			const timer = setTimeout(() => child.kill("SIGKILL"), WORKER_FORCE_KILL_MS);
 			child.once("exit", () => {
 				clearTimeout(timer);
 				resolve();
