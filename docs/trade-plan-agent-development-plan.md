@@ -4,7 +4,11 @@
 
 文档类型：面向开发 agent 的实施指南与验收参考。
 
-状态：待执行。本文描述计划，不表示功能已经实现、验收或发布。
+状态：本轮源码范围已接通（2026-09-15），未发布。长期 Paper、真实跨日期回访、独立候选安装、前瞻协议的真实样本与授权实盘试点仍待实际采集，不能据此宣布产品或策略通过验收。
+
+当前入口为 `/plan` 与 `/decisions`，操作参考见 [`packages/trading-agent/README.md`](../packages/trading-agent/README.md#保存计划明天继续)。已有版本化研究、人工启用、跨会话索引、只读条件/订单/保护跟踪、持久通知、提交前引用、确切修订归档、实际费用和固定期限前瞻对照。以下任务划分保留为设计与验收参考，并非所有外部门槛都已完成。
+
+实现与原建议的差异：计划存于单个 `plans/state.json`，使容量、版本、通知与 Paper 重置保持单事务一致；条件限于价格/已收盘价的数值比较；不提供自动下单或独立计划守护进程。决策评估分开报告证据纪律、声明成本的现货做多/持币对照与实际执行费用，不把单位资金样本均值当作账户收益。关联执行档案不能随普通历史窗口丢弃，带执行意图的计划不可删除；前瞻研究样本也不可选择性删除。
 
 调研基线：`21ef07979`。源码映射基于该阶段的实现；工作区可能存在其他 agent 的并行修改，接手任务前必须重新核对当前源码与 Git 状态。
 
@@ -224,14 +228,14 @@
 
 | ID | 任务 | 预计投入 | 依赖 | 状态 |
 | --- | --- | --- | --- | --- |
-| D0 | 版本与首用基线 | 2–3 天 | 无 | 待执行 |
-| D1 | 计划模型和存储 | 4–5 天 | 无 | 待执行 |
-| D2 | 工具与 `/plan` | 3–4 天 | D1 | 待执行 |
-| D3 | 跨会话恢复 | 2–3 天 | D2 | 待执行 |
-| D4 | 只读条件跟踪 | 4–5 天 | D2 | 待执行 |
-| D5 | 可靠执行关联 | 5–7 天 | D2 | 待执行 |
-| D6 | 证据归档与复盘 | 4–5 天 | D5 | 待执行 |
-| D7 | 试用与发布收敛 | 3–4 天 | D0、D3、D4、D6 | 待执行 |
+| D0 | 版本与首用基线 | 2–3 天 | 无 | 首用说明与记录模板已准备；候选包实测待授权 |
+| D1 | 计划模型和存储 | 4–5 天 | 无 | 源码已实现，含容量、私密导出与账户周期 |
+| D2 | 工具与 `/plan` | 3–4 天 | D1 | 工具及双语分页界面已接通 |
+| D3 | 跨会话恢复 | 2–3 天 | D2 | 持久索引与独立进程恢复已接通 |
+| D4 | 只读条件跟踪 | 4–5 天 | D2 | 条件、关联订单、保护覆盖、通知队列与健康已接通 |
+| D5 | 可靠执行关联 | 5–7 天 | D2 | 第一版源码已实现，外部验收待采集 |
+| D6 | 证据归档与复盘 | 4–5 天 | D5 | 归档、偏差、真实费用与固定期限对照已实现；未知成本仍为缺口 |
+| D7 | 试用与发布收敛 | 3–4 天 | D0、D3、D4、D6 | 首用、恢复与独立安装探针已接通；真实回访、候选安装及长跑待执行 |
 
 ```text
 D1 → D2 → D3 ──────────┐
@@ -240,7 +244,7 @@ D1 → D2 → D3 ──────────┐
 D0 ────────────────────┘
 ```
 
-第一批只分配 D0、D1、D2。D2 必须等待 D1 的模型和存储契约稳定，不能各自创造不同的数据结构。
+原首批只分配 D0、D1、D2；本轮已继续完成其后源码接线。依赖顺序仍适用于后续修改：工具与消费者必须等待模型及存储契约稳定，不能各自创造不同的数据结构。
 
 ### D0：版本与首用基线
 
@@ -260,6 +264,23 @@ D0 ────────────────────┘
 - 证据状态真实，未完成项目明确保留为未完成。
 
 边界：不得擅自构建、发布、使用付费模型或运行实盘。打包安装和长跑按仓库规则及维护者授权执行。
+
+首用练习使用一个全新的私密 `TI_DATA_DIR` 和经维护者提供的候选包。先记录 `ti --version` 与候选 revision，核对 Paper 模式，再配置独立的模型认证。要求 Ti“仅研究 BTC/USDT 1h，保存带入场、失效、复查和到期条件的观察计划，不要交易”。用 `/plan show <id>` 阅读，确认 `/plan track <id>` 仅启用跟踪；退出后重新打开同一数据目录，再用 `/plan review <id>`。真实跨日期回访必须另记日期，不能把立即重启算成第二天回来。
+
+以下是私密手工记录模板，不是已完成的试用结果。维护者安排参与者；不自动采集身份、对话或支付资料。
+
+| 记录项 | 填写要求 |
+| --- | --- |
+| 参与者引用、候选版本与 revision | 本地匿名引用；不记录真实姓名或凭证 |
+| 环境和前置步骤 | Node 版本、Paper 模式、是否独立安装；模型认证耗时单独记录 |
+| 首次开始、计划保存、跟踪启用时间 | 实际 ISO 时间戳；未完成留空并记阻碍 |
+| 首次任务结果 | 能否说明原始理由、失效条件和“跟踪不是授权” |
+| 再次访问日期与触发原因 | 是否主动跨日期回来；即时重启单独分类 |
+| 延续与复盘结果 | 能否找到原版本、最新条件、关联订单及未知费用；是否仍需翻聊天 |
+| 错误与人工帮助 | 复现步骤、脱敏错误类别、是否需要维护者介入 |
+| 持续价值 | 用户自己的使用频率和价值说明；未实际付款不得记录为付费转化 |
+
+本轮仅准备该流程和模板，没有招募或伪造用户回访。源码与 `[Unreleased]` 中的功能不能据此视为已发布的 npm 能力。
 
 基线长跑可以提前开展，但最终候选代码变化后必须重新满足 revision 绑定的发布证据要求，不能用旧版本的长跑冒充新版本完成。
 
@@ -400,6 +421,10 @@ D0 ────────────────────┘
 
 非目标：不输出样本不足的策略优劣判断，不宣称统计显著性、盈利提升或完整回测。
 
+本轮补充：实际费用保存来源、原币种和完整性，显式零与返佣保留，旧单独 `fee` 数字不充当实测值。关联挂单和已成交但缺费用的记录共享有界刷新；不变轮询不增加归档修订，最新档案可供决策评估读取。
+
+前瞻研究由操作者冻结数值期限、窗口、样本门槛与声明成本。仅后续新回合入组，交易前引用须有真实行情源时间；首个有效未来报价固定，停机错过窗口仍为缺失。现货做多/持币样本与持币、买入持有基准分组对照，缺失或样本不足不判通过，充分也只标描述性证据。合约、未知持仓批次、实际账户收益仍不靠假设补齐。
+
 ### D7：试用与发布收敛
 
 目标：形成一个可独立安装、理解和使用的模拟盘计划工作流。
@@ -427,17 +452,19 @@ D0 ────────────────────┘
 
 | 文件或模块 | 职责 | 关联任务 |
 | --- | --- | --- |
-| `packages/trading-agent/src/plans/types.ts`、`store.ts`，新增 | 模型、版本、持久化 | D1 |
-| `packages/trading-agent/src/plans/service.ts`，新增 | 作用域、权限、生命周期 | D1–D2 |
-| `packages/trading-agent/src/tools/plans.ts`，新增 | 受限计划工具 | D2 |
+| `packages/trading-agent/src/plans/model.ts`、`store.ts`；`packages/trading-agent/src/private-store.ts` | 模型、版本、作用域与持久化 | D1 |
+| `packages/trading-agent/src/plans/runtime.ts` | 计划引用、条件求值、上下文索引与复盘 | D1–D6 |
+| `packages/trading-agent/src/plans/extension.ts`、`presentation.ts` | 受限工具、用户命令和分页展示 | D2 |
 | `packages/trading-agent/src/tools/index.ts`、`prompt.ts` | 工具注册、使用规则 | D2–D3 |
 | `packages/trading-agent/src/main.ts`、`config.ts`、`context.ts` | 存储装配、上下文与运行时变化 | D1–D3 |
 | `packages/trading-agent/src/commands.ts`、`i18n.ts`、`slash-autocomplete.ts` | 命令、双语文案与补全 | D2 |
-| `packages/trading-agent/src/plans/monitor.ts`，新增 | 计划观测与状态变化 | D4 |
+| `packages/trading-agent/src/plans/account-observations.ts`、`monitoring.ts` | 关联订单、保护观测与持久通知 | D4 |
 | `packages/trading-agent/src/monitoring-state.ts`、`monitor.ts`、`trigger-monitor.ts`、`health.ts` | 监控接线、事件与健康；仅修改必要部分 | D4 |
 | `packages/trading-agent/src/tools/execution.ts`、`orders.ts` | 执行引用与结果展示 | D5 |
 | `packages/trading-engine/src/engine.ts`、`execution-journal.ts` | 引用持久化、恢复与保留契约 | D5 |
-| `packages/trading-agent/src/plans/evidence.ts`、`review.ts`，新增 | 证据归档、时间线和复盘事实 | D6 |
+| `packages/trading-agent/src/plans/store.ts`、`runtime.ts`、`comparisons.ts` | 证据归档、时间线与执行偏差 | D6 |
+| `packages/trading-agent/src/decisions/` | 公开理由、冻结协议、前瞻采集、评估及有界展示 | D6 |
+| `packages/trading-engine/src/types.ts`、`ccxt-map.ts`、`ccxt-client.ts`、`paper-account.ts`、`paper-client.ts`、`paper-path.ts` | 来源时间戳及实际费用规范化、持久化与补查 | D6 |
 | 包导出、包清单、相关 README/CHANGELOG | 按实际接口和发布变化更新 | 各任务、D7 |
 
 ### 6.2 Dependencies
@@ -456,11 +483,13 @@ D0 ────────────────────┘
 
 | 文件或测试组 | 覆盖范围 |
 | --- | --- |
-| `packages/trading-agent/src/plans/store.test.ts`，新增 | 持久化、坏文件、写失败、版本冲突、并发与隔离 |
-| `packages/trading-agent/src/plans/service.test.ts`，新增 | 权限、版本启用、归档、Paper 重置 |
-| `packages/trading-agent/src/plans/context.test.ts`，新增 | 新会话、恢复、压缩、索引上限与读取错误 |
-| `packages/trading-agent/src/plans/monitor.test.ts`，新增 | 未知行情、基线、重复通知、取消跟踪、零执行调用 |
-| `packages/trading-agent/src/plans/review.test.ts`，新增 | 归档、证据缺口、部分成交、费用和归因 |
+| `packages/trading-agent/src/plans/plans.test.ts` | 存储、版本、隔离、上下文、条件、执行归档与现金流证据 |
+| `packages/trading-agent/src/plans/monitoring.test.ts` | 保护覆盖、通知租约/重试/过期、健康、分页、容量与零唤醒 |
+| `packages/trading-agent/src/plans/recovery.test.ts` | 独立进程竞争、原理由与笔记保留、计划备份与未知格式拒绝 |
+| `packages/trading-agent/src/decisions/evidence.test.ts`、`study.test.ts` | 事前证据、真实工具时间接线、冻结窗口、缺失样本、声明成本对照及分页 |
+| `packages/trading-engine/src/ccxt-map.test.ts`、`ccxt-fees.test.ts`、`paper-fees.test.ts` | 时间来源、真实费用、旧证据、返佣与重启恢复 |
+| `packages/trading-agent/src/__tests__/plan-tools.test.ts` | 原生普通单/OCO 接线、关联 live 确认、归档失败不重发 |
+| `scripts/trading-package-install.test.mjs`、`trading-release-gate.test.mjs` | 安装探针与新增强制证据门槛；不冒充真实安装 |
 | `packages/trading-agent/src/__tests__/tools.test.ts`、`commands.test.ts`、`prompt.test.ts` | 工具、命令、确认与提示词 |
 | `packages/trading-agent/src/__tests__/config.test.ts`、`context.test.ts`、`tool-availability.test.ts` | 路径、运行时作用域与工具边界 |
 | `packages/trading-agent/src/__tests__/execution-runtime.test.ts` | 跨运行时、作用域、锁与恢复 |
@@ -508,7 +537,7 @@ D0 ────────────────────┘
 
 ```bash
 # 在相应 package 根目录运行，替换为本任务实际涉及的测试路径。
-node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run src/plans/store.test.ts
+node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run src/plans/plans.test.ts src/plans/monitoring.test.ts src/plans/recovery.test.ts
 ```
 
 总体不可妥协条件：
@@ -590,4 +619,4 @@ agent 完成后提交以下信息，而不是只说“已完成”：
 - [交易运维手册](trading-operations.md)。
 - [长程记忆设计参考](research/agent-memory-patterns.md)。
 
-第一批交付以 D0、D1、D2 为限，先获得“能可靠保存、查看和管理计划”的用户反馈。没有出现跨天复用前，不启动风险预算扩展或 Web 界面工程。
+首批以 D0、D1、D2 为限的阶段已结束；本轮完成了后续源码范围，但真实跨日期复用和候选验收尚未完成。没有取得这些证据前，不以源码交付为由启动风险预算扩展或 Web 界面工程。

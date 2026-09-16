@@ -8,6 +8,8 @@ import {
 	readMonitoringHealth,
 } from "./monitoring-state.ts";
 import { assessOperationalHealth } from "./operational-health.ts";
+import { readPlanHealth } from "./plans/monitoring.ts";
+import { PlanStore } from "./plans/store.ts";
 import type { TradingLanguage } from "./state.ts";
 import { renderTradingTable, type TableData } from "./table.ts";
 import { formatTradingStatus, renderTradingVenue, type TradingVenueInput, type TradingVenueStatus } from "./venue.ts";
@@ -20,6 +22,7 @@ const HEALTH_LABELS: Readonly<Partial<Record<string, MenuKey>>> = {
 	"unsettled-risk-reservations": "healthReservationBlock",
 	orders: "healthOrders",
 	triggers: "healthTriggers",
+	plans: "healthPlans",
 	disabled: "healthDisabled",
 	unknown: "healthUnknown",
 	degraded: "healthDegraded",
@@ -35,7 +38,7 @@ function healthLabel(language: TradingLanguage, value: string): string {
 	return key ? t(language, key) : value;
 }
 
-export function readOperationalHealth(store: MonitoringStore = createFileMonitoringStore()) {
+export function readOperationalHealth(store: MonitoringStore = createFileMonitoringStore(), plans?: PlanStore) {
 	const trading = getTrading();
 	const execution = trading.getExecutionStatus();
 	const pause = trading.tradingEngine.risk.usage().newExposurePause;
@@ -51,17 +54,20 @@ export function readOperationalHealth(store: MonitoringStore = createFileMonitor
 		unresolvedExecutions: execution.unresolved.length,
 		pendingReservations: pending.length,
 		maxObservationAgeMs: 5 * 60_000,
-		observations: observations.map((observation) => ({
-			source: observation.source,
-			enabled:
-				observation.source === "triggers"
-					? observation.activeTriggers > 0 || observation.pendingNotifications > 0
-					: trading.config.monitor.enabled || observation.pendingNotifications > 0,
-			lastSuccessAt: observation.lastObservationAt,
-			lastFailureAt: observation.lastFailureAt,
-			errorCode: observation.errorCode,
-			pendingNotifications: observation.pendingNotifications,
-		})),
+		observations: [
+			...observations.map((observation) => ({
+				source: observation.source,
+				enabled:
+					observation.source === "triggers"
+						? observation.activeTriggers > 0 || observation.pendingNotifications > 0
+						: trading.config.monitor.enabled || observation.pendingNotifications > 0,
+				lastSuccessAt: observation.lastObservationAt,
+				lastFailureAt: observation.lastFailureAt,
+				errorCode: observation.errorCode,
+				pendingNotifications: observation.pendingNotifications,
+			})),
+			...(plans ? [readPlanHealth(plans, trading.getExecutionScope(), trading.config.monitor.enabled)] : []),
+		],
 	});
 }
 
@@ -136,7 +142,7 @@ function readTradingStatus(readHealth: typeof readOperationalHealth) {
 }
 
 /** One owner for venue and local health; rendering only consumes the refreshed snapshot. */
-export function createTradingStatus(readHealth = readOperationalHealth) {
+export function createTradingStatus(readHealth = () => readOperationalHealth(undefined, new PlanStore())) {
 	let active:
 		| { ui: ExtensionContext["ui"]; mode: ExtensionContext["mode"]; refresh(): void; dispose(): void }
 		| undefined;
@@ -196,7 +202,7 @@ export function createTradingStatus(readHealth = readOperationalHealth) {
 }
 
 export function createOperationalHealthExtension(
-	readHealth = readOperationalHealth,
+	readHealth = () => readOperationalHealth(undefined, new PlanStore()),
 	getLanguage: () => TradingLanguage = () => getTrading().config.language,
 ) {
 	return (pi: ExtensionAPI): void => {

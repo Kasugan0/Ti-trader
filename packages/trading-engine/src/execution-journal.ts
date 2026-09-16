@@ -10,7 +10,7 @@ import {
 } from "@nikopack/ti-trading-risk";
 import { accountRiskKey } from "./account-risk.ts";
 import { ORDER_TYPES } from "./capabilities.ts";
-import type { Order, PlaceOcoOrderInput, PlaceOrderInput } from "./types.ts";
+import { isOrderFeeObservation, type Order, type PlaceOcoOrderInput, type PlaceOrderInput } from "./types.ts";
 
 export type ExecutionStatus =
 	| "prepared"
@@ -48,16 +48,41 @@ export interface ExecutionEvidence {
 			| "filled"
 			| "remaining"
 			| "cost"
+			| "feeObservation"
 			| "status"
 			| "orderListId"
 			| "listClientOrderId"
-		>
+		> &
+			Partial<
+				Pick<
+					Order,
+					| "type"
+					| "price"
+					| "stopPrice"
+					| "reduceOnly"
+					| "positionSide"
+					| "closePosition"
+					| "trailingPercent"
+					| "activationPrice"
+					| "callbackRate"
+				>
+			>
 	>;
 	/** Operator evidence is a reference, never raw responses, free-form errors or credentials. */
 	reference?: string;
+	/** Terminal quote fee total. Legacy records may lack provenance; verify orders' feeObservation before use. */
+	fee?: number;
+}
+export interface ExecutionReference {
+	kind: string;
+	id: string;
+	version: number;
 }
 export interface ExecutionRecord {
 	id: string;
+	intentId?: string;
+	reference?: ExecutionReference;
+	archiveAcknowledgedRevision?: number;
 	admissionGeneration?: number;
 	scope: ExecutionScope;
 	intent:
@@ -75,6 +100,32 @@ export interface ExecutionRecord {
 	evidence?: ExecutionEvidence;
 	settlement?: { outcome: "commit" | "release"; notional: number };
 }
+
+/** Terminal observed quote-denominated trading fees only; legacy totals, funding and slippage are not evidence. */
+export function observedExecutionFee(entry: Pick<ExecutionRecord, "scope" | "evidence">): number | undefined {
+	const orders = entry.evidence?.orders;
+	const source = entry.scope.mode === "paper" ? "paper-ledger" : "exchange";
+	if (
+		!orders?.length ||
+		entry.evidence?.source === "operator" ||
+		new Set(orders.map((order) => order.id)).size !== orders.length ||
+		!orders.every(
+			(order) =>
+				["closed", "canceled", "rejected", "expired"].includes(order.status) &&
+				isOrderFeeObservation(order.feeObservation) &&
+				order.feeObservation.source === source &&
+				order.feeObservation.completeness === "complete" &&
+				order.feeObservation.charges.every((charge) => charge.currency === entry.scope.quoteCurrency),
+		)
+	)
+		return undefined;
+	const fee = orders.reduce(
+		(sum, order) => sum + order.feeObservation!.charges.reduce((subtotal, charge) => subtotal + charge.cost, 0),
+		0,
+	);
+	return Number.isFinite(fee) ? fee : undefined;
+}
+
 export interface ExecutionJournalState {
 	version: 1;
 	records: ExecutionRecord[];
@@ -112,6 +163,7 @@ export type ExecutionJournalOptions = {
 	accountId: string;
 } & ({ durability: "durable"; admissionGeneration: number } | { durability: "memory"; admissionGeneration?: number });
 export const EXECUTION_HISTORY_LIMIT = 200;
+export const REFERENCED_EXECUTION_LIMIT = 1000;
 export const UNRESOLVED_EXECUTION_LIMIT = 100;
 export const MAX_RECOVERY_ATTEMPTS = 9;
 const states: ExecutionStatus[] = [
@@ -155,6 +207,16 @@ function iso(value: unknown): value is string {
 }
 function nonnegative(value: unknown): value is number {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+function referenceValid(value: unknown): value is ExecutionReference {
+	return (
+		record(value) &&
+		identifier(value.kind) &&
+		identifier(value.id) &&
+		Number.isSafeInteger(value.version) &&
+		Number(value.version) > 0 &&
+		keys(value, ["kind", "id", "version"])
+	);
 }
 function keys(value: Record<string, unknown>, allowed: string[]): boolean {
 	return Object.keys(value).every((key) => allowed.includes(key));
@@ -244,7 +306,8 @@ function evidenceValid(value: unknown): value is ExecutionEvidence {
 		["submission", "client-id-lookup", "operator"].includes(String(value.source)) &&
 		iso(value.observedAt) &&
 		(value.reference === undefined || identifier(value.reference)) &&
-		keys(value, ["source", "observedAt", "orders", "reference"]) &&
+		(value.fee === undefined || (typeof value.fee === "number" && Number.isFinite(value.fee))) &&
+		keys(value, ["source", "observedAt", "orders", "reference", "fee"]) &&
 		Array.isArray(value.orders) &&
 		value.orders.length <= 2 &&
 		value.orders.every(
@@ -258,6 +321,15 @@ function evidenceValid(value: unknown): value is ExecutionEvidence {
 				["clientOrderId", "orderListId", "listClientOrderId"].every(
 					(key) => order[key] === undefined || identifier(order[key]),
 				) &&
+				(order.feeObservation === undefined || isOrderFeeObservation(order.feeObservation)) &&
+				(order.type === undefined || [...ORDER_TYPES, "oco", "unknown"].some((type) => type === order.type)) &&
+				["price", "stopPrice", "trailingPercent", "activationPrice", "callbackRate"].every(
+					(key) => order[key] === undefined || (nonnegative(order[key]) && order[key] > 0),
+				) &&
+				["reduceOnly", "closePosition"].every(
+					(key) => order[key] === undefined || typeof order[key] === "boolean",
+				) &&
+				(order.positionSide === undefined || ["BOTH", "LONG", "SHORT"].includes(String(order.positionSide))) &&
 				keys(order, [
 					"id",
 					"clientOrderId",
@@ -267,15 +339,42 @@ function evidenceValid(value: unknown): value is ExecutionEvidence {
 					"filled",
 					"remaining",
 					"cost",
+					"feeObservation",
 					"status",
 					"orderListId",
 					"listClientOrderId",
+					"type",
+					"price",
+					"stopPrice",
+					"reduceOnly",
+					"positionSide",
+					"closePosition",
+					"trailingPercent",
+					"activationPrice",
+					"callbackRate",
 				]),
 		)
 	);
 }
 export function isUnresolvedExecution(value: ExecutionRecord): boolean {
 	return value.status === "prepared" || value.status === "submission-started" || value.status === "unknown";
+}
+function retainReference(value: ExecutionRecord): boolean {
+	return (
+		value.reference !== undefined &&
+		(value.archiveAcknowledgedRevision !== value.revision ||
+			value.evidence?.orders.some((order) => order.status === "open") === true)
+	);
+}
+
+function trimExecutionHistory(journal: ExecutionJournalState): void {
+	const closed = journal.records
+		.filter((entry) => !isUnresolvedExecution(entry) && !retainReference(entry))
+		.slice(-EXECUTION_HISTORY_LIMIT);
+	const keep = new Set(closed.map((entry) => entry.id));
+	journal.records = journal.records.filter(
+		(entry) => isUnresolvedExecution(entry) || retainReference(entry) || keep.has(entry.id),
+	);
 }
 export function isExecutionJournalState(value: unknown): value is ExecutionJournalState {
 	if (
@@ -337,12 +436,19 @@ export function isExecutionJournalState(value: unknown): value is ExecutionJourn
 		return false;
 	const ids = new Set<string>();
 	return (
-		value.records.length <= EXECUTION_HISTORY_LIMIT + UNRESOLVED_EXECUTION_LIMIT &&
+		value.records.length <= EXECUTION_HISTORY_LIMIT + UNRESOLVED_EXECUTION_LIMIT + REFERENCED_EXECUTION_LIMIT &&
 		value.records.every((entry) => {
 			if (!record(entry) || !identifier(entry.id) || ids.has(entry.id)) return false;
 			ids.add(entry.id);
 			return (
 				scopeValid(entry.scope) &&
+				(entry.intentId === undefined || identifier(entry.intentId)) &&
+				(entry.reference === undefined || (referenceValid(entry.reference) && identifier(entry.intentId))) &&
+				(entry.archiveAcknowledgedRevision === undefined ||
+					(entry.reference !== undefined &&
+						Number.isSafeInteger(entry.archiveAcknowledgedRevision) &&
+						Number(entry.archiveAcknowledgedRevision) >= 0 &&
+						Number(entry.archiveAcknowledgedRevision) <= Number(entry.revision))) &&
 				(entry.admissionGeneration === undefined ||
 					(Number.isSafeInteger(entry.admissionGeneration) && Number(entry.admissionGeneration) >= 0)) &&
 				intentValid(entry.intent) &&
@@ -368,6 +474,9 @@ export function isExecutionJournalState(value: unknown): value is ExecutionJourn
 						keys(entry.settlement, ["outcome", "notional"]))) &&
 				keys(entry, [
 					"id",
+					"intentId",
+					"reference",
+					"archiveAcknowledgedRevision",
 					"admissionGeneration",
 					"scope",
 					"intent",
@@ -397,7 +506,13 @@ export function validateExecutionRiskState(state: ExecutionRiskState): void {
 	)
 		throw new Error("Invalid maintenance admission generation");
 	const pending = records.filter(isUnresolvedExecution).length;
-	if (pending > UNRESOLVED_EXECUTION_LIMIT || records.length - pending > EXECUTION_HISTORY_LIMIT)
+	if (
+		pending > UNRESOLVED_EXECUTION_LIMIT ||
+		records.filter((entry) => !isUnresolvedExecution(entry) && !retainReference(entry)).length >
+			EXECUTION_HISTORY_LIMIT ||
+		records.filter((entry) => !isUnresolvedExecution(entry) && retainReference(entry)).length >
+			REFERENCED_EXECUTION_LIMIT
+	)
 		throw new Error("Execution history exceeds its bounded retention limits");
 	if (
 		state.executions?.maintenance &&
@@ -428,6 +543,15 @@ export function validateExecutionRiskState(state: ExecutionRiskState): void {
 	}
 	for (const entry of records) {
 		const unresolved = isUnresolvedExecution(entry);
+		const feeOrders = entry.evidence?.orders ?? [];
+		const expectedFeeSource = entry.scope.mode === "paper" ? "paper-ledger" : "exchange";
+		if (
+			feeOrders.some((order) => order.feeObservation && order.feeObservation.source !== expectedFeeSource) ||
+			(entry.evidence?.fee !== undefined &&
+				feeOrders.some((order) => order.feeObservation !== undefined) &&
+				observedExecutionFee(entry) !== entry.evidence.fee)
+		)
+			throw new Error("Execution fee provenance or total invariant failed");
 		if (
 			unresolved !== (state[entry.scope.mode].executionBlocks?.[entry.id] === true) ||
 			unresolved === (entry.settlement !== undefined)
@@ -619,23 +743,49 @@ export class ExecutionJournal {
 		intent: ExecutionRecord["intent"],
 		notional: number,
 		count: boolean,
-		options: { intentId?: string; riskRevision?: number; protectionStopPrice?: number } = {},
+		options: {
+			intentId?: string;
+			reference?: ExecutionReference;
+			riskRevision?: number;
+			protectionStopPrice?: number;
+		} = {},
 	): ExecutionRecord {
 		return this.transact((state, risk) => {
 			this.assertAdmission(state);
 			const journal = state.executions ?? { version: 1, records: [], admissionGeneration: this.admissionGeneration };
-			const fingerprint = createHash("sha256").update(JSON.stringify(intent)).digest("hex");
+			if (options.reference !== undefined && (!referenceValid(options.reference) || !identifier(options.intentId)))
+				throw new Error("Referenced execution requires a valid reference and stable intent ID");
+			if (
+				options.reference &&
+				journal.records.filter(
+					(entry) => entry.reference && (isUnresolvedExecution(entry) || retainReference(entry)),
+				).length >= REFERENCED_EXECUTION_LIMIT
+			)
+				throw new Error(
+					"Referenced execution archive capacity reached; archive evidence before linking more orders",
+				);
+			const fingerprint = createHash("sha256")
+				.update(JSON.stringify(options.reference ? { intent, reference: options.reference } : intent))
+				.digest("hex");
 			const intentKey = options.intentId === undefined ? undefined : this.intentKey(options.intentId);
 			if (options.intentId !== undefined) {
 				if (!identifier(options.intentId)) throw new Error("Invalid stable intent identity");
 				const known = journal.intentKeys?.[intentKey!];
 				if (known) {
-					throw new ExecutionRecoveryError(
-						known.executionId,
-						known.fingerprint === fingerprint
-							? "intent already recorded"
-							: "intent identity reused with different parameters",
-					);
+					const prior = journal.records.find((entry) => entry.id === known.executionId);
+					const released =
+						known.fingerprint === fingerprint &&
+						prior !== undefined &&
+						!isUnresolvedExecution(prior) &&
+						prior.settlement?.outcome === "release";
+					if (!released) {
+						throw new ExecutionRecoveryError(
+							known.executionId,
+							known.fingerprint === fingerprint
+								? "intent already recorded"
+								: "intent identity reused with different parameters",
+						);
+					}
 				}
 			}
 			const accountRisk = state.accountRisk?.[accountRiskKey(this.scope)];
@@ -657,6 +807,8 @@ export class ExecutionJournal {
 			});
 			const entry: ExecutionRecord = {
 				id,
+				...(options.intentId === undefined ? {} : { intentId: options.intentId }),
+				...(options.reference === undefined ? {} : { reference: structuredClone(options.reference) }),
 				admissionGeneration: this.admissionGeneration,
 				scope: structuredClone(this.scope),
 				intent: structuredClone(intent),
@@ -696,6 +848,30 @@ export class ExecutionJournal {
 	}
 	findIntent(intentId: string): string | undefined {
 		return (this.store.load() as ExecutionRiskState).executions?.intentKeys?.[this.intentKey(intentId)]?.executionId;
+	}
+	acknowledgeExecutionArchive(id: string, revision: number): void {
+		this.transact((state) => {
+			const entry = this.find(state, id);
+			if (!entry.reference || entry.revision !== revision)
+				throw new Error("Execution archive revision changed; archive current evidence first");
+			entry.archiveAcknowledgedRevision = revision;
+			trimExecutionHistory(state.executions!);
+		});
+	}
+	updateEvidence(id: string, revision: number, evidence: ExecutionEvidence): void {
+		this.transact((state) => {
+			const entry = this.find(state, id);
+			if (entry.revision !== revision || isUnresolvedExecution(entry))
+				throw new Error("Execution changed; use correlated recovery for unresolved records");
+			// Poll receipt freshness belongs to consumer health, not a new immutable evidence revision.
+			if (
+				JSON.stringify(entry.evidence?.orders) === JSON.stringify(evidence.orders) &&
+				entry.evidence?.fee === evidence.fee
+			)
+				return;
+			entry.evidence = structuredClone(evidence);
+			this.transition(state, entry, "reconciled");
+		});
 	}
 	private intentKey(intentId: string): string {
 		return createHash("sha256")
@@ -837,11 +1013,7 @@ export class ExecutionJournal {
 			if (journal) {
 				// Persist settlement order, including deterministic ties when clocks return the same timestamp.
 				journal.records = [...journal.records.filter((item) => item.id !== entry.id), entry];
-				const closed = journal.records
-					.filter((item) => !isUnresolvedExecution(item))
-					.slice(-EXECUTION_HISTORY_LIMIT);
-				const keep = new Set(closed.map((item) => item.id));
-				journal.records = journal.records.filter((item) => isUnresolvedExecution(item) || keep.has(item.id));
+				trimExecutionHistory(journal);
 			}
 			return true;
 		});

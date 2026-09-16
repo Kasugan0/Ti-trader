@@ -1,19 +1,8 @@
 export {
-	allCapabilities,
-	type Capability,
-	type CapabilityStatus,
-	capability,
-	conditionalCapability,
-	type MarketFamily,
 	marketFamily,
 	marketInfoMatchesFamily,
-	marketInfoMatchesPreflight,
-	normalizedOrderTypes,
-	orderTypeFromMarketInfo,
 	paperFuturesOrderUnsupported,
 	requireFuturesSymbol,
-	trailingCapability,
-	unavailableMarketCapability,
 } from "./capabilities.ts";
 export {
 	confirmLiveRiskChange,

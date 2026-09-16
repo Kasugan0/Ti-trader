@@ -4,7 +4,7 @@ export function reduceSide(position: Position): "buy" | "sell" {
 	return position.positionSide === "SHORT" || position.amount < 0 ? "buy" : "sell";
 }
 
-function hasStopComponent(order: Order): boolean {
+export function hasStopComponent(order: Pick<Order, "type">): boolean {
 	return order.type === "oco" || order.type.includes("stop");
 }
 

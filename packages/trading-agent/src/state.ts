@@ -1,3 +1,4 @@
+import { chmodSync, statSync } from "node:fs";
 import {
 	type AccountRiskState,
 	type ExchangeCredentials,
@@ -274,36 +275,105 @@ export function saveTradingConfig(config: TradingConfig): void {
 	);
 }
 
-export function loadExchangeKeys(): Record<string, ExchangeCredentials> {
+/**
+ * Manual credential-file creation is a documented workflow (README, live-mode
+ * errors), so a hand-made file can arrive with the default umask. Tighten
+ * group/world access before reading, mirroring the 0600 enforcement on every
+ * Ti-managed write.
+ */
+function restrictCredentialPermissions(path: string): void {
+	let mode: number;
+	try {
+		mode = statSync(path).mode;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		return;
+	}
+	if ((mode & 0o077) === 0) return;
+	chmodSync(path, 0o600);
+	console.error(`[security] ${path} was accessible by group or others; permissions tightened to 600`);
+}
+
+/** Read the credential file without validating its entries. */
+function readExchangeKeysFile(): Record<string, unknown> {
+	restrictCredentialPermissions(KEYS_PATH);
 	const keys = readJsonFile<unknown>(KEYS_PATH) ?? {};
 	if (typeof keys !== "object" || keys === null || Array.isArray(keys))
 		throw new Error(`Invalid exchange keys in ${KEYS_PATH}`);
-	for (const [exchange, credentials] of Object.entries(keys)) {
-		if (typeof credentials !== "object" || credentials === null)
-			throw new Error(`Invalid credentials for ${exchange}`);
-		const candidate = credentials as Record<string, unknown>;
-		if (
-			typeof candidate.apiKey !== "string" ||
-			candidate.apiKey.trim() === "" ||
-			typeof candidate.secret !== "string" ||
-			candidate.secret.trim() === ""
-		) {
-			throw new Error(`Credentials for ${exchange} must include non-empty apiKey and secret`);
-		}
-		if (candidate.password !== undefined && typeof candidate.password !== "string")
-			throw new Error(`Invalid password for ${exchange}`);
-	}
-	return keys as Record<string, ExchangeCredentials>;
+	return keys as Record<string, unknown>;
 }
 
-export function saveExchangeKeys(keys: Record<string, ExchangeCredentials>): void {
+function parseExchangeCredentials(exchange: string, credentials: unknown): ExchangeCredentials {
+	if (typeof credentials !== "object" || credentials === null) throw new Error(`Invalid credentials for ${exchange}`);
+	const candidate = credentials as Record<string, unknown>;
+	if (
+		typeof candidate.apiKey !== "string" ||
+		candidate.apiKey.trim() === "" ||
+		typeof candidate.secret !== "string" ||
+		candidate.secret.trim() === ""
+	) {
+		throw new Error(`Credentials for ${exchange} must include non-empty apiKey and secret`);
+	}
+	if (candidate.password !== undefined && typeof candidate.password !== "string")
+		throw new Error(`Invalid password for ${exchange}`);
+	return credentials as ExchangeCredentials;
+}
+
+export function loadExchangeKeys(): Record<string, ExchangeCredentials> {
+	const stored = readExchangeKeysFile();
+	const keys: Record<string, ExchangeCredentials> = {};
+	for (const [exchange, credentials] of Object.entries(stored))
+		keys[exchange] = parseExchangeCredentials(exchange, credentials);
+	return keys;
+}
+
+/**
+ * Read one exchange's credentials without validating unrelated exchanges'
+ * entries. Switching a venue live must not fail because another exchange's
+ * stored entry is malformed.
+ */
+export function loadExchangeKeyEntry(exchange: string): ExchangeCredentials | undefined {
+	const credentials = readExchangeKeysFile()[exchange];
+	return credentials === undefined ? undefined : parseExchangeCredentials(exchange, credentials);
+}
+
+export type ExchangeKeysMutator<T> = (keys: Record<string, ExchangeCredentials>) => T;
+
+function validateExchangeKeys(keys: Record<string, ExchangeCredentials>): void {
 	for (const [exchange, credentials] of Object.entries(keys)) {
 		if (!credentials.apiKey.trim() || !credentials.secret.trim())
 			throw new Error(`Credentials for ${exchange} must include apiKey and secret`);
 	}
+}
+
+export function saveExchangeKeys(keys: Record<string, ExchangeCredentials>): void {
+	validateExchangeKeys(keys);
 	withFileLockSync(`${KEYS_PATH}.lock`, () => writeJsonFile(KEYS_PATH, keys, 0o600), {
 		timeoutMessage: (path) => `Timed out waiting for exchange keys lock ${path}`,
 	});
+}
+
+/**
+ * Serialize a read/modify/write of the credential file across Ti processes.
+ * Collect user input before calling this: two sessions entering keys for
+ * different exchanges must merge their entries, not overwrite the whole file
+ * with a stale snapshot. The lock covers only the file transaction, never UI
+ * interaction, and a failed mutator leaves the stored file unchanged.
+ */
+export function mutateExchangeKeys<T>(mutator: ExchangeKeysMutator<T>): T {
+	return withFileLockSync(
+		`${KEYS_PATH}.lock`,
+		() => {
+			const keys = loadExchangeKeys();
+			const result = mutator(keys);
+			validateExchangeKeys(keys);
+			writeJsonFile(KEYS_PATH, keys, 0o600);
+			return result;
+		},
+		{
+			timeoutMessage: (path) => `Timed out waiting for exchange keys lock ${path}`,
+		},
+	);
 }
 
 export interface RiskReservationRecord {

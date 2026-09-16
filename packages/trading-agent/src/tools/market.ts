@@ -1,8 +1,12 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { type ContractStats, getTradingCapabilities, type MarketInfo } from "@nikopack/ti-trading-engine";
+import {
+	type ContractStats,
+	getTradingCapabilities,
+	type MarketInfo,
+	unavailableMarketCapability,
+} from "@nikopack/ti-trading-engine";
 import { getTrading } from "../context.ts";
 import {
-	allCapabilities,
 	capabilitySchema,
 	depthSchema,
 	errorMessage,
@@ -19,7 +23,6 @@ import {
 	round,
 	type TradingProvider,
 	topMarketsSchema,
-	unavailableMarketCapability,
 	venueFields,
 } from "./shared.ts";
 
@@ -84,6 +87,7 @@ export function createGetPriceTool(
 				volume24h: round(t.volume24h, 2),
 				quoteVolume24h: round(t.quoteVolume24h, 0),
 				time: new Date(t.timestamp).toISOString(),
+				sourceTimestampKnown: t.sourceTimestampKnown === true,
 			});
 		},
 	};
@@ -217,7 +221,7 @@ export function createGetTradingCapabilitiesTool(
 				futuresPositionControls: matrix.reduceOnly,
 				fundingRates: matrix.fundingRates,
 			};
-			const unknownCapabilities = allCapabilities(capabilitySet).filter((item) => item.status === "unknown");
+			const unknownCapabilities = Object.values(capabilitySet).filter((item) => item.status === "unknown");
 			return jsonResult({
 				exchange: trading.tradingEngine.id,
 				mode: trading.mode,

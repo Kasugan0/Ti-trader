@@ -48,6 +48,7 @@ out.html
 packages/coding-agent/binaries/
 todo.md
 plans/
+!/packages/trading-agent/src/plans/
 .ti-local/
 .pi/hf-sessions/
 .pi/hf-sessions-backup/

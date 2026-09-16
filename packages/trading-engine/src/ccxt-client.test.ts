@@ -287,8 +287,13 @@ class StubExchange {
 		},
 	};
 
-	async loadMarkets(): Promise<typeof this.markets> {
+	readonly loadMarketsCalls: boolean[] = [];
+	marketsReloadSource: Record<string, (typeof this.markets)[keyof typeof this.markets]> | undefined;
+
+	async loadMarkets(reload = false): Promise<typeof this.markets> {
 		this.events.push("loadMarkets");
+		this.loadMarketsCalls.push(reload);
+		if (reload && this.marketsReloadSource) this.markets = { ...this.markets, ...this.marketsReloadSource };
 		return this.markets;
 	}
 
@@ -539,6 +544,36 @@ function configureFuturesMarket(
 		};
 	}
 }
+
+describe("market metadata reload", () => {
+	it("refreshes the cached markets snapshot on demand", async () => {
+		const stub = new StubExchange();
+		const client = newClient("binance", stub);
+		await client.getMarketInfo("BTC/USDT");
+		expect(stub.loadMarketsCalls).toEqual([false]);
+
+		stub.marketsReloadSource = {
+			...stub.markets,
+			"PEPE/USDT": {
+				id: "PEPEUSDT",
+				symbol: "PEPE/USDT",
+				base: "PEPE",
+				quote: "USDT",
+				spot: true,
+				swap: false,
+				contract: false,
+				limits: { amount: { min: 1 }, cost: {} },
+				info: { filters: [] },
+			},
+		};
+		await expect(client.getMarketInfo("PEPE/USDT")).rejects.toThrow("Unsupported spot market");
+
+		await client.reloadMarkets();
+
+		expect(stub.loadMarketsCalls).toEqual([false, true]);
+		expect((await client.getMarketInfo("PEPE/USDT")).symbol).toBe("PEPE/USDT");
+	});
+});
 
 describe("Binance account exposure inspection", () => {
 	it("finds a matching futures position from a spot client", async () => {

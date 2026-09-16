@@ -44,7 +44,8 @@ jobs:
         run: |
           npm pack --dry-run --json --workspace packages/trading-risk > /tmp/ti-trading-risk-pack.json
           npm pack --dry-run --json --workspace packages/trading-engine > /tmp/ti-trading-engine-pack.json
-          node -e 'const fs = require("node:fs"); for (const name of ["trading-risk", "trading-engine"]) { const pack = JSON.parse(fs.readFileSync(`/tmp/ti-${name}-pack.json`, "utf8")); const files = pack.flatMap((entry) => entry.files.map((file) => file.path)); const tests = files.filter((file) => /\.test\.(js|d\.ts|js\.map)$/.test(file)); if (tests.length > 0) { console.error(`${name} package contains test modules: ${tests.join(", ")}`); process.exit(1); } }'
+          npm pack --dry-run --json --workspace packages/triggers > /tmp/ti-triggers-pack.json
+          node -e 'const fs = require("node:fs"); for (const name of ["trading-risk", "trading-engine", "triggers"]) { const pack = JSON.parse(fs.readFileSync(`/tmp/ti-${name}-pack.json`, "utf8")); const files = pack.flatMap((entry) => entry.files.map((file) => file.path)); const tests = files.filter((file) => /\.test\.(js|d\.ts|js\.map)$/.test(file)); if (tests.length > 0) { console.error(`${name} package contains test modules: ${tests.join(", ")}`); process.exit(1); } }'
           npm pack --dry-run --json --workspace packages/trading-agent > /tmp/ti-trading-agent-pack.json
       - run: npm run check
       - name: Run isolated trading readiness gates

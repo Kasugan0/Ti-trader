@@ -6,7 +6,11 @@ import { fileURLToPath } from "node:url";
 
 export const MINIMUM_SOAK_MS = 7 * 24 * 60 * 60 * 1000;
 export const MAXIMUM_SAMPLE_GAP_MS = 10 * 60 * 1000;
-export const REQUIRED_SUITES = ["repository-check", "risk", "engine", "agent", "release-gate"];
+export const REQUIRED_SUITES = ["repository-check", "risk", "engine", "triggers", "agent", "release-gate"];
+export const REQUIRED_INSTALL_CHECKS = [
+	"cleanInstall", "cliVersion", "isolatedDataDir", "paperDefault", "recoveryAfterRestart",
+	"continuityAfterRestart", "evidenceTools",
+];
 export const REQUIRED_DRILLS = [
 	"crash-before-send",
 	"accepted-before-crash",
@@ -151,7 +155,7 @@ export function evaluateReleaseEvidence(evidence, artifactRoot, now = Date.now()
 				blockers.push(`installation: candidate ${key} version is missing or mismatched`);
 			}
 		}
-		for (const key of ["cleanInstall", "cliVersion", "isolatedDataDir", "paperDefault", "recoveryAfterRestart"]) {
+		for (const key of REQUIRED_INSTALL_CHECKS) {
 			if (!record(installation.checks) || installation.checks[key] !== true) {
 				blockers.push(`installation: ${key} has not passed`);
 			}

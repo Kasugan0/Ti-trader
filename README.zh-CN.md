@@ -16,7 +16,7 @@
 
 会交易（或正在用模拟盘学），能用 CLI，希望 LLM 帮你看盘、试单、执行，但**不愿意**把文件系统或静默实盘通道交给模型。
 
-不是信号源、跟单机器人，也不是「设好就不管」的无人值守服务。
+不是信号源或跟单机器人。默认产品仍是人工确认的交易助手。另有显式启用的 [Paper 自主运行时](docs/autonomous-trading.md)；自主 live 启动会被拒绝。
 
 ## 实际拿到的东西
 
@@ -48,6 +48,7 @@ npm install -g ti-trader
 ti --version
 ti                          # 交互 TUI，默认模拟盘
 ti -p "分析 BTC 1h 走势"     # 一次性，无界面
+ti --autonomous status      # 显式启用的 Paper 自主运行时（需独立配置）
 ```
 
 不要 `sudo npm install -g`；遇到 `EACCES` 把 npm prefix 指到 `~/.npm-global` 再重试。升级用 `npm install -g ti-trader@latest`。
@@ -73,9 +74,10 @@ ti -p "分析 BTC 1h 走势"     # 一次性，无界面
 | `/mode` `/exchange` `/market` `/approval` | 切换运行时。live 需要密钥。`unattended` 需要确认 |
 | `/risk pause` `/risk resume` | 暂停或恢复**新增**敞口。恢复必须交互确认 |
 | `/recovery` `/audit` `/health` | 未决执行、脱敏审计、本地开仓健康 |
+| `/autonomous` | 控制显式启用的 Paper 自主运行时。live 启动拒绝 |
 | `/exchange-login <id>` | 写入交易所 API key |
 
-`/trigger` 是实验性功能。live 触发器只通知，不会拉起交易回合。
+`/trigger` 是实验性功能。live 触发器只通知，不会拉起交易回合。手建的 `keys.json`（以及知乎/freqtrade 密钥文件）若 group/other 可读，读取前会收紧为 `600`。
 
 ## 先说清楚的边界
 
@@ -84,7 +86,7 @@ ti -p "分析 BTC 1h 走势"     # 一次性，无界面
 - 缺 bid/ask、资金费率或未平仓量时返回 `null` 加 `warnings`，不会伪装成 `0`。
 - 可选研究扩展（`web-search`、`zhihu-research`、`market-research`、`subagent`、`freqtrade`）只在对应环境变量或 `--extension` 时加载，都不能下单。
 
-运维手册：[docs/trading-operations.md](docs/trading-operations.md)。设计：[packages/trading-agent/DESIGN.md](packages/trading-agent/DESIGN.md)。引擎契约：[packages/trading-engine/README.md](packages/trading-engine/README.md)。
+运维手册：[docs/trading-operations.md](docs/trading-operations.md)。自主 Paper：[docs/autonomous-trading.md](docs/autonomous-trading.md)。设计：[packages/trading-agent/DESIGN.md](packages/trading-agent/DESIGN.md)。引擎契约：[packages/trading-engine/README.md](packages/trading-engine/README.md)。
 
 ## 包
 

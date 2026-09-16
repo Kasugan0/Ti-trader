@@ -5,6 +5,7 @@ import type {
 	ExchangeClient,
 	MarketInfo,
 	Order,
+	OrderList,
 	PlaceOcoOrderInput,
 	PlaceOrderInput,
 	Position,
@@ -23,7 +24,6 @@ import {
 	createCheckOrderTool,
 	createGetBalanceTool,
 	createGetContractStatsTool,
-	createGetFuturesPositionsTool,
 	createGetPortfolioSnapshotTool,
 	createGetPositionsTool,
 	createGetPriceTool,
@@ -117,6 +117,14 @@ function createRuntime(
 	);
 	const cancelOrder = vi.fn(async (_id: string, _symbol?: string) => {});
 	const cancelOrderList = vi.fn(async (_orderListId: string, _symbol?: string) => {});
+	const getOrderList = vi.fn(
+		async (_orderListId: string): Promise<OrderList> => ({
+			id: "list-1",
+			listOrderStatus: "EXECUTING",
+			status: "open",
+			orders: options.openOrders ?? [],
+		}),
+	);
 	const getPositions = vi.fn(async () => options.positions ?? []);
 	const getBalances = vi.fn(async () => {
 		if (options.balancesError) throw options.balancesError;
@@ -173,7 +181,7 @@ function createRuntime(
 		getOrderHistory: unsupportedRead,
 		getOrder: unsupportedRead,
 		getOrderByClientId: unsupportedRead,
-		getOrderList: unsupportedRead,
+		getOrderList,
 		getOrderListByClientId: unsupportedRead,
 		getFundingRate: unsupportedRead,
 		getFundingRateHistory: unsupportedRead,
@@ -674,7 +682,7 @@ describe("trading order tools", () => {
 			};
 		};
 		expect(data.capabilities.orderTypes.market.status).toBe("supported");
-		expect(data.capabilities.orderTypes.limit.status).toBe("unsupported");
+		expect(data.capabilities.orderTypes.limit.status).toBe("supported");
 		expect(data.capabilities.oco.sell.status).toBe("unsupported");
 	});
 
@@ -1144,14 +1152,6 @@ describe("trading order tools", () => {
 		expect(data.status).toBe("rejected");
 		expect(data.reason).toMatch(/No BOTH position/);
 		expect(placeOrder).not.toHaveBeenCalled();
-	});
-
-	it("rejects the futures-position shortcut in spot mode", async () => {
-		const { runtime } = createRuntime();
-		const tool = createGetFuturesPositionsTool(() => runtime);
-		await expect(tool.execute("spot-futures", {}, undefined, undefined, context)).rejects.toThrow(
-			/unavailable in spot mode/,
-		);
 	});
 
 	it.each([

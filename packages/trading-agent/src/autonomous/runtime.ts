@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { AccountSnapshot, RiskSupervisionReport } from "@nikopack/ti-trading-engine";
 import type { FactValue } from "@nikopack/ti-triggers";
+import { failureCode } from "../failure-code.ts";
 import { ensureMonitoringScope, findMonitoringScope } from "../monitoring-state.ts";
 import {
 	collectTriggerFactKeys,
@@ -10,6 +11,8 @@ import {
 } from "../trigger-facts.ts";
 import type { AutonomousConfig } from "./config.ts";
 import { type AutonomousDecision, type AutonomousStore, enqueueAutonomousEvent } from "./state.ts";
+
+export { failureCode };
 
 export interface AutonomousModel {
 	run(decision: AutonomousDecision, context: string, signal: AbortSignal): Promise<string>;
@@ -24,16 +27,6 @@ export interface AutonomousRuntimeDependencies {
 	block(reason: string): void;
 	recover(): Promise<void>;
 	now?: () => number;
-}
-
-export function failureCode(error: unknown): string {
-	if (error instanceof Error) {
-		if (/timeout|timed out/i.test(error.message)) return "timeout";
-		if (/429|rate.?limit/i.test(error.message)) return "rate-limited";
-		if (/auth|401|403/i.test(error.message)) return "authentication-failed";
-		if (/network|socket|disconnect|ECONN/i.test(error.message)) return "disconnected";
-	}
-	return "operation-failed";
 }
 
 export async function withDeadline<T>(operation: Promise<T>, ms: number, source: string): Promise<T> {

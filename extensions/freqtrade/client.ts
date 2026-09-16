@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { isIP } from "node:net";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -224,6 +224,7 @@ export function readFreqtradeAuth(path = freqtradeAuthPath()): FreqtradeAuth | u
 		return { username, password };
 	}
 	if (!existsSync(path)) return undefined;
+	restrictAuthFilePermissions(path);
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
@@ -235,6 +236,24 @@ export function readFreqtradeAuth(path = freqtradeAuthPath()): FreqtradeAuth | u
 	const filePassword = typeof parsed.password === "string" ? parsed.password.trim() : "";
 	if (!fileUser || !filePassword) throw new Error(`Freqtrade auth file is missing username or password: ${path}`);
 	return { username: fileUser, password: filePassword };
+}
+
+/**
+ * The auth file can be created by hand, so it can arrive with the default
+ * umask. Tighten group/world access before reading, mirroring the 0600
+ * enforcement on every managed save.
+ */
+function restrictAuthFilePermissions(path: string): void {
+	let mode: number;
+	try {
+		mode = statSync(path).mode;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		return;
+	}
+	if ((mode & 0o077) === 0) return;
+	chmodSync(path, 0o600);
+	console.error(`[security] ${path} was accessible by group or others; permissions tightened to 600`);
 }
 
 export function saveFreqtradeAuth(auth: FreqtradeAuth, path = freqtradeAuthPath()): void {

@@ -16,7 +16,7 @@ It is a trading agent, not a coding agent with an exchange plugin. The `read` / 
 
 People who already trade (or are learning on paper), can use a CLI, and want an LLM in the loop **without** giving it a filesystem or a silent path to live orders.
 
-It is not a signal feed, a copy-trading bot, or an unattended “set and forget” service.
+It is not a signal feed or a copy-trading bot. The default product is a human-confirmed assistant. An explicit [Paper autonomous runtime](docs/autonomous-trading.md) exists; autonomous live startup is rejected.
 
 ## What you actually get
 
@@ -48,6 +48,7 @@ npm install -g ti-trader
 ti --version
 ti                          # interactive TUI, paper
 ti -p "分析 BTC 1h 走势"     # one-shot, no TUI
+ti --autonomous status      # explicit Paper autonomous runtime (separate config)
 ```
 
 Do not `sudo npm install -g`; on `EACCES`, set npm's prefix to `~/.npm-global` and retry. Upgrade with `npm install -g ti-trader@latest`.
@@ -73,9 +74,10 @@ State lives in `~/.ti-trader/agent/` (`trading.json`, `keys.json`, sessions); Pi
 | `/mode` `/exchange` `/market` `/approval` | Runtime switches. Live needs keys. `unattended` needs confirmation |
 | `/risk pause` `/risk resume` | Block or restore **new** exposure. Resume is interactive |
 | `/recovery` `/audit` `/health` | Unresolved executions, redacted history, local admission health |
+| `/autonomous` | Control an explicit Paper autonomous daemon. Live startup is rejected |
 | `/exchange-login <id>` | Store exchange API keys |
 
-`/trigger` is experimental. Live triggers notify only; they do not wake a trading turn.
+`/trigger` is experimental. Live triggers notify only; they do not wake a trading turn. Hand-made `keys.json` (and Zhihu/freqtrade secret files) that are group/world-readable are tightened to mode `600` on read.
 
 ## Honest limits
 
@@ -84,7 +86,7 @@ State lives in `~/.ti-trader/agent/` (`trading.json`, `keys.json`, sessions); Pi
 - Missing bid/ask, funding, or open interest comes back as `null` plus `warnings`, never as `0`.
 - Optional research extensions (`web-search`, `zhihu-research`, `market-research`, `subagent`, `freqtrade`) load only when their env is set or you pass `--extension`. They cannot submit orders.
 
-Operator runbook: [docs/trading-operations.md](docs/trading-operations.md). Design: [packages/trading-agent/DESIGN.md](packages/trading-agent/DESIGN.md). Engine contract: [packages/trading-engine/README.md](packages/trading-engine/README.md).
+Operator runbook: [docs/trading-operations.md](docs/trading-operations.md). Autonomous Paper: [docs/autonomous-trading.md](docs/autonomous-trading.md). Design: [packages/trading-agent/DESIGN.md](packages/trading-agent/DESIGN.md). Engine contract: [packages/trading-engine/README.md](packages/trading-engine/README.md).
 
 ## Packages
 

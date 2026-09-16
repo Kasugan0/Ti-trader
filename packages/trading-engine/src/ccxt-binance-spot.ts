@@ -1,5 +1,12 @@
 import type { Exchange } from "ccxt";
-import { optionalBoolean, positionSideFromInfo, toOrderStatus, validTimestamp } from "./ccxt-map.ts";
+import {
+	optionalBoolean,
+	positionSideFromInfo,
+	requireCcxtMarket,
+	requireCcxtString,
+	toOrderStatus,
+	validTimestamp,
+} from "./ccxt-map.ts";
 import type { Order } from "./types.ts";
 
 export async function createBinanceSpotOco(
@@ -20,29 +27,31 @@ export async function createBinanceSpotOco(
 	const endpoint = currentEndpoint ? methods.privatePostOrderListOco : methods.privatePostOrderOco;
 	if (typeof endpoint !== "function")
 		throw new Error("Binance ccxt adapter does not expose a Spot order-list OCO endpoint");
-	const market = exchange.markets[symbol];
+	const market = requireCcxtMarket(exchange, symbol);
+	const marketId = requireCcxtString(market.id, `market id for ${symbol}`);
+	const quantity = requireCcxtString(exchange.amountToPrecision(symbol, amount), "quantity");
 	const params: Record<string, string> = currentEndpoint
 		? {
-				symbol: market.id,
+				symbol: marketId,
 				side: side.toUpperCase(),
-				quantity: exchange.amountToPrecision(symbol, amount),
+				quantity,
 				aboveType: "LIMIT_MAKER",
-				abovePrice: exchange.priceToPrecision(symbol, takeProfitPrice),
+				abovePrice: requireCcxtString(exchange.priceToPrecision(symbol, takeProfitPrice), "abovePrice"),
 				belowType: "STOP_LOSS_LIMIT",
-				belowPrice: exchange.priceToPrecision(symbol, stopLossPrice),
-				belowStopPrice: exchange.priceToPrecision(symbol, stopLossPrice),
+				belowPrice: requireCcxtString(exchange.priceToPrecision(symbol, stopLossPrice), "belowPrice"),
+				belowStopPrice: requireCcxtString(exchange.priceToPrecision(symbol, stopLossPrice), "belowStopPrice"),
 				belowTimeInForce: "GTC",
 				listClientOrderId,
 				aboveClientOrderId,
 				belowClientOrderId,
 			}
 		: {
-				symbol: market.id,
+				symbol: marketId,
 				side: side.toUpperCase(),
-				quantity: exchange.amountToPrecision(symbol, amount),
-				price: exchange.priceToPrecision(symbol, takeProfitPrice),
-				stopPrice: exchange.priceToPrecision(symbol, stopLossPrice),
-				stopLimitPrice: exchange.priceToPrecision(symbol, stopLossPrice),
+				quantity,
+				price: requireCcxtString(exchange.priceToPrecision(symbol, takeProfitPrice), "price"),
+				stopPrice: requireCcxtString(exchange.priceToPrecision(symbol, stopLossPrice), "stopPrice"),
+				stopLimitPrice: requireCcxtString(exchange.priceToPrecision(symbol, stopLossPrice), "stopLimitPrice"),
 				stopLimitTimeInForce: "GTC",
 				// The legacy /order/oco API uses listClientOrderId and
 				// per-leg client ids; newClientOrderId is a single-order field.
@@ -62,7 +71,7 @@ export function assertBinanceSpotTrailingOrder(
 	side: "buy" | "sell",
 	trailingPercent: number,
 ): void {
-	const exchangeMarket = exchange.markets[symbol];
+	const exchangeMarket = requireCcxtMarket(exchange, symbol);
 	const trailingDelta = trailingPercent * 100;
 	if (!Number.isInteger(trailingDelta))
 		throw new Error("Binance Spot trailingPercent must convert to a whole number of BIPS");
@@ -101,18 +110,19 @@ export async function createBinanceSpotTrailingOrder(
 	const endpoint = (exchange as unknown as Record<string, unknown>).privatePostOrder;
 	if (typeof endpoint !== "function") throw new Error("Binance ccxt adapter does not expose the spot order endpoint");
 	assertBinanceSpotTrailingOrder(exchange, symbol, side, trailingPercent);
-	const exchangeMarket = exchange.markets[symbol];
+	const exchangeMarket = requireCcxtMarket(exchange, symbol);
 	const trailingDelta = trailingPercent * 100;
 	const params: Record<string, string> = {
-		symbol: exchangeMarket.id,
+		symbol: requireCcxtString(exchangeMarket.id, `market id for ${symbol}`),
 		side: side.toUpperCase(),
 		// TAKE_PROFIT activates SELL above market and BUY below market.
 		type: "TAKE_PROFIT",
-		quantity: exchange.amountToPrecision(symbol, amount),
+		quantity: requireCcxtString(exchange.amountToPrecision(symbol, amount), "quantity"),
 		trailingDelta: String(trailingDelta),
 		...(clientOrderId ? { newClientOrderId: clientOrderId } : {}),
 	};
-	if (stopPrice !== undefined) params.stopPrice = exchange.priceToPrecision(symbol, stopPrice);
+	if (stopPrice !== undefined)
+		params.stopPrice = requireCcxtString(exchange.priceToPrecision(symbol, stopPrice), "stopPrice");
 	return (await (endpoint as (params: Record<string, string>) => Promise<unknown>).call(exchange, params)) as Record<
 		string,
 		unknown

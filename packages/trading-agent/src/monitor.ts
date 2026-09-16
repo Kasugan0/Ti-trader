@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type Order, type Position, protectionCoverage, reduceSide } from "@nikopack/ti-trading-engine";
 import { getTrading } from "./context.ts";
+import { failureCode } from "./failure-code.ts";
 import { t, translate } from "./i18n.ts";
 import {
 	createFileMonitoringStore,
@@ -18,8 +19,6 @@ import {
 	recordMonitoringObservation,
 } from "./monitoring-state.ts";
 import { openTradingSettings } from "./settings-menu.ts";
-
-export { isProtection, protectionCoverage, reduceSide } from "@nikopack/ti-trading-engine";
 
 const MAX_MISSING_HISTORY_CHECKS = 3;
 const MAX_TRACKED_UNRESOLVED_ORDERS = 256;
@@ -105,7 +104,9 @@ export function createOrderMonitorExtension(options: OrderMonitorOptions = {}) {
 		};
 
 		const reportError = (ctx: ExtensionContext, scope: string, error: unknown): void => {
-			const message = `${scope}: ${error instanceof Error ? error.message : String(error)}`;
+			// Raw transport errors can echo authenticated request details; report only
+			// the coarse failure class, mirroring the autonomous runtime.
+			const message = `${scope}: ${failureCode(error)}`;
 			const now = Date.now();
 			if (lastError?.message === message && now - lastError.reportedAt < 60_000) return;
 			lastError = { message, reportedAt: now };
@@ -247,7 +248,7 @@ export function createOrderMonitorExtension(options: OrderMonitorOptions = {}) {
 						failure.error ?? "notification transport unavailable",
 					);
 				} catch (error) {
-					console.error("[order monitor] delivery diagnostic failed", error);
+					console.error("[order monitor] delivery diagnostic failed:", failureCode(error));
 				}
 			}
 		};

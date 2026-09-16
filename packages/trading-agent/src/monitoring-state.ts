@@ -71,13 +71,14 @@ export interface StoredFactHistory {
 
 export interface MonitoringNotification {
 	id: string;
-	source: "triggers" | "orders";
-	customType: "trigger" | "order-fill" | "position-alert";
+	source: "triggers" | "orders" | "plans";
+	customType: "trigger" | "order-fill" | "position-alert" | "trade-plan-observation";
 	content: string;
 	notices: string[];
 	level: "info" | "warning";
 	wake: boolean;
 	triggerRevision?: string;
+	planReference?: { id: string; version: number; eventId: string };
 	createdAt: number;
 	expiresAt: number;
 	status: "pending" | "delivering" | "delivered" | "expired" | "cancelled";
@@ -95,7 +96,7 @@ export interface MonitoringScopeState {
 	facts: StoredFact[];
 	factHistory?: StoredFactHistory[];
 	orders: OrderMonitorState;
-	health: { triggers: MonitorObservation; orders: MonitorObservation };
+	health: { triggers: MonitorObservation; orders: MonitorObservation; plans?: MonitorObservation };
 	notifications: MonitoringNotification[];
 	autonomous?: AutonomousState;
 }
@@ -303,6 +304,7 @@ function validateNotification(value: unknown): void {
 		"level",
 		"wake",
 		"triggerRevision",
+		"planReference",
 		"createdAt",
 		"expiresAt",
 		"status",
@@ -313,8 +315,23 @@ function validateNotification(value: unknown): void {
 		"finishedAt",
 	]);
 	text(event.id, 256);
-	oneOf(event.source, ["triggers", "orders"]);
-	oneOf(event.customType, event.source === "triggers" ? ["trigger"] : ["order-fill", "position-alert"]);
+	oneOf(event.source, ["triggers", "orders", "plans"]);
+	oneOf(
+		event.customType,
+		event.source === "triggers"
+			? ["trigger"]
+			: event.source === "plans"
+				? ["trade-plan-observation"]
+				: ["order-fill", "position-alert"],
+	);
+	if (event.source === "plans") {
+		const reference = object(event.planReference, ["id", "version", "eventId"]);
+		for (const field of ["id", "eventId"])
+			if (typeof reference[field] !== "string" || !/^[A-Za-z0-9_-]{1,80}$/.test(reference[field]))
+				throw new Error("Invalid plan notification identity");
+		if (!Number.isSafeInteger(reference.version) || Number(reference.version) < 1 || event.wake !== false)
+			throw new Error("Plan notifications cannot wake the agent");
+	} else if (event.planReference !== undefined) throw new Error("Unexpected plan notification reference");
 	text(event.content, 65_536);
 	for (const notice of array(event.notices, 256)) text(notice, 16_384);
 	oneOf(event.level, ["info", "warning"]);
@@ -421,9 +438,10 @@ export function validateMonitoringState(value: unknown): asserts value is Monito
 			optionalTimes(guard, ["firstSeenAt", "lastAlertAt"]);
 		}
 		unique((guards as OrderMonitorState["guards"]).map((guard) => guard.key));
-		const health = object(scope.health, ["triggers", "orders"]);
+		const health = object(scope.health, ["triggers", "orders", "plans"]);
 		validateObservation(health.triggers);
 		validateObservation(health.orders);
+		if (health.plans !== undefined) validateObservation(health.plans);
 		const events = array(scope.notifications, MAX_NOTIFICATIONS);
 		for (const event of events) validateNotification(event);
 		unique((events as MonitoringNotification[]).map((event) => event.id));
@@ -522,8 +540,10 @@ export function pruneMonitoringNotifications(entry: MonitoringScopeState, now: n
 			event.finishedAt = now;
 			delete event.leaseId;
 			delete event.leaseUntil;
-			entry.health[event.source].lastFailureAt = now;
-			entry.health[event.source].errorCode = "notification-expired";
+			entry.health[event.source] ??= {};
+			const health = entry.health[event.source]!;
+			health.lastFailureAt = now;
+			health.errorCode = "notification-expired";
 		}
 	}
 	entry.notifications = entry.notifications.filter(
@@ -535,7 +555,7 @@ export function enqueueMonitoringNotification(
 	entry: MonitoringScopeState,
 	notification: Pick<
 		MonitoringNotification,
-		"source" | "customType" | "content" | "notices" | "level" | "wake" | "triggerRevision"
+		"source" | "customType" | "content" | "notices" | "level" | "wake" | "triggerRevision" | "planReference"
 	>,
 	now: number,
 	expiresAt = now + MONITORING_MAX_AGE_MS,
@@ -577,7 +597,8 @@ export function recordMonitoringObservation(
 	observedAt: number | undefined,
 	failed: boolean,
 ): void {
-	const health = entry.health[source];
+	entry.health[source] ??= {};
+	const health = entry.health[source]!;
 	health.lastPollAt = now;
 	if (observedAt !== undefined) health.lastObservationAt = observedAt;
 	if (failed) {
@@ -669,9 +690,11 @@ export function deliverMonitoringNotifications(
 			} else {
 				event.status = "pending";
 				event.nextAttemptAt = now() + Math.min(60_000, 1000 * 2 ** Math.min(event.attempts, 6));
-				entry.health[source].lastFailureAt = now();
-				entry.health[source].lastDeliveryFailureAt = now();
-				entry.health[source].errorCode = "delivery-failed";
+				entry.health[source] ??= {};
+				const health = entry.health[source]!;
+				health.lastFailureAt = now();
+				health.lastDeliveryFailureAt = now();
+				health.errorCode = "delivery-failed";
 			}
 		});
 		if (delivered) report.delivered++;
@@ -683,7 +706,9 @@ export function deliverMonitoringNotifications(
 export function readMonitoringHealth(store: MonitoringStore, scope: MonitoringScope, now = Date.now()) {
 	time(now);
 	const entry = findMonitoringScope(store.read(), scope);
-	return (["triggers", "orders"] as const).map((source) => {
+	const sources: MonitoringNotification["source"][] = ["triggers", "orders"];
+	if (entry?.health.plans) sources.push("plans");
+	return sources.map((source) => {
 		const observation = entry?.health[source] ?? {};
 		const ageMs = observation.lastObservationAt === undefined ? undefined : now - observation.lastObservationAt;
 		const events = entry?.notifications.filter((event) => event.source === source) ?? [];

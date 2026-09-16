@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -64,9 +64,28 @@ export function readZhihuAccessSecret(path = accessSecretPath()): string | undef
 	const environmentSecret = process.env.ZHIHU_ACCESS_SECRET?.trim();
 	if (environmentSecret) return environmentSecret;
 	if (!existsSync(path)) return undefined;
+	restrictSecretFilePermissions(path);
 	const savedSecret = readFileSync(path, "utf8").trim();
 	if (!savedSecret) throw new Error(`Zhihu access secret file is empty: ${path}`);
 	return savedSecret;
+}
+
+/**
+ * The secret file is typically created by hand, so it can arrive with the
+ * default umask. Tighten group/world access before reading, mirroring the
+ * 0600 enforcement on every managed save.
+ */
+function restrictSecretFilePermissions(path: string): void {
+	let mode: number;
+	try {
+		mode = statSync(path).mode;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		return;
+	}
+	if ((mode & 0o077) === 0) return;
+	chmodSync(path, 0o600);
+	console.error(`[security] ${path} was accessible by group or others; permissions tightened to 600`);
 }
 
 export function saveZhihuAccessSecret(secret: string, path = accessSecretPath()): void {

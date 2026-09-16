@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { evaluateCondition, transitionTrigger } from "./evaluator.ts";
-import { type FactSnapshot, MAX_CHANGE_WINDOW_SEC, type RuntimeState, type TriggerDefinition } from "./model.ts";
+import {
+	type Condition,
+	type FactSnapshot,
+	MAX_CHANGE_WINDOW_SEC,
+	type RuntimeState,
+	type TriggerDefinition,
+} from "./model.ts";
 import { validateCondition, validateTriggerDefinition } from "./schema.ts";
 
 const facts: FactSnapshot = { price: { value: 101, observedAt: 1000, previousValue: 99, previousObservedAt: 900 } };
@@ -267,5 +273,48 @@ describe("trigger evaluator", () => {
 				61_000,
 			).state,
 		).toBe("unknown");
+	});
+
+	it("returns unknown for unsupported condition kinds instead of crashing", () => {
+		const evaluation = evaluateCondition({ kind: "nonsense" } as unknown as Condition, facts, 1_000);
+		expect(evaluation).toMatchObject({ state: "unknown", reason: expect.stringContaining("nonsense") });
+		const unsupported: TriggerDefinition = {
+			...definition(),
+			when: { kind: "nonsense" } as unknown as Condition,
+		};
+		const result = transitionTrigger(unsupported, base, facts, 1_000);
+		expect(result.evaluation).toMatchObject({ state: "unknown" });
+		expect(result.shouldFire).toBe(false);
+		expect(result.state.status).toBe("active");
+	});
+
+	it("negates inner conditions and propagates unknown through not", () => {
+		const above: Condition = { kind: "compare", fact: { key: "price" }, operator: "gt", value: 100 };
+		const below: Condition = { kind: "compare", fact: { key: "price" }, operator: "lte", value: 100 };
+		const missing: Condition = { kind: "compare", fact: { key: "missing" }, operator: "gt", value: 100 };
+		expect(evaluateCondition({ kind: "not", condition: above }, facts, 1_000).state).toBe("false");
+		expect(evaluateCondition({ kind: "not", condition: below }, facts, 1_000).state).toBe("true");
+		expect(evaluateCondition({ kind: "not", condition: missing }, facts, 1_000).state).toBe("unknown");
+	});
+
+	it("resolves any-combinations with short-circuit true and conservative unknown", () => {
+		const above: Condition = { kind: "compare", fact: { key: "price" }, operator: "gt", value: 100 };
+		const below: Condition = { kind: "compare", fact: { key: "price" }, operator: "lt", value: 100 };
+		const missing: Condition = { kind: "compare", fact: { key: "missing" }, operator: "gt", value: 100 };
+		expect(evaluateCondition({ kind: "any", conditions: [below, above] }, facts, 1_000).state).toBe("true");
+		expect(evaluateCondition({ kind: "any", conditions: [below, below] }, facts, 1_000).state).toBe("false");
+		expect(evaluateCondition({ kind: "any", conditions: [below, missing] }, facts, 1_000).state).toBe("unknown");
+	});
+
+	it("detects downward crosses", () => {
+		const belowCross: Condition = { kind: "cross", fact: { key: "price" }, direction: "below", value: 100 };
+		expect(
+			evaluateCondition(
+				belowCross,
+				{ price: { value: 99, observedAt: 1_000, previousValue: 101, previousObservedAt: 900 } },
+				1_000,
+			).state,
+		).toBe("true");
+		expect(evaluateCondition(belowCross, facts, 1_000).state).toBe("false");
 	});
 });

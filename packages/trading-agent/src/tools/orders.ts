@@ -10,6 +10,7 @@ import {
 	PreparedPlanError,
 } from "@nikopack/ti-trading-engine";
 import { getTrading } from "../context.ts";
+import { validatePlanSubmission } from "../plans/runtime.ts";
 import {
 	cancelOrderListSchema,
 	cancelOrderSchema,
@@ -23,7 +24,7 @@ import {
 	getOrderListStatusSchema,
 	getOrderStatusSchema,
 	jsonResult,
-	marketInfoMatchesPreflight,
+	marketInfoMatchesFamily,
 	ocoSchema,
 	orderHistorySchema,
 	orderSchema,
@@ -186,6 +187,12 @@ export function createCheckOrderTool(
 				});
 			}
 
+			if (params.plan)
+				validatePlanSubmission(trading, structuredClone(params.plan), {
+					intent: { kind: "order", input: plan.input },
+					countTowardsDailyLimit: plan.countTowardsDailyLimit,
+					...(params.protectionStopPrice === undefined ? {} : { protectionStopPrice: params.protectionStopPrice }),
+				});
 			const [marketInfoResult, balancesResult] = await Promise.allSettled([
 				trading.tradingEngine.getMarketInfo(plan.input.symbol),
 				trading.tradingEngine.getBalances(),
@@ -269,7 +276,9 @@ export function createCheckOrderTool(
 			const marketFamily = futures ? "futures" : "spot";
 			const marketMatches =
 				marketInfo !== undefined &&
-				marketInfoMatchesPreflight(marketInfo, plan.input.symbol, marketFamily, trading.config.quoteCurrency);
+				marketInfoMatchesFamily(marketInfo, plan.input.symbol, marketFamily, trading.config.quoteCurrency, {
+					allowOmittedOrientation: true,
+				});
 			const orderCapability = evaluateOrderCapability(
 				{
 					...plan.capabilityContext,
@@ -438,7 +447,8 @@ export function createCheckOrderTool(
 					usage,
 					remainingDailyNotional: Math.max(0, usage.limit - usage.used - usage.reserved),
 				},
-				requiresLiveConfirmation: trading.mode === "live" && trading.config.orderApproval === "confirm",
+				requiresLiveConfirmation:
+					trading.mode === "live" && (trading.config.orderApproval === "confirm" || params.plan !== undefined),
 				validation: {
 					orderFilters: "deferred_to_place",
 					note: "A successful preflight is not an exchange acceptance or a reservation. ok_with_warnings still requires reviewing warnings and the live confirmation step.",
@@ -496,7 +506,8 @@ export function createCancelOrderTool(
 		label: "cancel_order",
 		description:
 			"Cancel an open order by id. Use get_open_orders to list order ids. " +
-			"Cancelling one leg of an OCO bracket cancels the whole bracket.",
+			"Cancelling one leg of an OCO bracket cancels the whole bracket. " +
+			"Cancelling a stop or OCO leg that protects an open position is refused; close or reduce the position instead.",
 		parameters: cancelOrderSchema,
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			const trading = tradingProvider();
@@ -525,7 +536,9 @@ export function createCancelOrderListTool(
 	return {
 		name: "cancel_order_list",
 		label: "cancel_order_list",
-		description: "Cancel every open leg in an OCO/order-list by orderListId.",
+		description:
+			"Cancel every open leg in an OCO/order-list by orderListId. " +
+			"Cancelling a list whose stop leg protects an open position is refused; close or reduce the position instead.",
 		parameters: cancelOrderListSchema,
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			const trading = tradingProvider();

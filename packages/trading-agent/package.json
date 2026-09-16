@@ -46,7 +46,7 @@
 		"build:zhihu-research-extension": "tsgo -p ../../extensions/zhihu-research/tsconfig.json && node ../../scripts/package-trading-extension.mjs zhihu-research",
 		"build:subagent-extension": "tsgo -p ../../extensions/subagent/tsconfig.json && node ../../scripts/package-trading-extension.mjs subagent",
 		"build:freqtrade-extension": "tsgo -p ../../extensions/freqtrade/tsconfig.json && node ../../scripts/package-trading-extension.mjs freqtrade",
-		"test": "vitest --run src test --passWithNoTests",
+		"test": "vitest --run src test",
 		"smoke": "node scripts/smoke.mjs",
 		"prepublishOnly": "npm run build"
 	},
@@ -62,7 +62,7 @@
 		"@types/node": "22.19.19",
 		"shx": "0.4.0",
 		"typescript": "5.9.3",
-		"vitest": "4.1.9"
+		"vitest": "5.0.0"
 	},
 	"keywords": [
 		"pi-package",

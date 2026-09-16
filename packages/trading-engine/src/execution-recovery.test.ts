@@ -5,9 +5,10 @@ import {
 	ExecutionJournal,
 	type ExecutionRiskState,
 	isUnresolvedExecution,
+	observedExecutionFee,
 	validateExecutionRiskState,
 } from "./execution-journal.ts";
-import type { ExchangeClient, Order, PlaceOcoOrderInput, PlaceOrderInput } from "./types.ts";
+import type { ExchangeClient, Order, OrderFeeObservation, PlaceOcoOrderInput, PlaceOrderInput } from "./types.ts";
 import { SubmissionRejectedError } from "./types.ts";
 
 const config: TradingEngineConfig = {
@@ -697,4 +698,570 @@ describe("durable execution protocol", () => {
 		});
 		expect(() => f.engine()).toThrow();
 	});
+
+	it.each(["order", "oco"] as const)(
+		"persists %s references before send and clones caller metadata before waits",
+		async (kind) => {
+			const f = fixture();
+			const engine = f.engine();
+			const reference = { kind: "trade-plan", id: "plan-1", version: 1 };
+			const confirm = async () => {
+				reference.version = 9;
+				return true;
+			};
+			if (kind === "order") {
+				const original = f.submit.getMockImplementation()!;
+				f.submit.mockImplementationOnce(async (input) => {
+					expect(engine.listExecutions()[0]).toMatchObject({
+						status: "submission-started",
+						intentId: "intent-1",
+						reference: { kind: "trade-plan", id: "plan-1", version: 1 },
+					});
+					return original(input);
+				});
+				await engine.placeOrder(await engine.prepareOrder("buy", orderIntent), {
+					intentId: "intent-1",
+					reference,
+					confirm,
+				});
+			} else
+				await engine.placeOco(await engine.prepareOcoOrder(ocoIntent), {
+					intentId: "intent-1",
+					reference,
+					confirm,
+				});
+			expect(engine.listExecutions()[0].reference?.version).toBe(1);
+			expect(() => engine.acknowledgeExecutionArchive(engine.listExecutions()[0].id, 0)).toThrow(/revision/);
+			const record = engine.listExecutions()[0];
+			engine.acknowledgeExecutionArchive(record.id, record.revision);
+			expect(engine.listExecutions()[0].archiveAcknowledgedRevision).toBe(record.revision);
+		},
+	);
+
+	it("rejects stale reference checks without sending or retaining a quota claim", async () => {
+		const f = fixture();
+		const engine = f.engine();
+		await expect(
+			engine.placeOrder(await engine.prepareOrder("buy", orderIntent), {
+				intentId: "stale-reference",
+				reference: { kind: "trade-plan", id: "plan", version: 1 },
+				validateReference: () => {
+					throw new Error("Plan was archived");
+				},
+			}),
+		).rejects.toThrow(/archived/);
+		expect(f.submit).not.toHaveBeenCalled();
+		expect(engine.risk.usage()).toMatchObject({ used: 0, reserved: 0 });
+		expect(engine.listExecutions()[0]).toMatchObject({ status: "definite-rejection", reference: { id: "plan" } });
+	});
+
+	it("reuses a stable intentId after confirmation cancel or a pre-submission reference failure", async () => {
+		const f = fixture();
+		const engine = f.engine();
+		const reference = { kind: "trade-plan", id: "plan", version: 1 };
+		await expect(
+			engine.placeOrder(await engine.prepareOrder("buy", orderIntent), {
+				intentId: "retry-me",
+				confirm: async () => false,
+			}),
+		).rejects.toThrow(/cancelled/);
+		expect(f.submit).not.toHaveBeenCalled();
+		await expect(
+			engine.placeOrder(await engine.prepareOrder("sell", orderIntent), { intentId: "retry-me" }),
+		).rejects.toThrow(/different parameters/);
+		const first = await engine.placeOrder(await engine.prepareOrder("buy", orderIntent), { intentId: "retry-me" });
+		expect(f.submit).toHaveBeenCalledOnce();
+		expect(engine.findExecutionIntent("retry-me")).toBe(first.executionId);
+
+		let allowed = false;
+		await expect(
+			engine.placeOrder(await engine.prepareOrder("buy", orderIntent), {
+				intentId: "stale-then-retry",
+				reference,
+				validateReference: () => {
+					if (!allowed) throw new Error("Plan was archived");
+				},
+			}),
+		).rejects.toThrow(/archived/);
+		allowed = true;
+		const retried = await engine.placeOrder(await engine.prepareOrder("buy", orderIntent), {
+			intentId: "stale-then-retry",
+			reference,
+			validateReference: () => {},
+		});
+		expect(f.submit).toHaveBeenCalledTimes(2);
+		expect(engine.findExecutionIntent("stale-then-retry")).toBe(retried.executionId);
+	});
+
+	it("reuses a stable intentId after a definite exchange rejection", async () => {
+		const f = fixture();
+		const engine = f.engine();
+		f.submit.mockRejectedValueOnce(new SubmissionRejectedError("Rejected"));
+		await expect(
+			engine.placeOrder(await engine.prepareOrder("buy", orderIntent), { intentId: "rejected-then-retry" }),
+		).rejects.toThrow("Rejected");
+		const retried = await engine.placeOrder(await engine.prepareOrder("buy", orderIntent), {
+			intentId: "rejected-then-retry",
+		});
+		expect(f.submit).toHaveBeenCalledTimes(2);
+		expect(engine.findExecutionIntent("rejected-then-retry")).toBe(retried.executionId);
+	});
+
+	it("retains linked execution evidence beyond ordinary history until the exact revision is archived", async () => {
+		const f = fixture();
+		const engine = f.engine();
+		const result = await engine.placeOrder(await engine.prepareOrder("buy", orderIntent), {
+			intentId: "first-entry",
+			reference: { kind: "trade-plan", id: "plan", version: 1 },
+		});
+		for (let i = 0; i < 205; i++) await engine.placeOrder(await engine.prepareOrder("sell", orderIntent));
+		const retained = engine.listExecutions().find((record) => record.id === result.executionId)!;
+		expect(retained).toBeDefined();
+		expect(engine.listExecutions()).toHaveLength(201);
+		engine.acknowledgeExecutionArchive(retained.id, retained.revision);
+		expect(engine.listExecutions()).toHaveLength(200);
+		await expect(
+			f.engine().placeOrder(await engine.prepareOrder("buy", orderIntent), { intentId: "first-entry" }),
+		).rejects.toThrow();
+		expect(engine.findExecutionIntent("first-entry")).toBe(result.executionId);
+	});
+
+	it("retains archived open orders and refreshes fills read-only without changing quota settlement", async () => {
+		const f = fixture();
+		const engine = f.engine();
+		const result = await engine.placeOco(await engine.prepareOcoOrder(ocoIntent), {
+			intentId: "exit-oco",
+			reference: { kind: "trade-plan", id: "plan", version: 1 },
+		});
+		const first = engine.listExecutions()[0];
+		engine.acknowledgeExecutionArchive(first.id, first.revision);
+		for (let i = 0; i < 201; i++) await engine.placeOrder(await engine.prepareOrder("sell", orderIntent));
+		expect(engine.listExecutions().some((record) => record.id === result.executionId)).toBe(true);
+		const legs = [...f.lists.values()][0];
+		Object.assign(legs[0], { status: "closed", filled: 1, remaining: 0, cost: 110 });
+		Object.assign(legs[1], { status: "canceled" });
+		const usage = engine.risk.usage();
+		await engine.refreshExecutionEvidence(first.id);
+		const refreshed = engine.listExecutions().find((record) => record.id === first.id)!;
+		expect(refreshed).toMatchObject({ status: "reconciled", revision: first.revision + 1 });
+		expect(refreshed.evidence?.fee).toBeUndefined();
+		expect(engine.risk.usage()).toEqual(usage);
+		expect(f.submitOco).toHaveBeenCalledOnce();
+		expect(() => engine.acknowledgeExecutionArchive(first.id, first.revision)).toThrow(/revision/);
+		engine.acknowledgeExecutionArchive(refreshed.id, refreshed.revision);
+	});
+
+	it("reserves archive capacity for acknowledged pending records so settlement remains possible", () => {
+		const f = fixture();
+		const journal = new ExecutionJournal(f.store, config, f.engine().getExecutionScope());
+		const intent = {
+			kind: "order" as const,
+			input: { ...orderIntent, side: "sell" as const, clientOrderId: "capacity" },
+		};
+		const first = journal.prepare(intent, 100, false, {
+			intentId: "first",
+			reference: { kind: "trade-plan", id: "plan", version: 1 },
+		});
+		journal.settle(first.id, "release", 0, "definite-rejection");
+		f.store.transact((state) => {
+			const template = state.executions!.records[0];
+			state.executions!.records = Array.from({ length: 999 }, (_, index) => ({
+				...structuredClone(template),
+				id: `record-${index}`,
+			}));
+		});
+		const pending = journal.prepare(intent, 100, false, {
+			intentId: "last",
+			reference: { kind: "trade-plan", id: "plan", version: 1 },
+		});
+		journal.acknowledgeExecutionArchive(pending.id, pending.revision);
+		expect(() =>
+			journal.prepare(intent, 100, false, {
+				intentId: "overflow",
+				reference: { kind: "trade-plan", id: "plan", version: 1 },
+			}),
+		).toThrow(/capacity/);
+		expect(journal.settle(pending.id, "release", 0, "definite-rejection")).toBe(true);
+		validateExecutionRiskState(f.state());
+	});
+
+	it.each([
+		{
+			status: "open" as const,
+			filled: 0.4,
+			remaining: 0.6,
+			cost: 40,
+			completeness: "complete" as const,
+			fee: undefined,
+		},
+		{
+			status: "canceled" as const,
+			filled: 0.4,
+			remaining: 0.6,
+			cost: 40,
+			completeness: "complete" as const,
+			fee: 0.1,
+		},
+		{
+			status: "closed" as const,
+			filled: 1,
+			remaining: 0,
+			cost: 100,
+			completeness: "partial" as const,
+			fee: undefined,
+		},
+		{ status: "closed" as const, filled: 1, remaining: 0, cost: 100, completeness: "complete" as const, fee: 0.1 },
+	])("persists $status $completeness fee observations through recovery", async (observation) => {
+		const f = fixture();
+		const engine = f.engine();
+		f.fail(3);
+		await expect(engine.placeOrder(await engine.prepareOrder("buy", orderIntent))).rejects.toThrow();
+		const order = [...f.orders.values()][0];
+		const feeObservation: OrderFeeObservation = {
+			source: "paper-ledger",
+			completeness: observation.completeness,
+			charges: [{ currency: "USDT", cost: 0.1 }],
+		};
+		Object.assign(order, observation, { feeObservation });
+		expect((await f.engine().recoverExecutions(recovery)).reconciled).toBe(1);
+		const evidence = f.engine().listExecutions()[0].evidence;
+		expect(evidence?.orders[0].feeObservation).toEqual(feeObservation);
+		expect(evidence?.fee).toBe(observation.fee);
+		expect(f.submit).toHaveBeenCalledOnce();
+	});
+
+	it.each(["missing", "legacy", "unknown-source", "wrong-mode", "foreign", "base", "zero", "rebate"] as const)(
+		"only trusts explicitly observed terminal quote fees, not %s guesses",
+		async (condition) => {
+			const f = fixture();
+			const original = f.submit.getMockImplementation()!;
+			f.submit.mockImplementationOnce(async (input) => {
+				const result = await original(input);
+				const fee = condition === "zero" ? 0 : condition === "rebate" ? -0.1 : 0.1;
+				const currency = condition === "foreign" ? "BNB" : condition === "base" ? "BTC" : "USDT";
+				if (condition !== "missing" && condition !== "legacy")
+					Object.assign(result.order, {
+						feeObservation: {
+							source:
+								condition === "unknown-source"
+									? "estimate"
+									: condition === "wrong-mode"
+										? "exchange"
+										: "paper-ledger",
+							completeness: "complete",
+							charges: [{ currency, cost: fee }],
+						},
+					});
+				return { ...result, fee: condition === "legacy" ? 99 : fee };
+			});
+			const engine = f.engine();
+			await engine.placeOrder(await engine.prepareOrder("buy", orderIntent));
+			const evidence = f.engine().listExecutions()[0].evidence;
+			expect(evidence?.fee).toBe(condition === "zero" ? 0 : condition === "rebate" ? -0.1 : undefined);
+			if (condition === "base" || condition === "foreign")
+				expect(evidence?.orders[0].feeObservation?.charges[0].currency).toBe(condition === "base" ? "BTC" : "BNB");
+			if (["missing", "legacy", "unknown-source", "wrong-mode"].includes(condition))
+				expect(evidence?.orders[0].feeObservation).toBeUndefined();
+		},
+	);
+
+	it.each(["complete", "missing-canceled-leg", "foreign", "still-open"] as const)(
+		"refreshes %s OCO fees per leg without double counting or quota refunds",
+		async (condition) => {
+			const f = fixture();
+			const engine = f.engine();
+			await engine.placeOco(
+				await engine.prepareOcoOrder({ ...ocoIntent, side: "buy", stopLossPrice: 110, takeProfitPrice: 90 }),
+				{ intentId: "fee-oco", reference: { kind: "trade-plan", id: "plan", version: 1 } },
+			);
+			const before = engine.listExecutions()[0];
+			engine.acknowledgeExecutionArchive(before.id, before.revision);
+			const legs = [...f.lists.values()][0];
+			Object.assign(legs[0], {
+				status: "closed",
+				filled: 1,
+				remaining: 0,
+				cost: 90,
+				feeObservation: {
+					source: "paper-ledger",
+					completeness: "complete",
+					charges: [{ currency: condition === "foreign" ? "BNB" : "USDT", cost: 0.09 }],
+				},
+			});
+			Object.assign(legs[1], {
+				status: condition === "still-open" ? "open" : "canceled",
+				...(condition === "missing-canceled-leg"
+					? {}
+					: {
+							feeObservation: {
+								source: "paper-ledger",
+								completeness: "complete",
+								charges: [{ currency: "USDT", cost: 0 }],
+							},
+						}),
+			});
+			const usage = engine.risk.usage();
+			await f.engine().refreshExecutionEvidence(before.id);
+			const after = engine.listExecutions()[0];
+			expect(after.evidence?.fee).toBe(condition === "complete" ? 0.09 : undefined);
+			expect(after.evidence?.orders[0].feeObservation?.charges).toHaveLength(1);
+			expect(after.archiveAcknowledgedRevision).toBe(before.revision);
+			expect(after.revision).toBe(before.revision + 1);
+			expect(engine.risk.usage()).toEqual(usage);
+			expect(f.submitOco).toHaveBeenCalledOnce();
+			expect(f.submit).not.toHaveBeenCalled();
+			expect(() => engine.acknowledgeExecutionArchive(before.id, before.revision)).toThrow(/revision/);
+		},
+	);
+
+	it("refreshes late terminal fees and preserves them through JSON persistence and archival", async () => {
+		const f = fixture();
+		const engine = f.engine();
+		await engine.placeOrder(await engine.prepareOrder("buy", orderIntent), {
+			intentId: "late-fee",
+			reference: { kind: "trade-plan", id: "plan", version: 1 },
+		});
+		const before = engine.listExecutions()[0];
+		engine.acknowledgeExecutionArchive(before.id, before.revision);
+		[...f.orders.values()][0].feeObservation = {
+			source: "paper-ledger",
+			completeness: "complete",
+			charges: [{ currency: "USDT", cost: 0 }],
+		};
+		const usage = engine.risk.usage();
+		await f.engine().refreshExecutionEvidence(before.id);
+		f.store.save(JSON.parse(JSON.stringify(f.state())) as ExecutionRiskState);
+		expect(f.engine().listExecutions()[0].evidence?.fee).toBe(0);
+		expect(f.engine().listExecutions()[0].evidence?.orders[0].feeObservation?.source).toBe("paper-ledger");
+		expect(engine.risk.usage()).toEqual(usage);
+		await engine.refreshExecutionEvidence(before.id);
+		expect(f.lookup).toHaveBeenCalledOnce();
+		expect(f.submit).toHaveBeenCalledOnce();
+		for (let i = 0; i < 201; i++) await engine.placeOrder(await engine.prepareOrder("sell", orderIntent));
+		const retained = engine.listExecutions().find((record) => record.id === before.id)!;
+		expect(retained.evidence?.fee).toBe(0);
+		engine.acknowledgeExecutionArchive(retained.id, retained.revision);
+		expect(engine.listExecutions().some((record) => record.id === retained.id)).toBe(false);
+	});
+
+	it("retains prior observations on sparse refresh but never calls old partial fees complete after new fills", async () => {
+		const f = fixture();
+		const original = f.submit.getMockImplementation()!;
+		f.submit.mockImplementationOnce(async (input) => {
+			const result = await original(input);
+			Object.assign(result.order, {
+				status: "open",
+				filled: 0.4,
+				remaining: 0.6,
+				cost: 40,
+				feeObservation: {
+					source: "paper-ledger",
+					completeness: "complete",
+					charges: [{ currency: "USDT", cost: 0.04 }],
+				},
+			});
+			return result;
+		});
+		const engine = f.engine();
+		await engine.placeOrder(await engine.prepareOrder("buy", orderIntent));
+		const before = engine.listExecutions()[0];
+		const order = [...f.orders.values()][0];
+		delete order.feeObservation;
+		await engine.refreshExecutionEvidence(before.id);
+		expect(engine.listExecutions()[0].evidence?.orders[0].feeObservation?.completeness).toBe("complete");
+		Object.assign(order, { status: "closed", filled: 1, remaining: 0, cost: 100 });
+		await engine.refreshExecutionEvidence(before.id);
+		const after = engine.listExecutions()[0];
+		expect(after.evidence?.orders[0].feeObservation).toMatchObject({
+			completeness: "partial",
+			charges: [{ currency: "USDT", cost: 0.04 }],
+		});
+		expect(after.evidence?.fee).toBeUndefined();
+		const usage = engine.risk.usage();
+		Object.assign(order, { status: "open", filled: 0.4, remaining: 0.6, cost: 40 });
+		await expect(engine.refreshExecutionEvidence(before.id)).rejects.toThrow(/regressed/);
+		expect(engine.listExecutions()[0]).toEqual(after);
+		expect(engine.risk.usage()).toEqual(usage);
+	});
+
+	it("reads old saved numeric fees but rejects malformed new observation provenance", async () => {
+		const f = fixture();
+		const engine = f.engine();
+		await engine.placeOrder(await engine.prepareOrder("buy", orderIntent));
+		const legacy = structuredClone(f.state());
+		legacy.executions!.records[0].evidence!.fee = 0.1;
+		f.store.save(legacy);
+		expect(f.engine().listExecutions()[0].evidence?.fee).toBe(0.1);
+		expect(observedExecutionFee(f.engine().listExecutions()[0])).toBeUndefined();
+		for (const feeObservation of [
+			{ source: "unknown", completeness: "complete", charges: [{ currency: "USDT", cost: 1 }] },
+			{ source: "paper-ledger", completeness: "complete", charges: [] },
+			{ source: "paper-ledger", completeness: "complete", charges: [{ currency: "USDT", cost: null }] },
+			{
+				source: "paper-ledger",
+				completeness: "complete",
+				charges: [{ currency: "USDT", cost: 1, secret: "blocked" }],
+			},
+		]) {
+			const draft = structuredClone(legacy);
+			Object.assign(draft.executions!.records[0].evidence!.orders[0], { feeObservation });
+			f.store.save(draft);
+			expect(() => f.engine()).toThrow(/Invalid execution journal/);
+		}
+	});
+
+	it.each(["submission", "recovery", "refresh"] as const)(
+		"persists optional actual parameters from %s, never the requested intent",
+		async (phase) => {
+			const f = fixture();
+			const engine = f.engine();
+			const actual = {
+				type: "trailing_stop_market" as const,
+				price: 99,
+				stopPrice: 91,
+				reduceOnly: false,
+				positionSide: "BOTH" as const,
+				closePosition: false,
+				trailingPercent: 0.5,
+				activationPrice: 105,
+				callbackRate: 0.5,
+				feeObservation: {
+					source: "paper-ledger" as const,
+					completeness: "complete" as const,
+					charges: [{ currency: "USDT", cost: 0.1 }],
+				},
+			};
+			if (phase === "submission") {
+				const original = f.submit.getMockImplementation()!;
+				f.submit.mockImplementationOnce(async (input) => {
+					const result = await original(input);
+					Object.assign(result.order, actual);
+					return result;
+				});
+			}
+			if (phase === "recovery") f.fail(3);
+			const submitted = engine.placeOrder(await engine.prepareOrder("buy", orderIntent));
+			if (phase === "recovery") await expect(submitted).rejects.toThrow();
+			else await submitted;
+			if (phase !== "submission") {
+				Object.assign([...f.orders.values()][0], actual);
+				if (phase === "recovery") expect((await f.engine().recoverExecutions(recovery)).reconciled).toBe(1);
+				else await f.engine().refreshExecutionEvidence(engine.listExecutions()[0].id);
+			}
+			f.store.save(JSON.parse(JSON.stringify(f.state())) as ExecutionRiskState);
+			const record = f.engine().listExecutions()[0];
+			expect(record.evidence?.orders[0]).toMatchObject(actual);
+			expect(record.evidence?.fee).toBe(0.1);
+			expect(record.intent.input).toMatchObject({ type: "market" });
+			expect(f.submit).toHaveBeenCalledOnce();
+		},
+	);
+
+	it("keeps missing actual parameters absent in new evidence and legacy saved snapshots", async () => {
+		const f = fixture();
+		const engine = f.engine();
+		const original = f.submit.getMockImplementation()!;
+		f.submit.mockImplementationOnce(async (input) => {
+			const result = await original(input);
+			Object.assign(result.order, { type: undefined, price: undefined });
+			return result;
+		});
+		await engine.placeOrder(await engine.prepareOrder("buy", { ...orderIntent, type: "limit", price: 100 }));
+		f.store.save(JSON.parse(JSON.stringify(f.state())) as ExecutionRiskState);
+		const record = f.engine().listExecutions()[0];
+		for (const key of [
+			"type",
+			"price",
+			"stopPrice",
+			"reduceOnly",
+			"positionSide",
+			"closePosition",
+			"trailingPercent",
+			"activationPrice",
+			"callbackRate",
+		] as const)
+			expect(Object.hasOwn(record.evidence!.orders[0], key)).toBe(false);
+		expect(record.intent.input).toMatchObject({ type: "limit", price: 100 });
+	});
+
+	it.each([
+		{ type: "unsupported" },
+		{ price: 0 },
+		{ stopPrice: -1 },
+		{ reduceOnly: "false" },
+		{ closePosition: 0 },
+		{ positionSide: "UNKNOWN" },
+		{ activationPrice: null },
+		{ callbackRate: "0.5" },
+		{ trailingPercent: Number.POSITIVE_INFINITY },
+	])("rejects malformed saved actual parameters: %s", async (patch) => {
+		const f = fixture();
+		const engine = f.engine();
+		await engine.placeOrder(await engine.prepareOrder("buy", orderIntent));
+		Object.assign(f.state().executions!.records[0].evidence!.orders[0], patch);
+		expect(() => f.engine()).toThrow(/Invalid execution journal/);
+	});
+
+	it.each(["order", "oco"] as const)(
+		"does not spend archive revisions on 1001 unchanged %s polling receipts",
+		async (kind) => {
+			vi.useFakeTimers({ toFake: ["Date"] });
+			try {
+				const start = Date.parse("2026-09-15T00:00:00.000Z");
+				vi.setSystemTime(start);
+				const f = fixture();
+				const engine = f.engine();
+				if (kind === "order") {
+					const original = f.submit.getMockImplementation()!;
+					f.submit.mockImplementationOnce(async (input) => {
+						const result = await original(input);
+						Object.assign(result.order, { status: "open", filled: 0, remaining: 1, cost: 0 });
+						return result;
+					});
+					await engine.placeOrder(
+						await engine.prepareOrder("buy", { ...orderIntent, type: "limit", price: 100 }),
+						{ intentId: "polled-order", reference: { kind: "trade-plan", id: "plan", version: 1 } },
+					);
+				} else
+					await engine.placeOco(await engine.prepareOcoOrder(ocoIntent), {
+						intentId: "polled-oco",
+						reference: { kind: "trade-plan", id: "plan", version: 1 },
+					});
+				const initial = engine.listExecutions()[0];
+				engine.acknowledgeExecutionArchive(initial.id, initial.revision);
+				f.store.save(JSON.parse(JSON.stringify(f.state())) as ExecutionRiskState);
+				const poller = f.engine();
+				const archived = poller.listExecutions()[0];
+				const usage = poller.risk.usage();
+				const audit = poller.listAuditEvents();
+				for (let poll = 1; poll <= 1001; poll++) {
+					vi.setSystemTime(start + poll * 1000);
+					await poller.refreshExecutionEvidence(archived.id);
+				}
+				expect(poller.listExecutions()[0]).toEqual(archived);
+				expect(poller.listExecutions()[0].evidence?.observedAt).toBe(new Date(start).toISOString());
+				expect(poller.listExecutions()[0].evidence?.source).toBe("submission");
+				expect(poller.listAuditEvents()).toEqual(audit);
+				expect(poller.risk.usage()).toEqual(usage);
+				expect(kind === "order" ? f.lookup : f.lookupList).toHaveBeenCalledTimes(1001);
+
+				const changed = kind === "order" ? [...f.orders.values()][0] : [...f.lists.values()][0][0];
+				changed.price = 99;
+				vi.setSystemTime(start + 1002 * 1000);
+				await poller.refreshExecutionEvidence(archived.id);
+				const revised = poller.listExecutions()[0];
+				expect(revised.revision).toBe(archived.revision + 1);
+				expect(revised.archiveAcknowledgedRevision).toBe(archived.revision);
+				expect(revised.evidence?.source).toBe("client-id-lookup");
+				expect(revised.evidence?.observedAt).toBe(new Date(start + 1002 * 1000).toISOString());
+				vi.setSystemTime(start + 1003 * 1000);
+				await poller.refreshExecutionEvidence(archived.id);
+				expect(poller.listExecutions()[0]).toEqual(revised);
+				expect(poller.risk.usage()).toEqual(usage);
+				expect(kind === "order" ? f.submit : f.submitOco).toHaveBeenCalledOnce();
+			} finally {
+				vi.useRealTimers();
+			}
+		},
+	);
 });

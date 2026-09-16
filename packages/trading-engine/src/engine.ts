@@ -6,7 +6,8 @@ import {
 	type RiskReservation,
 	type RiskStateStore,
 } from "@nikopack/ti-trading-risk";
-import { AccountRiskGuard } from "./account-risk.ts";
+import { AccountRiskGuard, isProtectiveExit } from "./account-risk.ts";
+import { getTradingCapabilities, supportsCorrelatedLookup } from "./capabilities.ts";
 import type { FuturesPositionMode } from "./client-types.ts";
 import {
 	ExecutionJournal,
@@ -14,10 +15,12 @@ import {
 	type ExecutionMaintenance,
 	type ExecutionRecord,
 	ExecutionRecoveryError,
+	type ExecutionReference,
 	executionClientIds,
 	isUnresolvedExecution,
 } from "./execution-journal.ts";
 import {
+	boundedLookup,
 	executionEvidence,
 	type ManualExecutionResolution,
 	manuallyResolveExecution,
@@ -61,6 +64,9 @@ export class PreparedPlanError extends Error {
 export interface TradingEngineSubmissionPolicy {
 	/** Stable logical action identity, preserved across model turn retries and restarts. */
 	intentId?: string;
+	reference?: ExecutionReference;
+	/** Trusted synchronous consumer check after final preflight, before submission starts. */
+	validateReference?(): void;
 	timeoutMs?: number;
 	protectionStopPrice?: number;
 	/** Engine-validated atomic protection replacement or full protected close. */
@@ -166,6 +172,53 @@ export class TradingEngine {
 	}
 	findExecutionIntent(intentId: string): string | undefined {
 		return this.executionJournal().findIntent(intentId);
+	}
+	acknowledgeExecutionArchive(id: string, revision: number): void {
+		this.executionJournal().acknowledgeExecutionArchive(id, revision);
+	}
+	async refreshExecutionEvidence(id: string): Promise<void> {
+		const journal = this.executionJournal();
+		const entry = journal.list().find((record) => record.id === id);
+		if (
+			!entry ||
+			entry.scope.accountId !== journal.scope.accountId ||
+			entry.scope.mode !== journal.scope.mode ||
+			entry.scope.exchange !== journal.scope.exchange ||
+			entry.scope.marketType !== journal.scope.marketType ||
+			entry.scope.quoteCurrency !== journal.scope.quoteCurrency ||
+			entry.scope.positionMode !== journal.scope.positionMode
+		)
+			throw new Error("Execution not found in the current account scope");
+		if (isUnresolvedExecution(entry)) throw new Error("Execution is unresolved; use /recovery");
+		if (
+			!entry.evidence?.orders.length ||
+			entry.evidence.orders.every(
+				(order) => order.status !== "open" && order.feeObservation?.completeness === "complete",
+			)
+		)
+			return;
+		const capabilities = getTradingCapabilities({
+			exchangeId: entry.scope.exchange,
+			mode: entry.scope.mode,
+			marketFamily: entry.intent.input.symbol.includes(":") ? "futures" : "spot",
+			positionMode: entry.scope.positionMode,
+			orderType: entry.intent.kind === "order" ? entry.intent.input.type : "oco",
+		});
+		if (
+			!supportsCorrelatedLookup(
+				entry.intent.kind === "order" ? capabilities.queryOrderByClientId : capabilities.queryOrderListByClientId,
+			)
+		)
+			throw new Error("Correlated execution lookup is unsupported for this scope");
+		const result = await boundedLookup(
+			async () =>
+				entry.intent.kind === "order"
+					? { order: await this.getOrderByClientId(entry.intent.input.clientOrderId!, entry.intent.input.symbol) }
+					: { orders: (await this.getOrderListByClientId(entry.intent.input.listClientOrderId!)).orders },
+			1500,
+		);
+		const observation = executionEvidence(entry, result, "client-id-lookup");
+		journal.updateEvidence(entry.id, entry.revision, observation.evidence);
 	}
 	protectionTargets() {
 		return this.executionJournal().protectionTargets();
@@ -426,6 +479,11 @@ export class TradingEngine {
 		policy: TradingEngineSubmissionPolicy = {},
 		signal?: AbortSignal,
 	): Promise<PlaceOrderResult> {
+		policy = {
+			...policy,
+			...(policy.reference ? { reference: structuredClone(policy.reference) } : {}),
+			...(policy.replacementIds ? { replacementIds: [...policy.replacementIds] } : {}),
+		};
 		const prepared = this.preparedOrders.get(plan);
 		if (!prepared) throw new PreparedPlanError("Order plan was not prepared by this trading engine");
 		const input = { ...prepared.input, clientOrderId: executionClientIds(policy.intentId).clientOrderId };
@@ -458,6 +516,7 @@ export class TradingEngine {
 		policy: TradingEngineSubmissionPolicy = {},
 		signal?: AbortSignal,
 	): Promise<PlaceOcoOrderResult> {
+		policy = { ...policy, ...(policy.reference ? { reference: structuredClone(policy.reference) } : {}) };
 		const prepared = this.preparedOcos.get(plan);
 		if (!prepared) throw new PreparedPlanError("OCO plan was not prepared by this trading engine");
 		const { listClientOrderId, aboveClientOrderId, belowClientOrderId } = executionClientIds(policy.intentId);
@@ -538,6 +597,7 @@ export class TradingEngine {
 				countTowardsDailyLimit,
 				{
 					intentId: policy.intentId,
+					reference: policy.reference,
 					riskRevision: accountCheck?.revision,
 					protectionStopPrice: policy.protectionStopPrice,
 				},
@@ -604,6 +664,8 @@ export class TradingEngine {
 			}
 			// A user or another process may pause entries while confirmation is open.
 			throwIfAborted();
+			if (policy.validateReference && policy.validateReference() !== undefined)
+				throw new Error("Execution reference validation must be synchronous");
 			if (countTowardsDailyLimit) this.risk.assertNewExposureAllowed(execution.id);
 			journal.begin(execution.id, riskRevision);
 		} catch (error) {
@@ -672,6 +734,11 @@ export class TradingEngine {
 
 	async cancelOrder(id: string, symbol: string, signal?: AbortSignal, intentId?: string): Promise<void> {
 		if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("Operation cancelled");
+		if (this.mode === "live" && !this.accountRisk?.state()) {
+			const openOrders = await this.exchangeClient.getOpenOrders(symbol);
+			const target = openOrders.find((order) => order.id === id);
+			if (target) await this.assertLiveCancellationKeepsProtection([target]);
+		}
 		const revision = await this.accountRisk?.checkCancellation([id], symbol);
 		signal?.throwIfAborted();
 		const mutationId =
@@ -698,9 +765,34 @@ export class TradingEngine {
 					symbol,
 					orderIds: list.orders.map((order) => order.id),
 				});
+		} else if (this.mode === "live") {
+			const list = await this.exchangeClient.getOrderList(orderListId);
+			await this.assertLiveCancellationKeepsProtection(list.orders);
 		}
 		await this.exchangeClient.cancelOrderList(orderListId, symbol);
 		if (mutationId) this.accountRisk!.finishMutation(mutationId);
+	}
+
+	/**
+	 * Account hard risk arbitrates live cancellations when configured. Without
+	 * it, a live cancellation must never strip a stop-flavored exit from an
+	 * open position; use a controlled close instead.
+	 */
+	private async assertLiveCancellationKeepsProtection(orders: Order[]): Promise<void> {
+		const positions = await this.exchangeClient.getPositions();
+		const scope = { positionMode: this.config.positionMode };
+		const protectedExits = orders.filter((order) =>
+			positions.some((position) => isProtectiveExit(order, position, scope)),
+		);
+		if (protectedExits.length > 0) {
+			throw new Error(
+				`Cancellation would remove protection for an open position (${protectedExits
+					.map((order) => order.id)
+					.join(
+						", ",
+					)}); retain it or use a controlled close, or configure risk.account to arbitrate cancellations`,
+			);
+		}
 	}
 
 	private async verifyReduction(input: PlaceOrderInput): Promise<void> {

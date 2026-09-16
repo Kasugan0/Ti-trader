@@ -42,6 +42,10 @@ export {
 	TradingRuntime,
 	UnattendedTradingConfirmationRequired,
 } from "./context.ts";
+export { evaluateActualExecutions } from "./decisions/evaluation.ts";
+export type { DecisionClaim, DecisionEvidence, DecisionTurn } from "./decisions/evidence.ts";
+export { DecisionStore, evaluateDecisions, validateDecisionEvidence } from "./decisions/evidence.ts";
+export { createDecisionEvidenceExtension } from "./decisions/extension.ts";
 export { createOperationalHealthExtension, readOperationalHealth } from "./health.ts";
 export { main } from "./main.ts";
 export {
@@ -49,15 +53,21 @@ export {
 	type OperationalHealthInput,
 	type OperationalObservation,
 } from "./operational-health.ts";
+export { createPlanExtension } from "./plans/extension.ts";
+export type { PlanContent, PlanObservation, TradePlan } from "./plans/model.ts";
+export { PlanMonitor, planIndex, reviewPlan } from "./plans/runtime.ts";
+export { PlanStore } from "./plans/store.ts";
 export { buildTradingPrompt } from "./prompt.ts";
 export {
 	DEFAULT_CONFIG,
 	type ExchangeCredentials,
 	type FuturesMarginType,
 	type FuturesPositionMode,
+	loadExchangeKeyEntry,
 	loadExchangeKeys,
 	loadTradingConfig,
 	type MarketType,
+	mutateExchangeKeys,
 	type OrderApprovalMode,
 	type RiskLimits,
 	saveExchangeKeys,
@@ -73,8 +83,6 @@ export {
 	createGetBalanceTool,
 	createGetContractStatsTool,
 	createGetFundingRateHistoryTool,
-	createGetFundingRateTool,
-	createGetFuturesPositionsTool,
 	createGetKlinesTool,
 	createGetMarketInfoTool,
 	createGetOpenOrdersTool,

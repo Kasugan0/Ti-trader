@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import ccxt, { type Ticker as CcxtTicker, type Exchange } from "ccxt";
-import { toTicker } from "./ccxt-map.ts";
+import { requireCcxtMarkets, toTicker } from "./ccxt-map.ts";
 import { amountStepFromCcxtPrecision } from "./ccxt-precision.ts";
 import type { FuturesPositionMode } from "./client-types.ts";
 import { contractSizeForMarket, futuresAmountsEqual } from "./contract-size.ts";
@@ -15,6 +15,7 @@ import {
 	maxPersistedOrderId,
 	type PaperAccount,
 	type PaperOrder,
+	paperOrderFeeObservation,
 	parsePaperAccount,
 } from "./paper-account.ts";
 import {
@@ -405,7 +406,7 @@ export class PaperExchangeClient implements ExchangeClient {
 		if (!this.isFuturesSymbol(symbol)) throw new Error("Futures settings require a futures symbol");
 		this.accountForSymbol(symbol);
 		await this.futuresExchange.loadMarkets();
-		const market = this.futuresExchange.markets[symbol];
+		const market = requireCcxtMarkets(this.futuresExchange)[symbol];
 		if (
 			!market ||
 			market.quote !== this.quoteCurrency ||
@@ -508,7 +509,7 @@ export class PaperExchangeClient implements ExchangeClient {
 		const exchange = this.exchangeFor(input.symbol);
 		if (!Number.isFinite(input.amount) || input.amount <= 0) throw new Error("Amount must be finite and positive");
 		await exchange.loadMarkets();
-		const market = exchange.markets[input.symbol];
+		const market = requireCcxtMarkets(exchange)[input.symbol];
 		const futures = this.isFuturesSymbol(input.symbol);
 		if (
 			!market ||
@@ -608,7 +609,7 @@ export class PaperExchangeClient implements ExchangeClient {
 	async getMarketInfo(symbol: string): Promise<MarketInfo> {
 		const exchange = this.exchangeFor(symbol);
 		await exchange.loadMarkets();
-		const market = exchange.markets[symbol];
+		const market = requireCcxtMarkets(exchange)[symbol];
 		const futures = this.isFuturesSymbol(symbol);
 		if (
 			(this.marketType === "spot" && futures) ||
@@ -655,7 +656,7 @@ export class PaperExchangeClient implements ExchangeClient {
 		this.accountForSymbol(symbol);
 		const exchange = this.futuresExchange;
 		await exchange.loadMarkets();
-		const market = exchange.markets[symbol];
+		const market = requireCcxtMarkets(exchange)[symbol];
 		if (
 			!market ||
 			market.quote !== this.quoteCurrency ||
@@ -1062,6 +1063,7 @@ export class PaperExchangeClient implements ExchangeClient {
 				amount: input.amount,
 				filled: 0,
 				cost: 0,
+				feeObservation: paperOrderFeeObservation(this.quoteCurrency, 0),
 				status: "open",
 				timestamp: Date.now(),
 			};
@@ -1131,6 +1133,7 @@ export class PaperExchangeClient implements ExchangeClient {
 				amount,
 				filled: 0,
 				cost: 0,
+				feeObservation: paperOrderFeeObservation(this.quoteCurrency, 0),
 				status: "open",
 				timestamp: now,
 				lastCheckedAt: now,
@@ -1413,6 +1416,7 @@ export class PaperExchangeClient implements ExchangeClient {
 			amount: prepared.requested,
 			filled: 0,
 			cost: 0,
+			feeObservation: paperOrderFeeObservation(this.quoteCurrency, 0),
 			status: "open",
 			timestamp: Date.now(),
 		};
@@ -1438,6 +1442,7 @@ export class PaperExchangeClient implements ExchangeClient {
 		const closing = reducing ? Math.min(currentQty, requested) : 0;
 		const notional = requested * price;
 		const fee = notional * this.feeRate;
+		const feeObservation = paperOrderFeeObservation(this.quoteCurrency, fee, existing);
 		let remainingToClose = closing;
 		let releasedMargin = 0;
 		let pnl = 0;
@@ -1482,10 +1487,10 @@ export class PaperExchangeClient implements ExchangeClient {
 		const timestamp = existing?.timestamp ?? Date.now();
 		let order: PaperOrder;
 		if (existing) {
-			existing.amount = requested;
-			existing.filled = requested;
-			existing.average = price;
-			existing.cost = notional;
+			existing.amount = existing.filled + requested;
+			existing.filled = existing.amount;
+			existing.cost += notional;
+			existing.average = existing.cost / existing.filled;
 			existing.status = "closed";
 			existing.reservedMargin = 0;
 			order = existing;
@@ -1511,6 +1516,7 @@ export class PaperExchangeClient implements ExchangeClient {
 			};
 			account.orders.push(order);
 		}
+		order.feeObservation = feeObservation;
 		account.trades.push({
 			id: order.id,
 			symbol: input.symbol,
@@ -1687,7 +1693,12 @@ export class PaperExchangeClient implements ExchangeClient {
 			const tickers = await exchange.fetchTickers();
 			const suffix = futures ? `/${this.quoteCurrency}:${this.quoteCurrency}` : `/${this.quoteCurrency}`;
 			return Object.values(tickers)
-				.filter((ticker) => ticker.symbol.endsWith(suffix) && (futures || !ticker.symbol.includes(":")))
+				.filter(
+					(ticker) =>
+						typeof ticker.symbol === "string" &&
+						ticker.symbol.endsWith(suffix) &&
+						(futures || !ticker.symbol.includes(":")),
+				)
 				.map(toTicker);
 		};
 		const families =
@@ -1792,7 +1803,7 @@ export class PaperExchangeClient implements ExchangeClient {
 					? entryKey.slice(0, entryKey.lastIndexOf(":"))
 					: entryKey;
 			const symbol = `${asset}/${this.quoteCurrency}:${this.quoteCurrency}`;
-			const market = this.futuresExchange.markets[symbol];
+			const market = requireCcxtMarkets(this.futuresExchange)[symbol];
 			if (!market || market.contract !== true || market.swap !== true) {
 				throw new Error(`Unsupported futures market: ${symbol}`);
 			}
@@ -1887,6 +1898,7 @@ export class PaperExchangeClient implements ExchangeClient {
 			filled: amount,
 			average: price,
 			cost,
+			feeObservation: paperOrderFeeObservation(this.quoteCurrency, 0),
 			status: "closed",
 			timestamp,
 			positionSide,
@@ -1921,7 +1933,7 @@ export class PaperExchangeClient implements ExchangeClient {
 						: "SHORT";
 			const asset = this.positionMode === "hedge" && separator > 0 ? entryKey.slice(0, separator) : entryKey;
 			const symbol = `${asset}/${this.quoteCurrency}:${this.quoteCurrency}`;
-			const market = this.futuresExchange.markets[symbol];
+			const market = requireCcxtMarkets(this.futuresExchange)[symbol];
 			if (!market || market.contract !== true || market.swap !== true) {
 				throw new Error(`Unsupported futures market: ${symbol}`);
 			}
@@ -2124,6 +2136,7 @@ export class PaperExchangeClient implements ExchangeClient {
 			filled: amount,
 			average: price,
 			cost: notional,
+			feeObservation: paperOrderFeeObservation(this.quoteCurrency, fee),
 			status: "closed",
 			timestamp: Date.now(),
 		};
@@ -2308,9 +2321,10 @@ export class PaperExchangeClient implements ExchangeClient {
 		// executeFill creates the canonical trade and a temporary closed order;
 		// retain the original order id in order history instead.
 		account.orders = account.orders.filter((o) => o.id !== fill.order.id);
+		order.feeObservation = paperOrderFeeObservation(this.quoteCurrency, fill.fee, order);
 		order.filled = order.amount;
-		order.average = fill.order.average;
-		order.cost = fill.order.cost;
+		order.cost += fill.order.cost;
+		order.average = order.cost / order.filled;
 		order.status = "closed";
 		account.orders = account.orders.filter((o) => o.id !== order.id);
 		account.orders.push(order);

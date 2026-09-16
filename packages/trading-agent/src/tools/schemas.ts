@@ -58,7 +58,21 @@ export const orderHistorySchema = Type.Object({
 	limit: Type.Optional(Type.Number({ description: "Max orders to return. Default 20, max 100." })),
 });
 
+export const planReferenceSchema = Type.Object(
+	{
+		id: Type.String({ pattern: "^[A-Za-z0-9_-]{1,80}$", description: "Saved trade plan ID." }),
+		version: Type.Integer({ minimum: 1, description: "Exact operator-approved plan version." }),
+		intentId: Type.String({
+			pattern: "^[A-Za-z0-9_-]{1,80}$",
+			description:
+				"Stable ID for this one logical order within the plan version. Reuse for retries; never change it to bypass an unknown execution.",
+		}),
+	},
+	{ additionalProperties: false },
+);
+
 const orderFields = {
+	plan: Type.Optional(planReferenceSchema),
 	symbol: Type.String({ description: SYMBOL_DESC }),
 	type: Type.Union(
 		[
@@ -140,6 +154,7 @@ export const cancelOrderListSchema = Type.Object({
 });
 
 export const ocoSchema = Type.Object({
+	plan: Type.Optional(planReferenceSchema),
 	protectionStopPrice: Type.Optional(
 		Type.Number({
 			exclusiveMinimum: 0,

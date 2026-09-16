@@ -2,10 +2,19 @@ import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveLiveVenue } from "../../../trading-engine/src/venues/index.ts";
 
-const stateMocks = vi.hoisted(() => ({
-	loadExchangeKeys: vi.fn(() => ({})),
-	saveExchangeKeys: vi.fn(),
-}));
+const stateMocks = vi.hoisted(() => {
+	const saved: Array<Record<string, unknown>> = [];
+	return {
+		loadExchangeKeys: vi.fn(() => ({})),
+		loadExchangeKeyEntry: vi.fn(() => undefined),
+		mutateExchangeKeys: vi.fn((mutator: (keys: Record<string, unknown>) => unknown) => {
+			const keys: Record<string, unknown> = {};
+			mutator(keys);
+			saved.push(keys);
+		}),
+		saved,
+	};
+});
 const venueMocks = vi.hoisted(() => ({
 	resolveLiveVenue: vi.fn(),
 }));
@@ -19,6 +28,7 @@ import { loginExchange } from "../settings-menu.ts";
 describe("loginExchange", () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
+		stateMocks.saved.length = 0;
 		venueMocks.resolveLiveVenue.mockImplementation(resolveLiveVenue);
 	});
 
@@ -36,9 +46,7 @@ describe("loginExchange", () => {
 			expect(call[2]).toEqual({ secret: true });
 		}
 		expect(input).toHaveBeenCalledTimes(2);
-		expect(stateMocks.saveExchangeKeys).toHaveBeenCalledWith({
-			binance: { apiKey: "api-key", secret: "api-secret" },
-		});
+		expect(stateMocks.saved).toEqual([{ binance: { apiKey: "api-key", secret: "api-secret" } }]);
 		expect(notify).toHaveBeenCalledWith(expect.stringContaining("Keys for binance saved"), "info");
 	});
 
@@ -54,7 +62,7 @@ describe("loginExchange", () => {
 		await loginExchange("okx", ctx);
 
 		expect(input).toHaveBeenCalledTimes(3);
-		expect(stateMocks.saveExchangeKeys).not.toHaveBeenCalled();
+		expect(stateMocks.saved).toEqual([]);
 		expect(notify).toHaveBeenCalledWith(expect.stringContaining("passphrase is required"), "warning");
 	});
 
@@ -69,8 +77,6 @@ describe("loginExchange", () => {
 
 		await loginExchange("okx", ctx);
 
-		expect(stateMocks.saveExchangeKeys).toHaveBeenCalledWith({
-			okx: { apiKey: "api-key", secret: "api-secret", password: "passphrase" },
-		});
+		expect(stateMocks.saved).toEqual([{ okx: { apiKey: "api-key", secret: "api-secret", password: "passphrase" } }]);
 	});
 });

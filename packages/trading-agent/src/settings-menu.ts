@@ -15,10 +15,11 @@ import { AccountSwitchConfirmationRequired, getTrading } from "./context.ts";
 import { exchangeLabel, isSupportedExchangeId, SUPPORTED_EXCHANGES } from "./exchanges.ts";
 import { orderApprovalLabel, t, translate } from "./i18n.ts";
 import {
+	loadExchangeKeyEntry,
 	loadExchangeKeys,
 	type MarketType,
+	mutateExchangeKeys,
 	type OrderApprovalMode,
-	saveExchangeKeys,
 	type TradingLanguage,
 	type TradingMode,
 } from "./state.ts";
@@ -251,7 +252,7 @@ export class TradingSettingsPanel implements Component {
 					this.rebuild("language");
 					return;
 				case "mode": {
-					if (value === "live" && !loadExchangeKeys()[trading.config.exchange]) {
+					if (value === "live" && !loadExchangeKeyEntry(trading.config.exchange)) {
 						this.ctx.ui.notify(t(language, "liveKeysMissing"), "error");
 						break;
 					}
@@ -890,6 +891,7 @@ function parentSettingId(id: string): string {
 export async function loginExchange(exchange: string, ctx: ExtensionCommandContext): Promise<void> {
 	const language = lang();
 	const inputOptions = { secret: true };
+	const venue = resolveLiveVenue(exchange);
 	const apiKey = await ctx.ui.input(
 		translate(language, "loginApiKeyTitle", { exchange }),
 		t(language, "loginApiKeyPlaceholder"),
@@ -908,28 +910,29 @@ export async function loginExchange(exchange: string, ctx: ExtensionCommandConte
 		ctx.ui.notify(t(language, "cancelled"), "info");
 		return;
 	}
-	const keys = loadExchangeKeys();
-	const venue = resolveLiveVenue(exchange);
-	if (venue.password === "unused") {
-		keys[exchange] = { apiKey: apiKey.trim(), secret: secret.trim() };
-	} else {
+	let password: string | undefined;
+	if (venue.password !== "unused") {
 		const required = venue.password === "required";
-		const password = await ctx.ui.input(
+		const passphrase = await ctx.ui.input(
 			translate(language, required ? "loginPasswordRequiredTitle" : "loginPasswordTitle", { exchange }),
 			t(language, required ? "loginPasswordRequiredPlaceholder" : "loginPasswordPlaceholder"),
 			inputOptions,
 		);
-		if (required && !password?.trim()) {
+		if (required && !passphrase?.trim()) {
 			ctx.ui.notify(translate(language, "loginPassphraseRequired", { exchange }), "warning");
 			return;
 		}
-		keys[exchange] = {
-			apiKey: apiKey.trim(),
-			secret: secret.trim(),
-			password: password?.trim() || undefined,
-		};
+		password = passphrase?.trim() || undefined;
 	}
-	saveExchangeKeys(keys);
+	// All UI interaction is complete; merge only this exchange's entry under the
+	// keys-file lock so a concurrent session entering another exchange's
+	// credentials cannot be silently overwritten.
+	mutateExchangeKeys((keys) => {
+		keys[exchange] =
+			venue.password === "unused"
+				? { apiKey: apiKey.trim(), secret: secret.trim() }
+				: { apiKey: apiKey.trim(), secret: secret.trim(), password };
+	});
 	ctx.ui.notify(translate(language, "loginKeysSaved", { exchange }), "info");
 }
 

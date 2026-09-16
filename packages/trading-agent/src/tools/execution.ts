@@ -13,6 +13,7 @@ import {
 import type { TradingRuntime } from "../context.ts";
 import { t } from "../i18n.ts";
 import { createOrderReview, type OrderReviewPlan, showOrderReview } from "../order-review.ts";
+import { archivePlanExecutions, preparePlanSubmission } from "../plans/runtime.ts";
 import { liveOrdersRequireConfirmation } from "../state.ts";
 import { paperFuturesOrderUnsupported } from "./capabilities.ts";
 import {
@@ -186,8 +187,11 @@ function needsLiveConfirmation(trading: TradingRuntime): boolean {
 	return liveOrdersRequireConfirmation(trading.mode, trading.config.orderApproval);
 }
 
-function liveSubmissionOverride(trading: TradingRuntime): { allowUnconfirmedLive?: true } {
-	return trading.mode === "live" && trading.config.orderApproval === "unattended"
+function liveSubmissionOverride(
+	trading: TradingRuntime,
+	planReference?: OrderToolParams["plan"],
+): { allowUnconfirmedLive?: true } {
+	return trading.mode === "live" && trading.config.orderApproval === "unattended" && !planReference
 		? { allowUnconfirmedLive: true }
 		: {};
 }
@@ -199,8 +203,9 @@ function liveOrderConfirm(
 	prepared: OrderReviewPlan,
 	protectionStopPrice?: number,
 	signal?: AbortSignal,
+	planReference?: OrderToolParams["plan"],
 ): ((summary: string) => Promise<boolean>) | undefined {
-	if (!needsLiveConfirmation(trading)) return undefined;
+	if (!needsLiveConfirmation(trading) && !(trading.mode === "live" && planReference)) return undefined;
 	return async () => {
 		if (!ctx.hasUI) {
 			throw new Error(
@@ -214,6 +219,7 @@ function liveOrderConfirm(
 			accountId: engine.getExecutionScope().accountId,
 			usage,
 			protectionStopPrice,
+			planReference,
 		});
 		return showOrderReview(ctx, review, signal);
 	};
@@ -270,6 +276,19 @@ function handlePlacementFailure(
 	throw error;
 }
 
+function archiveLinkedEvidence(ctx: ExtensionContext, trading: TradingRuntime): "archived" | "pending" {
+	try {
+		archivePlanExecutions(trading);
+		return "archived";
+	} catch {
+		// Placement has its own durable outcome; archive failure must never invite resubmission.
+		const message = t(trading.config.language, "planEvidencePending");
+		console.error(`[plans] ${message}`);
+		if (ctx.hasUI) ctx.ui.notify(message, "warning");
+		return "pending";
+	}
+}
+
 export async function executeOrder(
 	side: "buy" | "sell",
 	params: OrderToolParams,
@@ -278,9 +297,20 @@ export async function executeOrder(
 	signal?: AbortSignal,
 ): Promise<AgentToolResult<unknown>> {
 	const engine = trading.tradingEngine;
+	const { plan: suppliedReference, ...orderParams } = params;
+	const planReference = suppliedReference ? structuredClone(suppliedReference) : undefined;
 	const unsupported = paperFuturesOrderUnsupported(trading, params.symbol, params.type);
 	if (unsupported) throw new Error(unsupported);
-	const plan = await engine.prepareOrder(side, params);
+	const plan = await engine.prepareOrder(side, orderParams);
+	const provenance = planReference
+		? preparePlanSubmission(trading, planReference, {
+				intent: { kind: "order", input: plan.input },
+				referencePrice: plan.referencePrice,
+				referenceTimestamp: plan.referenceTimestamp,
+				countTowardsDailyLimit: plan.countTowardsDailyLimit,
+				...(params.protectionStopPrice === undefined ? {} : { protectionStopPrice: params.protectionStopPrice }),
+			})
+		: {};
 	let submitted = false;
 	try {
 		const confirm = liveOrderConfirm(
@@ -290,12 +320,14 @@ export async function executeOrder(
 			{ kind: "order", plan },
 			params.protectionStopPrice,
 			signal,
+			planReference,
 		);
 		const result = await engine.placeOrder(
 			plan,
 			{
 				...(confirm === undefined ? {} : { confirm }),
-				...liveSubmissionOverride(trading),
+				...liveSubmissionOverride(trading, planReference),
+				...provenance,
 				submissionStatusUnknown: isSubmissionStatusUnknown,
 				...(params.protectionStopPrice === undefined ? {} : { protectionStopPrice: params.protectionStopPrice }),
 			},
@@ -306,6 +338,7 @@ export async function executeOrder(
 		return jsonResult({
 			status: "ok",
 			executionId: result.executionId,
+			...(planReference ? { plan: planReference, planEvidence: archiveLinkedEvidence(ctx, trading) } : {}),
 			mode: trading.mode,
 			summary: plan.summary,
 			executionConstraints: executionConstraints(plan),
@@ -326,6 +359,7 @@ export async function executeOrder(
 			),
 		});
 	} catch (error) {
+		if (planReference) archiveLinkedEvidence(ctx, trading);
 		return handlePlacementFailure(ctx, trading, error, plan.summary, submitted, {
 			submitted: "Order",
 			unknown: "Order",
@@ -341,9 +375,11 @@ export async function executeOco(
 ): Promise<AgentToolResult<unknown>> {
 	const trading = tradingProvider();
 	const { config } = trading;
+	const { plan: suppliedReference, ...orderParams } = params;
+	const planReference = suppliedReference ? structuredClone(suppliedReference) : undefined;
 	let plan: PreparedOco;
 	try {
-		plan = await trading.tradingEngine.prepareOcoOrder(params);
+		plan = await trading.tradingEngine.prepareOcoOrder(orderParams);
 	} catch (error) {
 		if (error instanceof OrderPreparationError) throw new Error(error.message);
 		throw error;
@@ -372,6 +408,15 @@ export async function executeOco(
 			: []),
 	];
 
+	const provenance = planReference
+		? preparePlanSubmission(trading, planReference, {
+				intent: { kind: "oco", input: plan.input },
+				referencePrice: plan.referencePrice,
+				referenceTimestamp: plan.referenceTimestamp,
+				countTowardsDailyLimit: plan.countTowardsDailyLimit,
+				...(params.protectionStopPrice === undefined ? {} : { protectionStopPrice: params.protectionStopPrice }),
+			})
+		: {};
 	let submitted = false;
 	try {
 		const confirm = liveOrderConfirm(
@@ -381,12 +426,14 @@ export async function executeOco(
 			{ kind: "oco", plan, preflight },
 			params.protectionStopPrice,
 			signal,
+			planReference,
 		);
 		const result = await engine.placeOco(
 			plan,
 			{
 				...(confirm === undefined ? {} : { confirm }),
-				...liveSubmissionOverride(trading),
+				...liveSubmissionOverride(trading, planReference),
+				...provenance,
 				submissionStatusUnknown: isSubmissionStatusUnknown,
 				...(params.protectionStopPrice === undefined ? {} : { protectionStopPrice: params.protectionStopPrice }),
 			},
@@ -399,6 +446,7 @@ export async function executeOco(
 			executionId: result.executionId,
 			mode: trading.mode,
 			summary: plan.summary,
+			...(planReference ? { plan: planReference, planEvidence: archiveLinkedEvidence(ctx, trading) } : {}),
 			preflight: {
 				referencePrice: plan.referencePrice,
 				referenceTime: new Date(plan.referenceTimestamp).toISOString(),
@@ -411,6 +459,7 @@ export async function executeOco(
 			orders: result.orders.map((order) => formatOrder(order)),
 		});
 	} catch (error) {
+		if (planReference) archiveLinkedEvidence(ctx, trading);
 		return handlePlacementFailure(ctx, trading, error, plan.summary, submitted, {
 			submitted: "OCO order",
 			unknown: "OCO",

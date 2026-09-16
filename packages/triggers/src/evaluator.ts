@@ -231,6 +231,12 @@ function evaluate(
 				states: next,
 			};
 		}
+		default: {
+			// Unvalidated input can reach the default branch with an unknown kind;
+			// stay fail-closed instead of returning undefined.
+			const kind = (condition as { kind?: unknown }).kind;
+			return { result: { state: "unknown", reason: `unsupported condition kind: ${String(kind)}` }, states };
+		}
 	}
 }
 

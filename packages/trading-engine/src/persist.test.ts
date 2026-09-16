@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -44,13 +44,41 @@ describe("persist", () => {
 		).toThrow(`Timed out waiting for paper account lock ${lockPath}`);
 	});
 
-	it("reclaims a stale lock without waiting for the timeout", () => {
+	it("reclaims a stale lock without waiting for the timeout and removes the reclaim gate", () => {
 		const lockPath = join(dir, "state.lock");
 		writeFileSync(lockPath, "");
 		const past = new Date(Date.now() - 120_000);
 		utimesSync(lockPath, past, past);
 		const lock = acquireFileLockSync(lockPath, { timeoutMs: 200, staleMs: 60_000 });
+		expect(existsSync(`${lockPath}.reclaim`)).toBe(false);
 		releaseFileLock(lock);
+	});
+
+	it("serializes stale reclamation so a replacement lock survives", () => {
+		const lockPath = join(dir, "state.lock");
+		const gatePath = `${lockPath}.reclaim`;
+		writeFileSync(lockPath, JSON.stringify({ pid: 999_999, host: "other-host" }));
+		const past = new Date(Date.now() - 120_000);
+		utimesSync(lockPath, past, past);
+
+		// Simulate another process mid-reclamation holding the gate: a waiter
+		// must not unlink the stale lock file while that reclaimer is in flight.
+		writeFileSync(gatePath, "");
+		expect(() => acquireFileLockSync(lockPath, { timeoutMs: 100, staleMs: 60_000 })).toThrow("Timed out");
+		expect(existsSync(lockPath)).toBe(true);
+
+		// The other reclaimer replaces the stale lock with a fresh one, then
+		// releases the gate.
+		rmSync(gatePath);
+		rmSync(lockPath);
+		const replacement = acquireFileLockSync(lockPath, { timeoutMs: 200 });
+
+		// A new waiter sees a non-stale lock: it must leave the replacement in
+		// place instead of unlinking the lock another process still holds.
+		expect(() => acquireFileLockSync(lockPath, { timeoutMs: 100, staleMs: 60_000 })).toThrow("Timed out");
+		expect(statSync(lockPath).ino).toBe(replacement.inode);
+		releaseFileLock(replacement);
+		expect(existsSync(lockPath)).toBe(false);
 	});
 
 	it("prefers the operation error when the locked callback throws", () => {

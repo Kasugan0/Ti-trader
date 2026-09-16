@@ -17,16 +17,12 @@ import {
 } from "@nikopack/ti-trading-engine";
 import { PAPER_DIR } from "./config.ts";
 import type { MonitoringScope } from "./monitoring-state.ts";
-import {
-	requiresAccountSwitchConfirmation,
-	requiresClientReplace,
-	requiresPaperFeeRateChange,
-} from "./runtime-config.ts";
+import { PlanStore } from "./plans/store.ts";
 import {
 	defaultOrderApproval,
 	type FuturesMarginType,
 	type FuturesPositionMode,
-	loadExchangeKeys,
+	loadExchangeKeyEntry,
 	loadTradingConfig,
 	loadTradingState,
 	type MarketType,
@@ -97,6 +93,32 @@ type DeepReadonly<Value> = Value extends (...args: never[]) => unknown
 			: Value;
 
 export type ReadonlyTradingConfig = DeepReadonly<TradingConfig>;
+
+function requiresClientReplace(prev: ReadonlyTradingConfig, next: TradingConfig): boolean {
+	return (
+		prev.mode !== next.mode ||
+		prev.exchange !== next.exchange ||
+		prev.marketType !== next.marketType ||
+		prev.quoteCurrency !== next.quoteCurrency ||
+		prev.leverage !== next.leverage ||
+		prev.marginType !== next.marginType ||
+		prev.positionMode !== next.positionMode ||
+		(prev.mode === "paper" && next.mode === "paper" && prev.paper.feeRate !== next.paper.feeRate)
+	);
+}
+
+function requiresPaperFeeRateChange(prev: ReadonlyTradingConfig, next: TradingConfig): boolean {
+	return prev.mode === "paper" && next.mode === "paper" && prev.paper.feeRate !== next.paper.feeRate;
+}
+
+function requiresAccountSwitchConfirmation(prev: ReadonlyTradingConfig, next: TradingConfig): boolean {
+	return (
+		prev.mode !== next.mode ||
+		prev.exchange !== next.exchange ||
+		prev.marketType !== next.marketType ||
+		prev.quoteCurrency !== next.quoteCurrency
+	);
+}
 
 interface AccountExposureInspector {
 	hasAnyAccountExposure(): Promise<boolean>;
@@ -374,6 +396,8 @@ export class TradingRuntime {
 			}
 			throw error;
 		}
+		// Invalidate first: a failed reset must never authorize plans against a new ledger.
+		new PlanStore(resolve(PAPER_DIR, "..")).markPaperReset(previousEngine.getExecutionScope());
 		await client.resetAccount(targetStartQuote);
 		// The account reset is complete before quota reset. If persistence of the
 		// quota fails, the error remains visible and the old quota conservatively
@@ -552,7 +576,7 @@ export class TradingRuntime {
 			return client;
 		}
 		if (config.marketType === "both") throw new Error('marketType "both" is supported only in Paper mode');
-		const keys = loadExchangeKeys()[exchange];
+		const keys = loadExchangeKeyEntry(exchange);
 		if (!keys) {
 			throw new Error(
 				`Live mode requires API keys for "${exchange}".\n` +

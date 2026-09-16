@@ -64,6 +64,7 @@ vi.mock("@google/genai", () => {
 			MALFORMED_FUNCTION_CALL: "MALFORMED_FUNCTION_CALL",
 			UNEXPECTED_TOOL_CALL: "UNEXPECTED_TOOL_CALL",
 			NO_IMAGE: "NO_IMAGE",
+			TOO_MANY_TOOL_CALLS: "TOO_MANY_TOOL_CALLS",
 		},
 		FunctionCallingConfigMode: {
 			AUTO: "AUTO",

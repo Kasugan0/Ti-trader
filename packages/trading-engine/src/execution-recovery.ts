@@ -7,8 +7,14 @@ import {
 	type ExecutionScope,
 	isUnresolvedExecution,
 	MAX_RECOVERY_ATTEMPTS,
+	observedExecutionFee,
 } from "./execution-journal.ts";
-import type { ExchangeClient, PlaceOcoOrderResult, PlaceOrderResult } from "./types.ts";
+import {
+	type ExchangeClient,
+	isOrderFeeObservation,
+	type PlaceOcoOrderResult,
+	type PlaceOrderResult,
+} from "./types.ts";
 import { resolveLiveVenue } from "./venues/index.ts";
 
 export interface RecoveryReport {
@@ -93,6 +99,15 @@ export function executionEvidence(
 		)
 			throw new Error("Conflicting execution evidence");
 		ids.add(order.id);
+		const previous = entry.evidence?.orders.find((saved) => saved.id === order.id);
+		if (
+			entry.evidence?.orders.length &&
+			(!previous ||
+				order.filled < previous.filled ||
+				order.cost < previous.cost ||
+				(previous.status !== "open" && order.status === "open"))
+		)
+			throw new Error("Execution evidence regressed or changed order identity");
 		const tolerance = Math.max(Number.MIN_VALUE, Math.abs(input.amount) * 1e-8);
 		const closeAll = entry.intent.kind === "order" && entry.intent.input.closePosition === true;
 		if (
@@ -141,20 +156,55 @@ export function executionEvidence(
 	const evidence: ExecutionEvidence = {
 		source,
 		observedAt: new Date().toISOString(),
-		orders: orders.map((order) => ({
-			id: order.id,
-			clientOrderId: order.clientOrderId,
-			symbol: order.symbol,
-			side: order.side,
-			amount: order.amount,
-			filled: order.filled,
-			remaining: order.remaining,
-			cost: order.cost,
-			status: order.status,
-			orderListId: order.orderListId,
-			listClientOrderId: order.listClientOrderId,
-		})),
+		orders: orders.map((order) => {
+			const expectedSource = entry.scope.mode === "paper" ? "paper-ledger" : "exchange";
+			let feeObservation =
+				isOrderFeeObservation(order.feeObservation) && order.feeObservation.source === expectedSource
+					? structuredClone(order.feeObservation)
+					: undefined;
+			const previous = entry.evidence?.orders.find((saved) => saved.id === order.id);
+			const priorFee = previous?.feeObservation;
+			if (
+				previous &&
+				isOrderFeeObservation(priorFee) &&
+				priorFee.source === expectedSource &&
+				(!feeObservation ||
+					(feeObservation.completeness === "partial" &&
+						priorFee.completeness === "complete" &&
+						order.filled === previous.filled &&
+						order.cost === previous.cost))
+			) {
+				feeObservation = structuredClone(priorFee);
+				if (order.filled !== previous.filled || order.cost !== previous.cost)
+					feeObservation.completeness = "partial";
+			}
+			return {
+				id: order.id,
+				clientOrderId: order.clientOrderId,
+				symbol: order.symbol,
+				side: order.side,
+				amount: order.amount,
+				filled: order.filled,
+				remaining: order.remaining,
+				cost: order.cost,
+				status: order.status,
+				orderListId: order.orderListId,
+				listClientOrderId: order.listClientOrderId,
+				...(order.type !== undefined ? { type: order.type } : {}),
+				...(order.price !== undefined ? { price: order.price } : {}),
+				...(order.stopPrice !== undefined ? { stopPrice: order.stopPrice } : {}),
+				...(order.reduceOnly !== undefined ? { reduceOnly: order.reduceOnly } : {}),
+				...(order.positionSide !== undefined ? { positionSide: order.positionSide } : {}),
+				...(order.closePosition !== undefined ? { closePosition: order.closePosition } : {}),
+				...(order.trailingPercent !== undefined ? { trailingPercent: order.trailingPercent } : {}),
+				...(order.activationPrice !== undefined ? { activationPrice: order.activationPrice } : {}),
+				...(order.callbackRate !== undefined ? { callbackRate: order.callbackRate } : {}),
+				...(feeObservation ? { feeObservation } : {}),
+			};
+		}),
 	};
+	const fee = observedExecutionFee({ scope: entry.scope, evidence });
+	if (fee !== undefined) evidence.fee = fee;
 	return { evidence, notional, outcome: notional === 0 ? "release" : "commit" };
 }
 

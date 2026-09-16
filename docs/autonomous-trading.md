@@ -1,6 +1,6 @@
 # Autonomous Paper trading
 
-Ti has an explicitly enabled, headless Paper runtime. The model chooses its research, strategy, instruments, trades, position management and next wake. Waiting and holding cash are valid decisions. There is no prescribed analysis sequence, vote, score or minimum trading frequency.
+Ti has an explicitly enabled, headless Paper runtime (working tree; not in the last npm release). The model chooses its research, strategy, instruments, trades, position management and next wake. Waiting and holding cash are valid decisions. There is no prescribed analysis sequence, vote, score or minimum trading frequency.
 
 **Autonomous live startup is currently rejected.** Existing live adapters do not supply the complete external-capital-flow, fee and funding evidence required by account-wide hard risk. Setting `mode: "live"` does not bypass this check or fall back to Paper. This implementation is not a claim of profitable trading or production readiness.
 

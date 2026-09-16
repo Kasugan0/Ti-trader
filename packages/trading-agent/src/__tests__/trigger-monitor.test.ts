@@ -207,7 +207,7 @@ describe("trigger monitor", () => {
 		await add("due", { kind: "time", at: new Date(NOW - 1).toISOString() });
 		try {
 			await handlers.get("session_start")!({}, ctx);
-			expect(notify).toHaveBeenCalledWith(expect.stringContaining("observation unavailable"), "warning");
+			expect(notify).toHaveBeenCalledWith(expect.stringContaining("observation is unknown"), "warning");
 			expect(sendMessage.mock.calls.map(([message]) => message.content)).toEqual([
 				"[trigger:healthy] healthy",
 				"[trigger:due] due",

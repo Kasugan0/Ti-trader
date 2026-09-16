@@ -10,6 +10,7 @@
 
 ### Changed
 
+- Pinned `hosted-git-info` `10.1.1`.
 - Pinned `chalk` `6.0.0`.
 - Improved the built-in dark theme's Markdown contrast for headings, links, code, lists, quotes, and separators on light terminal backgrounds.
 - Changed built-in light and dark warning colors from yellow to orange so warnings stay readable on light terminal backgrounds.
@@ -23,6 +24,10 @@
 - Remote session operations now restore lifecycle state after synchronous failures, dispose connection listeners, and settings read/modify/write operations serialize even when the settings file is created for the first time.
 - Session rewrites now write a complete temporary JSONL snapshot and atomically rename it, preventing a failed rewrite from truncating the active session.
 - Settings storage supports fresh nested agent directories and writable project configuration directories under read-only project roots. Reads require no write access; locked updates atomically replace complete snapshots while preserving symlinks and file modes, without losing concurrent first writes.
+- Fixed resumed sessions corrupting the next appended entry when their JSONL file lacks a trailing newline ([#8345](https://github.com/earendil-works/pi/issues/8345)).
+- Fixed compaction and branch summaries forcing `toolChoice: "none"` ([#8649](https://github.com/earendil-works/pi/issues/8649), [#8638](https://github.com/earendil-works/pi/issues/8638)).
+- Capped agent-level retry backoff at `retry.maxAgentDelayMs` (60s by default) so long retry runs stay responsive during prolonged transient outages ([#8826](https://github.com/earendil-works/pi/issues/8826)).
+- Fixed large tool results crossing the auto-compaction threshold being sent to the provider before compaction. Pi now compacts between tool execution and the next assistant response in the same run, and restores interactive progress when that run resumes ([#6879](https://github.com/earendil-works/pi/issues/6879)).
 
 ## [0.84.3] - 2026-08-24
 

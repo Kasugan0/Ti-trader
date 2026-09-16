@@ -47,6 +47,7 @@ export function createOrderReview(
 		accountId?: string;
 		usage: { used: number; reserved: number; limit: number };
 		protectionStopPrice?: number;
+		planReference?: { id: string; version: number; intentId: string };
 	},
 ): OrderReview {
 	const { plan } = prepared;
@@ -69,6 +70,11 @@ export function createOrderReview(
 		"orderReviewAccount",
 		context.accountId && /^[a-f0-9]{64}$/i.test(context.accountId) ? context.accountId : unavailable,
 	);
+	if (context.planReference) {
+		field("orderReviewPlan", `${context.planReference.id} v${context.planReference.version}`);
+		field("orderReviewPlanIntent", context.planReference.intentId);
+		lines.push(t(language, "orderReviewPlanNotice"));
+	}
 	field("marketType", t(language, capabilityContext.marketFamily === "futures" ? "marketFutures" : "marketSpot"));
 	field("colSymbol", input.symbol);
 	field("colSide", t(language, input.side === "buy" ? "orderReviewBuy" : "orderReviewSell"));

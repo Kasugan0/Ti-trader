@@ -39,8 +39,6 @@ export {
 } from "./account.ts";
 export {
 	createGetFundingRateHistoryTool,
-	createGetFundingRateTool,
-	createGetFuturesPositionsTool,
 	createGetRiskStatusTool,
 	createSetLeverageTool,
 	createSetMarginModeTool,

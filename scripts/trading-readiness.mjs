@@ -7,11 +7,13 @@ import { fileURLToPath } from "node:url";
 export const READINESS_TESTS = {
 	risk: ["src/risk.test.ts"],
 	engine: [
-		"src/engine.test.ts", "src/capabilities.test.ts", "src/ccxt-client.test.ts", "src/paper-client.test.ts",
+		"src/engine.test.ts", "src/capabilities.test.ts", "src/ccxt-client.test.ts", "src/ccxt-map.test.ts",
+		"src/ccxt-fees.test.ts", "src/paper-fees.test.ts", "src/paper-client.test.ts",
 		"src/paper-account.test.ts", "src/persist.test.ts",
 		"src/paper-durability.test.ts",
 		"src/execution-recovery.test.ts",
 	],
+	triggers: ["src/evaluator.test.ts", "src/schema.test.ts"],
 	agent: [
 		"src/__tests__/commands.test.ts", "src/__tests__/context.test.ts", "src/__tests__/trading.test.ts",
 		"src/__tests__/monitor.test.ts", "src/__tests__/trigger-monitor.test.ts",
@@ -23,6 +25,8 @@ export const READINESS_TESTS = {
 		"src/__tests__/execution-runtime.test.ts", "src/__tests__/monitoring-state.test.ts",
 		"src/__tests__/paper-reset-durability.test.ts",
 		"src/__tests__/durable-trigger-monitor.test.ts", "src/__tests__/tool-availability.test.ts",
+		"src/plans/plans.test.ts", "src/plans/monitoring.test.ts", "src/plans/recovery.test.ts", "src/plans/runtime.test.ts",
+		"src/decisions/evidence.test.ts", "src/decisions/study.test.ts", "src/__tests__/plan-tools.test.ts",
 	],
 };
 
@@ -62,7 +66,8 @@ export function readinessCommands(repo, platform = process.platform) {
 		{ name: "repository-check", command: platform === "win32" ? "cmd.exe" : "npm",
 			args: platform === "win32" ? ["/d", "/s", "/c", "npm run check"] : ["run", "check"], cwd: repo },
 		...Object.entries(READINESS_TESTS).map(([name, files]) => ({
-			name, command: process.execPath, args: [vitest, "--run", ...files], cwd: join(repo, "packages", `trading-${name}`),
+			name, command: process.execPath, args: [vitest, "--run", ...files],
+			cwd: join(repo, "packages", name === "triggers" ? "triggers" : `trading-${name}`),
 		})),
 		{ name: "release-gate", command: process.execPath,
 			args: ["--test", "scripts/trading-release-gate.test.mjs", "scripts/trading-readiness.test.mjs",

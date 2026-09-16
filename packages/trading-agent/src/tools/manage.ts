@@ -1,6 +1,5 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { Order } from "@nikopack/ti-trading-engine";
-import { isFuturesSymbol } from "@nikopack/ti-trading-engine";
 import { getTrading } from "../context.ts";
 import {
 	confirmLiveRiskChange,
@@ -9,7 +8,6 @@ import {
 	errorMessage,
 	finiteOrNull,
 	fundingHistorySchema,
-	futuresSymbolSchema,
 	hasFiniteQuoteValue,
 	isProtectiveOrder,
 	jsonResult,
@@ -60,38 +58,6 @@ export function createGetFundingRateHistoryTool(
 	};
 }
 
-export function createGetFundingRateTool(
-	tradingProvider: TradingProvider = getTrading,
-): ToolDefinition<typeof futuresSymbolSchema> {
-	return {
-		name: "get_funding_rate",
-		label: "get_funding_rate",
-		description: "Get current futures funding rate.",
-		parameters: futuresSymbolSchema,
-		async execute(_id, params) {
-			const trading = tradingProvider();
-			requireFuturesSymbol(trading, params.symbol, "Funding rate");
-			const funding = await trading.tradingEngine.getFundingRate(params.symbol);
-			const hasRate = funding.rate !== undefined && Number.isFinite(funding.rate);
-			const available = trading.mode === "live" ? hasRate : hasRate && funding.rate !== 0;
-			return jsonResult({
-				...venueFields(trading),
-				...funding,
-				rate: finiteOrNull(funding.rate),
-				dataQuality: {
-					available,
-					observed: trading.mode === "live" && hasRate,
-				},
-				warnings:
-					trading.mode === "paper"
-						? ["Paper futures do not simulate funding; rate 0 is a placeholder, not an observed market rate"]
-						: hasRate
-							? []
-							: ["Funding rate unavailable"],
-			});
-		},
-	};
-}
 export function createSetLeverageTool(
 	tradingProvider: TradingProvider = getTrading,
 ): ToolDefinition<typeof leverageSchema> {
@@ -183,26 +149,6 @@ export function createSetMultiAssetsModeTool(
 				enabled: params.enabled,
 				marginType: params.enabled ? "cross-only" : "isolated-compatible",
 			});
-		},
-	};
-}
-export function createGetFuturesPositionsTool(
-	tradingProvider: TradingProvider = getTrading,
-): ToolDefinition<typeof emptySchema> {
-	return {
-		name: "get_futures_positions",
-		label: "get_futures_positions",
-		description: "Get futures positions.",
-		parameters: emptySchema,
-		async execute() {
-			const trading = tradingProvider();
-			if (trading.config.marketType === "spot") {
-				throw new Error("Futures positions are unavailable in spot mode; use get_positions for spot holdings");
-			}
-			const positions = (await trading.tradingEngine.getPositions()).filter((position) =>
-				isFuturesSymbol(position.symbol, trading.config.quoteCurrency),
-			);
-			return jsonResult({ positions, marketType: trading.config.marketType });
 		},
 	};
 }

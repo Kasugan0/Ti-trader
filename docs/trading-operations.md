@@ -21,7 +21,7 @@ node scripts/trading-package-install.mjs --report /tmp/ti-release-evidence/insta
 
 Confirm its version before opening a session. Initial configuration must be Paper; verify the displayed mode again after every account or market switch. Do not assume a restart resets a previously saved live configuration. For a controlled Paper soak, keep `TI_DATA_DIR` on that candidate and collect samples with `scripts/trading-paper-soak.mjs` rather than filling the observation record by hand.
 
-API permissions must exclude withdrawals. Keep exchange credentials in Ti's credential store, not in commands, source files, logs or release evidence. Require confirmation for each live order during a pilot (`orderApproval: "confirm"`). Switching to `unattended` is an explicit opt-in and requires interactive confirmation in Settings or `/approval unattended`. Do not disable confirmation to work around a failed UI or recovery workflow.
+API permissions must exclude withdrawals. Keep exchange credentials in Ti's credential store, not in commands, source files, logs or release evidence. A hand-made `keys.json` that is group- or world-readable is tightened to mode 600 on read; treat the stderr warning as confirmation that the file was too open, then keep the directory private. Require confirmation for each live order during a pilot (`orderApproval: "confirm"`). Switching to `unattended` is an explicit opt-in and requires interactive confirmation in Settings or `/approval unattended`. Do not disable confirmation to work around a failed UI or recovery workflow.
 
 Only one candidate version may write a given data directory. A state schema upgrade is also an operational boundary: binaries that ignore execution, pause or monitor fields are not safe rollback targets.
 
@@ -36,7 +36,7 @@ Use the current Ti session:
 
 Pausing is local and does not wait for a model turn or an exchange query. It blocks new exposure in the current mode, including an entry that is still awaiting confirmation. Paper and live controls are separate. Confirm the displayed mode before interpreting the result.
 
-An already-started request may still reach the exchange. Existing limit, stop and OCO orders are not canceled by pausing or closing Ti. Verify them directly at the exchange. Preserve valid protection; do not indiscriminately cancel all orders just to clear a warning.
+An already-started request may still reach the exchange. Existing limit, stop and OCO orders are not canceled by pausing or closing Ti. Verify them directly at the exchange. Preserve valid protection; do not indiscriminately cancel all orders just to clear a warning. Without `risk.account`, live cancellation of a stop that still protects an open position is refused; use a controlled close instead of forcing the cancel.
 
 If a pause write fails, treat the control as unconfirmed. Do not continue trading on a success assumption. Stop initiating work from affected Ti processes and use the exchange's own account controls as needed. Preserve the state and diagnostic evidence for recovery.
 
@@ -78,6 +78,8 @@ The risk/execution file lock is a separate filesystem mechanism. It is not autom
 
 Fresh first-attempt order-fill and position-guard notifications retain the configured `monitor.wakeAgent` behavior in interactive Paper and live sessions. Live triggers remain notification-only. Restored and retried notifications never wake a trading turn. An analysis wake is not permission to bypass live confirmation or risk limits.
 
+Trade-plan notifications never wake a model, including their first delivery. `/health` reports plan observation and delivery failures separately. `/plan review <id>` performs bounded read-only evidence repair; `planEvidence: pending` does not change the engine's order outcome. Archiving a plan leaves its orders and positions untouched. Preserve the execution ID and use `/recovery` for uncertain submissions rather than submitting another plan intent.
+
 | Symptom | Safe response |
 | --- | --- |
 | Timeout after submit | Preserve unknown state; query the correlated order; do not resend |
@@ -93,7 +95,7 @@ Fresh first-attempt order-fill and position-guard notifications retain the confi
 
 Pause entries, let active submissions finish or remain explicitly unresolved, and stop **every** Ti writer using the directory. Stop monitors too. An archive taken while independently locked state files are changing is not a consistent snapshot.
 
-Back up the entire `agent` directory, not just `trading.json`. Risk state, execution records, Paper ledgers, monitor state and identity metadata must be kept together. Include the candidate version and Git revision in a private operator record.
+Back up the entire `agent` directory, not just `trading.json`. Risk state, execution records, Paper ledgers, monitor state, `plans/state.json`, `decisions/state.json` and identity metadata must be kept together. The plan file also contains notification leases, archive evidence and Paper epochs. A `/plan export` is a research export, not a recoverable account backup. Include the candidate version and Git revision in a private operator record.
 
 For a stopped directory, a local archive can be made with:
 
@@ -119,6 +121,8 @@ A successful restore exercise must demonstrate that unknown executions, used/res
 Pause, drain active work where possible, take a stopped-state backup, then upgrade risk, engine and agent together using their exact dependency versions. Check the installed CLI version and state diagnostics before enabling new activity.
 
 Do not downgrade a live state directory to an older writer that drops safety fields. If the candidate has a defect, keep it paused and prefer a forward fix. A rollback using an older backup is a recovery exercise requiring exchange reconciliation, not a reset of account history.
+
+Plan and decision stores reject unknown format versions and invalid nested data instead of replacing them with empty records. Their additive version-1 fields do not authorize mixed-version writers: stop old processes before introducing plan notification state, prospective evaluation state or expanded execution evidence. Never delete the new fields to make an older binary accept a file. Keep the complete stopped-state backup and inspect it with the schema-aware candidate.
 
 ## Release and pilot decision
 

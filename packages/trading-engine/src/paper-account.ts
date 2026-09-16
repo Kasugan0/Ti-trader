@@ -1,5 +1,5 @@
 import type { FuturesPositionMode } from "./client-types.ts";
-import type { OrderSide, OrderType } from "./types.ts";
+import { isOrderFeeObservation, type OrderFeeObservation, type OrderSide, type OrderType } from "./types.ts";
 
 export interface PaperOrder {
 	id: string;
@@ -32,8 +32,35 @@ export interface PaperOrder {
 	filled: number;
 	average?: number;
 	cost: number;
+	/** Actual ledger charges for this order; absent in legacy records without fee evidence. */
+	feeObservation?: OrderFeeObservation;
 	status: "open" | "closed" | "canceled";
 	timestamp: number;
+}
+
+/** Record the exact charged fee, preserving any unknown earlier fills rather than estimating them. */
+export function paperOrderFeeObservation(
+	quote: string,
+	fee: number,
+	previous?: Pick<PaperOrder, "filled" | "feeObservation">,
+): OrderFeeObservation {
+	const prior = previous?.feeObservation;
+	if (
+		!Number.isFinite(fee) ||
+		fee < 0 ||
+		(prior &&
+			(!isOrderFeeObservation(prior) ||
+				prior.source !== "paper-ledger" ||
+				prior.charges.some((charge) => charge.currency !== quote || charge.cost < 0)))
+	)
+		throw new Error("Invalid actual paper ledger fee");
+	const observation: OrderFeeObservation = {
+		source: "paper-ledger",
+		completeness: previous && previous.filled > 0 && prior?.completeness !== "complete" ? "partial" : "complete",
+		charges: [{ currency: quote, cost: fee + (prior?.charges.reduce((sum, charge) => sum + charge.cost, 0) ?? 0) }],
+	};
+	if (!isOrderFeeObservation(observation)) throw new Error("Invalid actual paper ledger fee");
+	return observation;
 }
 
 export interface FuturesLot {
@@ -219,7 +246,7 @@ function parseEntry(value: unknown, path: string, label: string): FuturesEntry {
 	};
 }
 
-function parseOrder(value: unknown, path: string, label: string): PaperOrder {
+function parseOrder(value: unknown, path: string, label: string, quote: string): PaperOrder {
 	if (!isRecord(value)) throw accountError(path, `${label} must be an object`);
 	if (typeof value.id !== "string" || value.id.length === 0) throw accountError(path, `${label}.id must be a string`);
 	if (typeof value.symbol !== "string" || value.symbol.length === 0) {
@@ -234,6 +261,17 @@ function parseOrder(value: unknown, path: string, label: string): PaperOrder {
 	const amount = positiveNumber(value.amount, path, `${label}.amount`);
 	const filled = nonNegativeNumber(value.filled, path, `${label}.filled`);
 	if (filled > amount) throw accountError(path, `${label}.filled cannot exceed amount`);
+	const feeObservation = value.feeObservation;
+	if (
+		feeObservation !== undefined &&
+		(!isOrderFeeObservation(feeObservation) ||
+			feeObservation.source !== "paper-ledger" ||
+			feeObservation.charges.length !== 1 ||
+			feeObservation.charges.some(
+				(charge) => charge.currency !== quote || charge.cost < 0 || (filled === 0 && charge.cost !== 0),
+			))
+	)
+		throw accountError(path, `${label}.feeObservation must contain actual quote ledger fees`);
 	const price = optionalFinite(value.price, path, `${label}.price`);
 	const stopPrice = optionalFinite(value.stopPrice, path, `${label}.stopPrice`);
 	const trailingPercent = optionalFinite(value.trailingPercent, path, `${label}.trailingPercent`);
@@ -277,6 +315,7 @@ function parseOrder(value: unknown, path: string, label: string): PaperOrder {
 		filled,
 		average,
 		cost: nonNegativeNumber(value.cost, path, `${label}.cost`),
+		...(feeObservation !== undefined ? { feeObservation: structuredClone(feeObservation) } : {}),
 		status: value.status as PaperOrder["status"],
 		timestamp: finiteNumber(value.timestamp, path, `${label}.timestamp`),
 	};
@@ -339,6 +378,7 @@ function parseMarginTypeBySymbol(value: unknown, path: string): Record<string, "
 export function parsePaperAccount(value: unknown, path: string): PaperAccount {
 	if (!isRecord(value)) throw accountError(path, "expected an object");
 	if (typeof value.quote !== "string" || value.quote.length === 0) throw accountError(path, "quote is missing");
+	const quote = value.quote;
 	if (!isRecord(value.entries) || !Array.isArray(value.orders) || !Array.isArray(value.trades)) {
 		throw accountError(path, "entries, orders and trades are required");
 	}
@@ -351,14 +391,35 @@ export function parsePaperAccount(value: unknown, path: string): PaperAccount {
 			throw accountError(path, "positionMode must be one-way or hedge");
 		}
 	}
+	const orders = value.orders.map((order, index) => parseOrder(order, path, `orders[${index}]`, quote));
+	const trades = value.trades.map((trade, index) => parseTrade(trade, path, `trades[${index}]`));
+	const orderCounts = new Map<string, number>();
+	for (const order of orders) orderCounts.set(order.id, (orderCounts.get(order.id) ?? 0) + 1);
+	const uniqueTrades = new Map<string, PaperTrade | undefined>();
+	for (const trade of trades) uniqueTrades.set(trade.id, uniqueTrades.has(trade.id) ? undefined : trade);
+	for (const order of orders) {
+		if (order.feeObservation || order.filled === 0 || orderCounts.get(order.id) !== 1) continue;
+		// Legacy market/futures trades share their order ID. Resting Spot trades may
+		// have a temporary ID instead; never guess correlation from amount or time.
+		const trade = uniqueTrades.get(order.id);
+		if (
+			trade &&
+			trade.symbol === order.symbol &&
+			trade.side === order.side &&
+			trade.positionSide === order.positionSide &&
+			trade.amount === order.filled &&
+			trade.cost === order.cost
+		)
+			order.feeObservation = paperOrderFeeObservation(quote, trade.fee);
+	}
 	return {
 		quote: value.quote,
 		balances: parseNumberRecord(value.balances, path, "balances"),
 		entries: Object.fromEntries(
 			Object.entries(value.entries).map(([asset, entry]) => [asset, parseEntry(entry, path, `entries.${asset}`)]),
 		),
-		orders: value.orders.map((order, index) => parseOrder(order, path, `orders[${index}]`)),
-		trades: value.trades.map((trade, index) => parseTrade(trade, path, `trades[${index}]`)),
+		orders,
+		trades,
 		realizedPnl: finiteNumber(value.realizedPnl, path, "realizedPnl"),
 		leverage,
 		marginType: value.marginType === undefined ? undefined : marginType(value.marginType, path, "marginType"),

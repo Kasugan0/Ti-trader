@@ -4,13 +4,23 @@ All notable changes to `ti-trader` are documented in this file.
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Removed unused `createGetFundingRateTool` and `createGetFuturesPositionsTool` factory exports. Current funding is `get_contract_stats`, historical funding is `get_funding_rate_history`, and futures holdings are `get_positions`.
+
 ### Added
 
+- Durable, account-scoped trade plans with immutable rationale versions, operator-confirmed tracking, read-only condition observations, Paper-reset invalidation, execution provenance and `/plan` reviews/exports.
+- Plan-linked order and account-protection observations reuse bounded read-only recovery, durable notification leases/retries and `/health`, without waking a model. Localized paginated reviews compare frozen proposals with recorded executions; independent-install probes require cross-process plan continuity and actual evidence extension registration.
+- Private decision evidence records capture public rationales, bounded numeric observations and actual mutation attempts. `/decisions` evaluates citation freshness, missing/retrospective rationale and unknown outcomes without claiming model reliability or profitability.
+- Operator-frozen prospective studies collect source-timestamped endpoints within fixed windows and report declared-cost spot long/cash comparisons, missingness and non-overlapping samples. Bounded bilingual decision views stay out of model history; complete private evidence supports offline reevaluation.
+- Execution reviews consume observed fee provenance, including Paper ledger charges and signed venue rebates, without treating legacy fee scalars or foreign-currency charges as complete quote costs. Late fees share bounded plan refreshes, and decision facts survive ordinary journal retention through plan archives.
 - Explicit headless autonomous Paper mode with persistent events, model-controlled wakes, separate AgentSession workers, reviewed research tools, independent risk supervision and start/status/pause/resume/stop controls. Autonomous live startup fails closed until adapters provide complete account-risk evidence.
 - TUI `/autonomous` controls the background runtime with account binding, subcommand completion and localized status. Pause and stop do not wait for an active model turn; exiting the TUI leaves the daemon running.
 
 ### Changed
 
+- Documented autonomous Paper, optional `risk.account` hard limits, live protective-cancel refusal and credential-file mode-600 tightening in the design doc, package README and operator guides.
 - Replaced the interactive Ti wordmark with a compact solid block mark in muted gray.
 - Native trading tools use compact, localized summaries with original parameters and output available through tool expansion. Warnings, incomplete data, order identifiers and ambiguous execution outcomes remain visible.
 - Live order and OCO confirmation shows localized fields from the exact prepared plan, including price provenance, reserved quota and exchange constraints. TUI review defaults to cancellation and supports configurable paging and narrow layouts; RPC retains its confirmation protocol and submission policies are unchanged.
@@ -24,12 +34,18 @@ All notable changes to `ti-trader` are documented in this file.
 
 ### Fixed
 
+- Plan-linked `intentId` reuse fingerprints stable order identity only. A moved ticker snapshot no longer throws before the engine can reuse a released identity or block an unknown one.
+- Cancelling a live protective stop without account hard risk is refused (engine-enforced), matching the account-risk cancellation guard; `cancel_order` and `cancel_order_list` document the refusal.
+- A group/world-readable `~/.ti-trader/agent/keys.json`, Zhihu access-secret file or freqtrade auth file is tightened to mode 600 on read, mirroring the enforced permissions on managed writes.
 - Trading tool presentation distinguishes preflight rejection or uncertainty from tool completion, and open or partially filled orders from completed fills, without using the generic success background for business failures.
 - Settings allowed-symbol edits drop empty tokens such as a trailing comma, instead of failing validation.
 - Live futures prompts no longer treat reduce-only conditionals as unconditionally available; the model must check `get_trading_capabilities`.
 - Market-lab replay percentage fields now return percentages (`10` for 10%) instead of fractions. Additive returns are explicitly distinguished from compounded or account returns.
 - Market-lab rejects invalid candle limits, unclosed data and stale session-runtime results, and propagates cancellation and request timeouts through tools and slash commands.
 - Trigger crossings reject stale or unordered baselines, unknown conditions preserve edge arming, and unsupported or ambiguous facts no longer silently select a position. Bounded history survives restarts and faster concurrent pollers.
+- Concurrent `ti` sessions entering credentials for different exchanges no longer overwrite each other's `keys.json` entries: `/exchange-login` collects all input first and merges only the target exchange's entry under the keys-file lock.
+- Switching a venue live validates only that venue's credential entry; a malformed entry for another exchange no longer blocks the switch.
+- Order and trigger monitors log and notify coarse failure classifications (timeout, rate-limited, authentication-failed, disconnected) instead of raw transport error messages, matching the autonomous runtime's sanitization discipline.
 
 ## [0.2.2] - 2026-09-11
 

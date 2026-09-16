@@ -29,7 +29,6 @@ export function validateLiveVenueCredentials(exchangeId: string, credentials: Ex
 	}
 }
 
-export { BINANCE_CLOSE_ALL, BINANCE_HEDGE_REDUCTION } from "./binance.ts";
 export { LIVE_ADAPTER_LIMITATIONS } from "./constants.ts";
 export type {
 	CredentialPasswordPolicy,

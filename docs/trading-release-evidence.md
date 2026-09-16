@@ -24,7 +24,9 @@ Build the candidate first (`npm run build:trading`). Packing and installing are 
 node scripts/trading-package-install.mjs --report /tmp/ti-release-evidence/installation.json
 ```
 
-The runner packs the risk, engine, agent and triggers packages, installs those tarballs into a temporary directory, and checks `ti --version`, `TI_DATA_DIR` isolation, default Paper mode and restart recovery of a durable pause. It does not publish, inherit `NPM_TOKEN`/`NODE_OPTIONS`, or use workspace links. If the packages are already packed, pass `--tarball-dir` and `--skip-pack`. Keep `--workdir` outside the repository if you need to inspect the install.
+The runner packs the risk, engine, agent and triggers packages, installs those tarballs into a temporary directory, and checks `ti --version`, `TI_DATA_DIR` isolation, default Paper mode and restart recovery of a durable pause. It also saves and tracks a plan, appends an unapproved second version and research note, then verifies the exact evidence from a second process. A larger stored draft set exercises the 4 KiB nonauthoritative startup index. The installed plan/decision extensions must register their actual tools, commands and lifecycle hooks; a plan with no fills must remain insufficient evidence.
+
+The probe does not invoke a model, submit orders or start monitoring. It does not publish, inherit `NPM_TOKEN`/`NODE_OPTIONS`, or use workspace links. If the packages are already packed, pass `--tarball-dir` and `--skip-pack`. Keep `--workdir` outside the repository if you need to inspect the install. Script-fixture results are not evidence that the candidate was independently installed.
 
 ## Collect a Paper soak
 
@@ -96,7 +98,7 @@ Each entry is `{ "name": "...", "passed": true, "observation": "..." }`. State w
 
 ## Clean installation artifact
 
-`kind` must be `package-install`. Include `completedAt`, `passed: true`, supported `nodeMajor`, and `versions` matching the manifest. `checks` must record successful `cleanInstall`, `cliVersion`, `isolatedDataDir`, `paperDefault` and `recoveryAfterRestart` exercises.
+`kind` must be `package-install`. Include `completedAt`, `passed: true`, supported `nodeMajor`, and `versions` matching the manifest. `checks` must record successful `cleanInstall`, `cliVersion`, `isolatedDataDir`, `paperDefault`, `recoveryAfterRestart`, `continuityAfterRestart` and `evidenceTools` exercises. Older reports without the continuity and extension-registration evidence do not pass.
 
 Use an isolated package installation, not a workspace whose aliases can hide missing published files. Inspect package contents and exact dependency versions. `scripts/trading-package-install.mjs` performs local pack and install only; it does not publish. Building remains a separate maintainer step. The offline readiness runner does not pack, install or soak.
 

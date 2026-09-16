@@ -102,7 +102,11 @@ const stateMocks = vi.hoisted(() => {
 	const saveTradingConfig = vi.fn();
 	const loadTradingState = vi.fn(() => ({}));
 	const saveTradingState = vi.fn();
-	const loadExchangeKeys = vi.fn(() => ({}));
+	const loadExchangeKeys = vi.fn((): Record<string, { apiKey: string; secret: string; password?: string }> => ({}));
+	const loadExchangeKeyEntry = vi.fn(
+		(exchange: string): { apiKey: string; secret: string; password?: string } | undefined =>
+			loadExchangeKeys()[exchange],
+	);
 	const validateTradingConfig = vi.fn();
 	const normalizeTradingConfig = vi.fn((config: typeof baseConfig) => ({
 		...config,
@@ -116,6 +120,7 @@ const stateMocks = vi.hoisted(() => {
 		loadTradingState,
 		saveTradingState,
 		loadExchangeKeys,
+		loadExchangeKeyEntry,
 		validateTradingConfig,
 		normalizeTradingConfig,
 		defaultOrderApproval: (mode: "paper" | "live") => (mode === "live" ? "confirm" : "unattended"),
@@ -128,6 +133,7 @@ vi.mock("../state.ts", () => ({
 	loadTradingState: stateMocks.loadTradingState,
 	saveTradingState: stateMocks.saveTradingState,
 	loadExchangeKeys: stateMocks.loadExchangeKeys,
+	loadExchangeKeyEntry: stateMocks.loadExchangeKeyEntry,
 	validateTradingConfig: stateMocks.validateTradingConfig,
 	normalizeTradingConfig: stateMocks.normalizeTradingConfig,
 	defaultOrderApproval: stateMocks.defaultOrderApproval,

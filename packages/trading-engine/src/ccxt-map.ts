@@ -1,10 +1,34 @@
 import { randomBytes } from "node:crypto";
-import ccxt, { type Order as CcxtOrder, type Ticker as CcxtTicker } from "ccxt";
-import { type Order, type OrderStatus, type OrderType, SubmissionStatusUnknownError, type Ticker } from "./types.ts";
+import ccxt, { type Order as CcxtOrder, type Ticker as CcxtTicker, type Exchange } from "ccxt";
+import {
+	type Order,
+	type OrderFeeObservation,
+	type OrderStatus,
+	type OrderType,
+	SubmissionStatusUnknownError,
+	type Ticker,
+} from "./types.ts";
+
+export function requireCcxtString(value: string | undefined, label: string): string {
+	if (typeof value !== "string" || value.length === 0) throw new Error(`${label} is missing`);
+	return value;
+}
+
+export function requireCcxtMarkets(exchange: Exchange): NonNullable<Exchange["markets"]> {
+	if (exchange.markets === undefined) throw new Error("Exchange markets are not loaded");
+	return exchange.markets;
+}
+
+export function requireCcxtMarket(exchange: Exchange, symbol: string): NonNullable<Exchange["markets"]>[string] {
+	const market = requireCcxtMarkets(exchange)[symbol];
+	if (!market) throw new Error(`Unknown market: ${symbol}`);
+	return market;
+}
 
 export function toTicker(t: CcxtTicker): Ticker {
+	const timestamp = validTimestamp(t.timestamp);
 	return {
-		symbol: t.symbol,
+		symbol: requireCcxtString(t.symbol, "ticker symbol"),
 		last: t.last ?? undefined,
 		bid: t.bid ?? undefined,
 		ask: t.ask ?? undefined,
@@ -13,7 +37,8 @@ export function toTicker(t: CcxtTicker): Ticker {
 		changePct24h: t.percentage,
 		volume24h: t.baseVolume,
 		quoteVolume24h: t.quoteVolume,
-		timestamp: validTimestamp(t.timestamp),
+		timestamp,
+		sourceTimestampKnown: t.timestamp === timestamp,
 	};
 }
 
@@ -95,7 +120,9 @@ export function positionSideFromInfo(info: Record<string, unknown>): Order["posi
 }
 
 export function validTimestamp(timestamp: number | undefined): number {
-	return timestamp !== undefined && Number.isFinite(timestamp) && timestamp > 0 ? timestamp : Date.now();
+	return timestamp !== undefined && Number.isSafeInteger(timestamp) && timestamp > 0 && timestamp <= 8.64e15
+		? timestamp
+		: Date.now();
 }
 
 export function validateBinanceClientOrderId(value: string, label: string): void {
@@ -116,11 +143,23 @@ function errorCode(error: unknown): string | undefined {
 	return message.match(/-\d{3,5}\b/)?.[0];
 }
 
-function isDefiniteSubmissionRejection(error: unknown): boolean {
+// Single classifier for submission failures. A definite rejection proves the
+// order was never accepted: the exchange (or ccxt locally) returned an
+// explicit business error before acceptance. Transport failures, unrecognized
+// error shapes and replies that imply the order may already exist stay
+// uncertain, so callers run the client-order-id recovery lookup instead of
+// reporting a rejection. This replaces the two diverging copies that previously
+// lived in ccxt-client.ts and ccxt-map.ts; when in doubt, prefer uncertainty.
+export function isDefiniteSubmissionRejection(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	// A duplicate-order reply means the exchange already holds this order from
+	// an earlier submission; classify it as uncertain so the client-id recovery
+	// lookup can return the existing order instead of reporting a rejection.
+	if (/duplicate/i.test(error.message) || error instanceof ccxt.DuplicateOrderId) return false;
 	if (
 		error instanceof ccxt.InsufficientFunds ||
 		error instanceof ccxt.InvalidOrder ||
-		error instanceof ccxt.AuthenticationError ||
+		error instanceof ccxt.AuthenticationError || // PermissionDenied subclasses this
 		error instanceof ccxt.BadRequest ||
 		error instanceof ccxt.ArgumentsRequired ||
 		error instanceof ccxt.OperationRejected ||
@@ -130,8 +169,12 @@ function isDefiniteSubmissionRejection(error: unknown): boolean {
 	}
 	// NetworkError, RateLimitExceeded, DDoSProtection, BadResponse, RequestTimeout.
 	if (error instanceof ccxt.OperationFailed) return false;
+	// An explicit HTTP 400 response rejected the request before acceptance;
+	// ccxt usually raises it as BadRequest, but unparsed venues surface the raw
+	// status line in the message.
+	if (/^HTTP 400\b/.test(error.message)) return true;
 	const code = errorCode(error);
-	const message = error instanceof Error ? `${error.name} ${error.message}` : String(error);
+	const message = `${error.name} ${error.message}`;
 	const text = `${code ?? ""} ${message}`;
 	return (
 		/-2010\b|-1013\b|-2021\b|-2014\b|-2015\b/.test(text) ||
@@ -222,8 +265,8 @@ export function normalizeExchangeError(error: unknown, operation: string): Error
 	return new Error(`${operation} failed [errorCategory=${category}]${code ? ` [code=${code}]` : ""}: ${message}`);
 }
 
-export function orderKey(order: { id: string; symbol: string }): string {
-	return `${order.symbol}:${order.id}`;
+export function orderKey(order: { id?: string; symbol?: string }): string {
+	return `${requireCcxtString(order.symbol, "order symbol")}:${requireCcxtString(order.id, "order id")}`;
 }
 
 export function finiteNumber(value: unknown): number | undefined {
@@ -262,10 +305,92 @@ export function orderMetric(normalized: unknown, rawValues: unknown[]): number {
 	return normalizedValue ?? rawValues.map(finiteNonNegative).find((value) => value !== undefined) ?? 0;
 }
 
+function observedCharges(value: unknown): OrderFeeObservation["charges"] {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return [];
+	const fee = value as Record<string, unknown>;
+	if (
+		typeof fee.currency !== "string" ||
+		!/^[A-Z0-9_-]{1,80}$/.test(fee.currency) ||
+		typeof fee.cost !== "number" ||
+		!Number.isFinite(fee.cost)
+	)
+		return [];
+	return [{ currency: fee.currency, cost: fee.cost }];
+}
+
+function feeComponents(value: { fee?: unknown; fees?: unknown }): {
+	charges: OrderFeeObservation["charges"];
+	complete: boolean;
+} {
+	// CCXT exposes `fees` at runtime but omits it from the installed Order/Trade interfaces.
+	// `fee` aliases an element/aggregate of `fees`; never sum both representations.
+	const fees = Array.isArray(value.fees) && value.fees.length > 0 ? value.fees : [value.fee];
+	const charges = fees.flatMap(observedCharges);
+	return { charges, complete: charges.length === fees.length };
+}
+
+function orderFeeObservation(o: CcxtOrder): OrderFeeObservation | undefined {
+	const trades = Array.isArray(o.trades) ? o.trades : [];
+	let charges: OrderFeeObservation["charges"];
+	let complete: boolean;
+	if (trades.length > 0) {
+		// safeOrder() synthesizes order.fee from whatever trades it received, even a
+		// truncated page. Verify quantity coverage and each trade's fee independently.
+		charges = [];
+		complete = true;
+		let filled = 0;
+		const ids = new Set<string>();
+		for (const trade of trades) {
+			if (
+				(trade.order !== undefined && trade.order !== o.id) ||
+				(trade.symbol !== undefined && trade.symbol !== o.symbol) ||
+				(trade.side !== undefined && trade.side !== o.side) ||
+				(trade.id !== undefined && ids.has(trade.id))
+			)
+				return undefined;
+			if (trade.id !== undefined) ids.add(trade.id);
+			const fee = feeComponents(trade);
+			charges.push(...fee.charges);
+			if (typeof trade.amount !== "number" || !Number.isFinite(trade.amount) || trade.amount <= 0) complete = false;
+			else filled += trade.amount;
+			complete &&= fee.complete;
+		}
+		const filledQty = o.filled;
+		complete &&=
+			filledQty !== undefined &&
+			Number.isFinite(filledQty) &&
+			filledQty > 0 &&
+			Number.isFinite(filled) &&
+			Math.abs(filled - filledQty) <= Math.max(Number.MIN_VALUE, Math.abs(filledQty) * 1e-8);
+	} else {
+		const fee = feeComponents(o);
+		charges = fee.charges;
+		complete = fee.complete;
+	}
+	if (charges.length === 0) return undefined;
+	// Bounded currency totals preserve original denominations without retaining raw trade responses.
+	const totals = new Map<string, number>();
+	for (const charge of charges) totals.set(charge.currency, (totals.get(charge.currency) ?? 0) + charge.cost);
+	if (totals.size > 32 || [...totals.values()].some((cost) => !Number.isFinite(cost))) return undefined;
+	return {
+		source: "exchange",
+		completeness: complete ? "complete" : "partial",
+		charges: [...totals].map(([currency, cost]) => ({ currency, cost })),
+	};
+}
+
 export function toOrder(o: CcxtOrder, contractSize: number, contractMarket: boolean): Order {
 	const info = (o.info ?? {}) as Record<string, unknown>;
-	const trailingDelta = Number(info.trailingDelta);
-	const callbackRate = Number(info.callbackRate ?? info.trailingPercent);
+	const trailingDelta = finitePositive(info.trailingDelta);
+	const callbackRatio = finitePositive(info.callbackRatio);
+	const callbackRate =
+		finitePositive(info.callbackRate) ??
+		finitePositive(info.priceRate) ??
+		(callbackRatio !== undefined ? finitePositive(callbackRatio * 100) : undefined);
+	const trailingPercent =
+		callbackRate ??
+		finitePositive(info.trailingPercent) ??
+		(trailingDelta !== undefined ? trailingDelta / 100 : undefined);
 	const type = toOrderType(o);
 	const rawGroup = info.orderListId ?? (type === "oco" ? (info.algoId ?? info.algoClOrdId) : undefined);
 	if (!Number.isFinite(contractSize) || contractSize <= 0) {
@@ -296,19 +421,22 @@ export function toOrder(o: CcxtOrder, contractSize: number, contractMarket: bool
 		(value): value is string => typeof value === "string" && value.length > 0,
 	);
 	return {
-		id: o.id,
+		id: requireCcxtString(o.id, "order id"),
 		clientOrderId,
 		listClientOrderId: typeof info.listClientOrderId === "string" ? info.listClientOrderId : undefined,
-		symbol: o.symbol,
+		symbol: requireCcxtString(o.symbol, "order symbol"),
 		side: o.side as Order["side"],
 		type,
-		price: o.price,
-		stopPrice: o.triggerPrice ?? o.stopPrice ?? o.stopLossPrice ?? o.takeProfitPrice,
-		trailingPercent: Number.isFinite(callbackRate)
-			? callbackRate
-			: Number.isFinite(trailingDelta)
-				? trailingDelta / 100
-				: undefined,
+		price: finitePositive(o.price),
+		stopPrice:
+			finitePositive(o.triggerPrice) ??
+			finitePositive(o.stopPrice) ??
+			finitePositive(o.stopLossPrice) ??
+			finitePositive(o.takeProfitPrice),
+		trailingPercent,
+		activationPrice:
+			finitePositive(info.activatePrice) ?? finitePositive(info.activationPrice) ?? finitePositive(info.activePx),
+		callbackRate,
 		ocoGroup: rawGroup !== undefined && String(rawGroup) !== "-1" ? String(rawGroup) : undefined,
 		orderListId: rawGroup !== undefined && String(rawGroup) !== "-1" ? String(rawGroup) : undefined,
 		listOrderStatus: typeof info.listOrderStatus === "string" ? info.listOrderStatus : undefined,
@@ -320,6 +448,7 @@ export function toOrder(o: CcxtOrder, contractSize: number, contractMarket: bool
 		remaining: normalizedRemaining * scale,
 		average,
 		cost,
+		feeObservation: orderFeeObservation(o),
 		status: toOrderStatus(o.status ?? info.status ?? info.state),
 		timestamp: validTimestamp(o.timestamp),
 	};

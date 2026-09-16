@@ -7,8 +7,6 @@ import {
 	createGetBalanceTool,
 	createGetContractStatsTool,
 	createGetFundingRateHistoryTool,
-	createGetFundingRateTool,
-	createGetFuturesPositionsTool,
 	createGetKlinesTool,
 	createGetMarketInfoTool,
 	createGetOpenOrdersTool,
@@ -43,8 +41,6 @@ describe("package api", () => {
 			createGetBalanceTool,
 			createGetContractStatsTool,
 			createGetFundingRateHistoryTool,
-			createGetFundingRateTool,
-			createGetFuturesPositionsTool,
 			createGetKlinesTool,
 			createGetMarketInfoTool,
 			createGetOpenOrdersTool,
@@ -66,7 +62,7 @@ describe("package api", () => {
 			createTradingTools,
 		] as const;
 
-		expect(exportFactories).toHaveLength(28);
+		expect(exportFactories).toHaveLength(26);
 
 		for (const factory of exportFactories) {
 			expect(typeof factory).toBe("function");

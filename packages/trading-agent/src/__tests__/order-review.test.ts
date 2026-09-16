@@ -194,6 +194,19 @@ describe("structured live order review", () => {
 		expect(review.body).toContain("停止 Agent 不会撤销已提交的订单");
 	});
 
+	it("shows the immutable plan version and logical intent alongside the actual order", async () => {
+		const f = fixture({ language: "zh-CN" });
+		const plan = await f.engine.prepareOrder("buy", { symbol: "BTC/USDT", type: "market", amount: 1 });
+		const review = createOrderReview(
+			{ kind: "order", plan },
+			{ ...f.reviewContext, planReference: { id: "plan-example", version: 3, intentId: "entry-1" } },
+		);
+		expect(review.body).toContain("交易计划: plan-example v3");
+		expect(review.body).toContain("计划订单意图: entry-1");
+		expect(review.body).toContain("启用跟踪不等于交易授权");
+		expect(review.body).toContain("1 BTC");
+	});
+
 	it("shows close-all, reducing intent and exact final exchange constraints", async () => {
 		const f = fixture({ exchange: "binance", marketType: "usdm-futures", positionMode: "hedge" }, [
 			{ symbol: "BTC/USDT:USDT", asset: "BTC", amount: 2, positionSide: "LONG", avgEntryPrice: 80, quoteValue: 200 },

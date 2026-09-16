@@ -587,7 +587,7 @@ describe("durable trigger monitor", () => {
 		await monitor.start();
 		expect(monitor.sendMessage).not.toHaveBeenCalled();
 		expect(base.read().scopes[0].triggers[0].state.status).toBe("active");
-		expect(monitor.notify).toHaveBeenCalledWith(expect.stringContaining("disk failure"), "warning");
+		expect(monitor.notify).toHaveBeenCalledWith(expect.stringContaining("poll failed: operation-failed"), "warning");
 		fail = false;
 		await vi.advanceTimersByTimeAsync(5_000);
 		expect(monitor.sendMessage).toHaveBeenCalledOnce();

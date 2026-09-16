@@ -1,18 +1,32 @@
 import { closeSync, existsSync, openSync, renameSync, rmSync, unlinkSync } from "node:fs";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { type ExchangeClient, TradingEngine, type TradingEngineConfig } from "@nikopack/ti-trading-engine";
+import {
+	type ExchangeClient,
+	isProtection,
+	type Order,
+	type Position,
+	protectionCoverage,
+	reduceSide,
+	TradingEngine,
+	type TradingEngineConfig,
+} from "@nikopack/ti-trading-engine";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const configFiles = vi.hoisted(() => new Map<string, unknown>());
 const testStatePath = vi.hoisted(
 	() => `${process.cwd()}/.ti-trading-state-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.json`,
 );
+// Paper ledgers are real files written by the paper client; give them a
+// per-run temporary directory instead of leaking into the package tree.
+const testPaperDir = vi.hoisted(
+	() => `${process.cwd()}/.ti-paper-test-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+);
 const stateWriteHooks = vi.hoisted(() => ({ beforeWrite: undefined as (() => void) | undefined }));
 vi.mock("../state-durability.ts", () => ({ syncTradingStateFile: vi.fn() }));
 
 vi.mock("../config.ts", () => ({
 	KEYS_PATH: "keys.json",
-	PAPER_DIR: "paper",
+	PAPER_DIR: testPaperDir,
 	TRADING_CONFIG_PATH: "trading.json",
 	TRADING_STATE_PATH: testStatePath,
 	readJsonFile<T>(path: string): T | undefined {
@@ -25,11 +39,9 @@ vi.mock("../config.ts", () => ({
 	},
 }));
 
-import type { Order, Position } from "@nikopack/ti-trading-engine";
 import { parseTradingArgs } from "../args.ts";
 import { TRADING_CONFIG_PATH, TRADING_STATE_PATH } from "../config.ts";
 import { TradingRuntime } from "../context.ts";
-import { isProtection, protectionCoverage, reduceSide } from "../monitor.ts";
 import {
 	DEFAULT_CONFIG,
 	loadTradingConfig,
@@ -136,6 +148,7 @@ afterAll(() => {
 	rmSync(testStatePath, { force: true });
 	rmSync(`${testStatePath}.lock`, { force: true });
 	rmSync(`${testStatePath}.lock.replaced`, { force: true });
+	rmSync(testPaperDir, { recursive: true, force: true });
 });
 
 describe("trading configuration", () => {
@@ -472,11 +485,9 @@ describe("risk accounting", () => {
 		expect(runtime.tradingEngine.risk.check("BTC/USDT", 500, { countTowardsDailyLimit: false })).toBeNull();
 	});
 
-	it("still enforces the per-order limit for protective orders", () => {
+	it("allows engine-verified protective orders past opening notional limits", () => {
 		const runtime = runtimeWithUsage(DEFAULT_CONFIG.risk.maxDailyNotional);
-		expect(runtime.tradingEngine.risk.check("BTC/USDT", 500.01, { countTowardsDailyLimit: false })).toMatch(
-			/maxOrderNotional/,
-		);
+		expect(runtime.tradingEngine.risk.check("BTC/USDT", 500.01, { countTowardsDailyLimit: false })).toBeNull();
 	});
 
 	it("keeps paper and live usage isolated", () => {

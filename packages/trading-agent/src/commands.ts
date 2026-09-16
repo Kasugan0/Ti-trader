@@ -8,7 +8,7 @@ import { loginExchange, openTradingSettings } from "./settings-menu.ts";
 import { wrapTradingAutocomplete } from "./slash-autocomplete.ts";
 import {
 	isOrderApprovalMode,
-	loadExchangeKeys,
+	loadExchangeKeyEntry,
 	type MarketType,
 	type TradingLanguage,
 	type TradingMode,
@@ -417,7 +417,7 @@ export function createTradingExtension() {
 				}
 				let liveConfirmed = false;
 				if (target === "live") {
-					const keys = loadExchangeKeys()[trading.config.exchange];
+					const keys = loadExchangeKeyEntry(trading.config.exchange);
 					if (!keys) {
 						ctx.ui.notify(
 							translate(language, "liveKeysMissingSlash", { exchange: trading.config.exchange }),

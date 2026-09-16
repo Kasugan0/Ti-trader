@@ -24,6 +24,7 @@ npm install -g ti-trader
 ti --version
 ti                          # 交互模式，默认 paper
 ti -p "分析 BTC 1h 走势"     # 一次性无头
+ti --autonomous status      # 显式启用的 Paper 自主运行时（需独立配置）
 ```
 
 不要用 `sudo` 往系统 npm 装。若出现 `EACCES`：
@@ -45,7 +46,7 @@ Ti 与 Pi 的配置完全隔离。首次启动创建 `~/.ti-trader/agent/`，不
 3. `/settings` 设语言、风控上限、市场。
 4. 真要实盘再用 `/exchange-login`。
 
-交易所：Binance（现货与 USDⓈ-M 覆盖最完整）、OKX、Bybit（后两者 experimental）。语言、模式、市场类型在 `/settings`，写入 `~/.ti-trader/agent/trading.json`。模型认证 `auth.json`，交易所 key `keys.json`（权限 600）。
+交易所：Binance（现货与 USDⓈ-M 覆盖最完整）、OKX、Bybit（后两者 experimental）。语言、模式、市场类型在 `/settings`，写入 `~/.ti-trader/agent/trading.json`。模型认证 `auth.json`，交易所 key `keys.json`（权限 600）。手建的 `keys.json`、知乎密钥文件或 freqtrade 认证文件若 group/other 可读，读取前会收紧为 600。
 
 可选扩展在仓库 `extensions/`，发布时打进 `ti-trader/dist/`。默认只自动加载 `market-lab` 和 `market-chart`（只读，不下单）。其余按环境变量或 `--extension` 加载；`--no-extensions` 关掉用户扩展发现：
 
@@ -92,12 +93,103 @@ node packages/trading-agent/dist/cli.js --mode live --exchange binance
 		"wakeAgent": true,
 		"guardPositions": true,
 		"alertLossPct": 5,
-		"alertCooldownSec": 900
+		"alertCooldownSec": 900,
+		"protectionCoveragePct": 95
 	}
 }
 ```
 
 实盘 API key：`/exchange-login okx` 交互录入，或编辑 `~/.ti-trader/agent/keys.json`（权限 600）。API key 只应授予必要的交易权限，不要授予提现权限；不要将 key、token 或账户敏感信息提交到仓库或贴入 issue。
+
+自主 Paper 不是默认产品。要跑无头循环，须在同一 `TI_DATA_DIR` 配置完整 `risk.account`、`orderApproval: "unattended"` 和 `autonomous.json`，再用 `ti --autonomous` 或 `/autonomous` 控制。自主 live 启动会被拒绝。步骤见 [autonomous-trading.md](../../docs/autonomous-trading.md)。
+
+## 保存计划，明天继续
+
+本节描述当前 **Unreleased 源码**；尚未发布。安装 npm 包不等于已获得这些功能，试用前应确认所用候选包含 `/plan` 与 `/decisions`。模型认证与费用独立于 Paper：无需交易所密钥不等于无需模型账号，也不等于免费推理。
+
+向 Ti 说明：“保存这次研究为计划，写清依据、入场条件、失效条件、复查时间和到期时间；暂时不要交易。”模型通过 `create_plan` 保存草稿；由你在终端启用跟踪：
+
+```text
+/plan
+/plan list 2
+/plan show <计划ID>
+/plan show <计划ID> 2
+/plan track <计划ID>
+/plan review <计划ID>
+/plan archive <计划ID>
+/plan export <计划ID>
+```
+
+第二天、另一个工作目录或新会话使用同一 Ti 数据目录和账户即可继续。每轮只注入不超过 4 KiB 的计划索引；原始依据、新版本、追加笔记和事件时间线由 `read_plan` / `get_plan_review` 按需读取。模型修改产生新草稿，不改写旧理由，也不替换已启用版本；再次执行 `/plan track` 并确认后才启用新版。一个计划的标的不可改变。
+
+支持 `price` / `closed_price` 的 `gt`、`gte`、`lt`、`lte` 比较：入场条件全部满足，失效条件任一满足即失效。时间周期为 `1m`、`5m`、`15m`、`1h`、`4h`、`1d`。价格超过五分钟或无法确认行情源时间即未知；已收盘价最长有效到一个周期加五分钟，并排除尚未收盘的 K 线。观察只在交互会话运行，遵循 `monitor.enabled` / `intervalSec`，不会因计划条件满足而唤醒模型、下单、撤单或平仓。
+
+跟踪还观察当前版本的关联订单变化及同标的账户保护覆盖。保护覆盖复用 `monitor.protectionCoveragePct`，但不把多个不完整止损或 OCO 腿相加来宣称保护完整；缺少数量、方向或触发价时显示未知。账户观测时间是读取完成时间，不冒充交易所事件发生时间。同一轮最多刷新 20 条关联执行，包括挂单及仍在引擎日志中、已成交但费用缺失的订单；游标跨重启轮转，未轮到的记录明确标为待刷新。
+
+事件与待发送通知在同一个计划事务内保存。每个计划成功通知后冷却 60 秒；冷却期间保留历史事件，并合并尚未发送的摘要。失败通知使用同一 ID 重试，30 秒租约、五分钟过期，状态见 `/health` 的“计划”项。归档、启用新版或 Paper 重置取消旧通知。发送后、确认落盘前退出仍可能重复通知，不保证严格只送一次；任何计划通知及重试都不会唤醒模型。原有成交监控和仓位守护的唤醒策略不变。
+
+`check_order`、`buy`、`sell`、`place_oco` 可带 `plan: { id, version, intentId }`。模型应为同一拟议动作保持相同 `intentId`，不能用新 ID 重试结果未知的订单。开仓必须使用当前已启用、未到期、条件明确满足的版本；提交前再次校验。归档不撤销已存在订单，经引擎验证的减仓仍可关联原批准版本。计划关联的 live 订单始终要求逐单确认，即使直接交易配置为 `unattended`。
+
+`/plan review` 对照原始版本、条件时间线、拟议订单、实际数量/订单参数、成交均价与当前持仓；同标的外部仓位不会自动算作该计划。准备时参考价与成交均价的差异包含市场变化，不等于已测得纯执行滑点。只有已归因、终态且数量闭合的现货成交与完整报价币费用，才可计算净报价币现金流；这仍不是策略收益评级。缺失成交、费用或完整平仓证据时结果为 `insufficient_evidence`，不是零收益。
+
+费用证据保留原币种、真实金额、来源及完整性。Paper 使用成交时实际记账费用，重启或修改费率不会重算历史费用；live 只使用订单或精确关联成交返回的费用，保留明确的零费用和负数返佣。旧版单独的 `fee` 数字不再被当作实测证据。基础币或第三方代币费用不自动换算，资金费率、点差与执行滑点也不默认是零。
+
+复盘同时进行有界只读修复：刷新当前跟踪计划后，轮转刷新所查计划的历史版本关联挂单并补归档，每个阶段最多 20 条。若还有待刷新记录，可再次请求复盘；结果未知的执行仍应先查 `/recovery`。归档失败显示 `planEvidence: pending`，订单仍按引擎结果处理，不得重发。`/paper reset` 保留旧研究与执行证据，但废止旧账户周期的计划，须修订并重新确认。
+
+列表、详情和复盘支持分页与中英文界面；长正文以明确标记的片段显示，导出保留全文。操作者页面不会被当作模型消息重新注入。模型通过 `read_plan` 的 `section` 读取 `versions`、`notes`、`events`、`intents`、`executions`；通过 `get_plan_review` 读取 `summary`、`differences`、`executions`、`events`、`gaps`，并按 `nextOffset` 继续。历史分区只读已保存快照，需要更新时先请求 `summary`。
+
+数据保存在 `~/.ti-trader/agent/plans/state.json`（支持 `TI_DATA_DIR`）。同一作用域最多跟踪 20 个计划；总计 500 个计划，每个最多 100 版、200 条笔记、各 1000 条事件/意图/执行快照。容量用尽会明确报错，不静默删除证据。`/plan delete <ID>` 只允许删除已归档且没有执行意图的计划。导出文件权限 600，含敏感账户研究，不要上传或提交。
+
+升级前停止同一数据目录的所有旧写入者，并一起备份整个 `agent` 目录；计划导出不能替代风险、执行和 Paper 账本备份。恢复必须核对原账户及 Paper 原始绝对路径，不可修改账户 ID 来绕过不匹配，也不能把旧备份当作从未下过单。步骤见[备份与恢复](../../docs/trading-operations.md#back-up-state-consistently)。
+
+## 分开看运行、决策纪律与策略表现
+
+Ti 会在本地保存每轮模型/提示词/工具指纹、有限数字观测、公开理由以及实际交易工具调用。`record_decision` 应在交易前记录理由，也允许 `wait`、`hold`、`avoid`；事后理由不会补成事前证据。
+
+```text
+/decisions
+/decisions list 20
+/decisions show <记录ID> 0
+/decisions evaluate
+/decisions evaluate discipline
+/decisions evaluate strategy
+/decisions evaluate samples
+/decisions evaluate executions
+/decisions evaluate protocols
+/decisions export
+/decisions delete <记录ID>
+```
+
+命令不调用模型，操作者页面不会重新注入模型消息。`list`、`show` 和评估分区每次最多 20 条、条目预算 16 KiB；按返回的 `nextOffset` 继续，不把它当页码。模型工具 `get_decision_evaluation` 默认只返回概览，通过 `section` 和 `offset` 读取详细分区；不会把全部样本塞进上下文。
+
+纪律评估按账户、Paper 周期、模型和指纹分组，报告样本数、引用缺失/过期、无来源时间、遗漏理由、事后说明、风控阻断及未知结果；缺失记录、采集故障和未完成回合不能判通过。只保存白名单数字快照，不保存原始提示词、完整对话、模型隐藏推理、凭证或原始错误。模型自己写的理由仍是声明，不是事实。
+
+### 先固定协议，再观察未来结果
+
+在 `spot` 作用域中，由操作者确认协议；不能让模型看完结果再选择观察期限或成本：
+
+```text
+/decisions study create {"name":"spot-1h","symbols":["BTC/USDT"],"horizonSeconds":3600,"maxSourceAgeSeconds":60,"endpointWindowSeconds":60,"feeBpsPerSide":10,"slippageBpsPerSide":5,"minimumSamples":20}
+/decisions study
+/decisions collect
+/decisions study stop <研究ID>
+```
+
+这是格式示例，不是成本估计或参数推荐。`horizonSeconds` 固定观察期限，`endpointWindowSeconds` 是到期后的采集窗口；`maxSourceAgeSeconds` 限制来源时间年龄。费用和滑点单位为基点（1 bp = 0.01%），每边分别计入。每个作用域最多一个正在接收新样本的协议；修改要先停止旧协议，再确认新协议，旧样本仍按原协议处理。
+
+只有确认后的新回合入组。决策必须引用交易前读取的、作用域与标的一致、无缺失警告的 `get_price` 观测；`sourceTimestampKnown: true` 才能证明时间来自行情源，而非本地时钟补值。公开预测使用 `forecast.direction: "up" | "down" | "flat"`，不从自由文本猜方向；自由文本 `horizon` 不改变协议期限。
+
+会话运行时每五秒尝试采集，每轮最多检查 100 个待处理样本、读取 20 个去重标的，单个行情请求最多等待十秒。当前有效窗口优先于过期积压；共享同次报价的样本按真实接收时间成批落盘，过期结果也成批保存，避免每个样本重写整个文件。窗口内首个有效报价一经保存即固定。退出后不采集；重启可继续尚未过期的窗口，错过窗口保留缺失，不补历史价格。`study stop` 只停止后续入组，已入组样本继续只读观察。Paper 重置废止旧周期的待观察样本，新周期须重新确认协议。这些采集不唤醒模型、不执行订单，也不继承 `monitor.enabled` 的计划监控开关。
+
+现货 `enter` 且明确预测上涨按单位资金做多计算；`wait` / `avoid` 按持有报价币计算。每条同时给出持币和买入持有基准，以及声明双边费用/滑点后的差值。结果按作用域、周期、模型、指纹、协议、动作和标的分组；小样本、重叠样本或缺失结果保持 `insufficient_evidence`。只有完整且非重叠样本达到预设门槛，才标 `descriptive_evidence_only`（仅描述性证据），不是统计显著性或模型信任评级。单位资金收益的均值不是账户资金曲线；做多与同窗口买入持有采用相同规则，不能用二者相等宣称超额收益。
+
+`hold` / `reduce` / `exit` 缺可归因起始仓位，以及合约缺资金费、杠杆和强平资料时不计算此对照。实际执行分区另读引擎记录和永久计划档案，按执行 ID 对应事前理由，展示真实成交与报价币费用；缺少闭合买卖批次归属时，已实现收益仍为 `null`。可证明闭合的计划现金流请查看 `/plan review`，不能与假设成本的前瞻对照混用。
+
+`decisions/state.json` 最多保存 1000 个回合、100 个协议及 30000 个结果；每回合最多 100 个观测、100 个操作及 30 条理由，文件上限 32 MiB。容量用尽明确报错，不自动删除样本。仅未入组且已结束的记录可通过 `delete` 删除；已入组记录不可选择性删除，以免只保留好结果。长研究须提前考虑容量，导出不是清空或重置账户的授权。
+
+私密导出包含完整冻结证据、协议、结果、已留存的最新执行事实和有界评估概览，不重复保存全部派生行，最大 128 MiB；单文件导出不替代整个账户备份。库导出的 `validateDecisionEvidence` / `evaluateDecisions` 可对导出文件的 `evidence` 字段离线重算纪律与前瞻对照；`evaluateActualExecutions` 使用 `evidence`、`executionRecords` 和 `Date.parse(evaluatedAt)` 重算该时点的实际执行报告。记录范围仍是交互/单次会话，不包括独立自主 Paper 守护进程。
+
+三种结论不可互相替代：运行就绪依赖实际长时间 Paper、恢复及独立安装证据；纪律评估只说明可观察行为；前瞻对照只描述固定规则下的结果。`no_recorded_discipline_issues` 或 `descriptive_evidence_only` 均不表示模型可信、策略盈利或获准实盘。
 
 ## 工具结果与订单状态
 
@@ -144,7 +236,9 @@ Paper 现货和 Paper 合约的触发在每次账户读取时懒惰撮合：所�
 - **裸仓告警**：持仓没有任何止损类保护单（stop/移动止损/OCO 止损腿）且超过一个轮询周期宽限期时，注入 `[position guard]` 消息唤醒 agent——要么立刻设置保护，要么向用户说明为何不保护。
 - **浮亏告警**：持仓未实现亏损达到 `alertLossPct`（默认 5%）时唤醒 agent 重新评估：砍仓、收紧止损或说明持有理由。同一仓位的告警受 `alertCooldownSec`（默认 900s）冷却限制，不会刷屏。
 
-`/monitor` 查看状态，`/monitor on|off` 开关本次会话的监控。`/paper reset [金额]` 重置模拟账户。
+`/monitor` 查看状态，`/monitor on|off` 开关本次会话的监控。`/paper reset [金额]` 重置模拟账户。`/autonomous` 控制显式启用的 Paper 自主运行时，不替代交互会话。
+
+未配置 `risk.account` 时，live 的 `cancel_order` / `cancel_order_list` 会拒绝撤销仍保护开仓的止损类挂单；应保留保护或走受控平仓。配置了账户硬风控后，由硬风控仲裁撤单。
 
 ## 暂停新增敞口与恢复
 
@@ -206,7 +300,7 @@ Binance USDⓈ-M 合约使用 ccxt unified symbol，例如 `BTC/USDT:USDT`，不
 
 启用合约市场时运行时强制要求 `exchange` 为 `binance`，并使用 ccxt `defaultType: swap`。Paper 合约账户独立持有报价币保证金，不会使用现货余额；杠杆和保证金模式会持久化到独立的 Paper 状态文件。余额查询中的 `futures:USDT` 表示合约账户的 USDT，普通 `USDT` 表示现货账户的 USDT。
 
-默认工具使用统一的 `get_positions` 和 `get_contract_stats`/`get_funding_rate_history`；`get_futures_positions`、`get_funding_rate` 仅保留为非默认 factory。买卖工具额外支持 `reduceOnly`、`positionSide`、`stopPrice`、`closePosition`。agent-facing 的 futures `amount` 永远是 base 数量，交易所提交数量及 amount limits 是 contracts，必须使用市场报告的 `contractSize` 转换；缺失、非线性或无法精确表示的合约元数据会拒绝下单，绝不按 1 猜。订单和持仓返回值会从 contracts 转回 base。
+默认工具使用统一的 `get_positions` 和 `get_contract_stats`/`get_funding_rate_history`。买卖工具额外支持 `reduceOnly`、`positionSide`、`stopPrice`、`closePosition`。agent-facing 的 futures `amount` 永远是 base 数量，交易所提交数量及 amount limits 是 contracts，必须使用市场报告的 `contractSize` 转换；缺失、非线性或无法精确表示的合约元数据会拒绝下单，绝不按 1 猜。订单和持仓返回值会从 contracts 转回 base。
 
 `closePosition` 只用于平掉匹配方向的 futures 仓位：market close 会提交准确数量并带减仓方向；live Binance USDⓈ-M 的 `stop_market`/`take_profit_market` 使用交易所 close-all 语义，可能省略 quantity。此时 `requestedAmount` 是匹配仓位快照，`amountSemantics`/`exchangeQuantitySemantics` 会说明数量来源，返回 `amount: 0` 不代表没有提交订单。hedge 模式必须同时校验 `side` 与 `positionSide`；Binance live 受交易所约束省略 wire-level `reduceOnly` 并返回 `reduceOnlyApplied: false`/`exchangeConstraint`，Paper 与其他适配器保留显式 `reduceOnly`。
 
@@ -231,13 +325,16 @@ npm --prefix packages/trading-agent run smoke   # headless 运行时检查 + 模
 ```
 src/
   cli.ts / main.ts      入口与 bootstrap（复用 pi 的 services/runtime/InteractiveMode）
-  args.ts               CLI 参数（--mode/--exchange/--print）
-  config.ts / state.ts  配置与状态持久化（~/.ti-trader/agent/）
+  args.ts               CLI 参数（--mode/--exchange/--print/--autonomous）
+  config.ts / state.ts  配置与状态持久化（~/.ti-trader/agent/）；密钥读取时收紧 600
   context.ts            交易运行时单例：marketData、tradingEngine、配置和模式切换
   tools/index.ts         25 个原生交易工具（行情读取与交易引擎编排）
+  autonomous/            显式启用的 Paper 自主运行时（live 启动 fail-closed）
   monitor.ts              后台成交监控 + 仓位守护（裸仓/浮亏告警，唤醒 agent）
   trigger-monitor.ts      实验性 /trigger：持久化条件与状态；live 只通知
   monitoring-state.ts     账户作用域、监控状态、通知队列和健康快照
+  plans/                  私密版本化计划、只读跟踪、关联档案与分页复盘
+  decisions/              公开决策理由、观测证据和分组评估
   health.ts               /health 本地执行阻断和监控健康
   commands.ts             交易 slash 命令、/recovery 对账和 /audit 审计
   prompt.ts               交易系统提示词（整体替换编码提示词）

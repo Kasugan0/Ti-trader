@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
-import { evaluateCandidateEvidence, evaluateReleaseEvidence, MAXIMUM_SAMPLE_GAP_MS, MINIMUM_SOAK_MS, REQUIRED_DRILLS, REQUIRED_SUITES } from "./trading-release-gate.mjs";
+import { evaluateCandidateEvidence, evaluateReleaseEvidence, MAXIMUM_SAMPLE_GAP_MS, MINIMUM_SOAK_MS, REQUIRED_DRILLS, REQUIRED_INSTALL_CHECKS, REQUIRED_SUITES } from "./trading-release-gate.mjs";
 
 const revision = "a".repeat(40);
 const versions = { risk: "0.1.1", engine: "0.1.2", agent: "0.1.8" };
@@ -32,7 +32,7 @@ function fixture() {
 			cases: REQUIRED_DRILLS.map((name) => ({ name, passed: true, observation: "Fixture observation" })) },
 		installation: { kind: "package-install", revision, completedAt: new Date(end).toISOString(), passed: true,
 			nodeMajor: 22, versions,
-			checks: { cleanInstall: true, cliVersion: true, isolatedDataDir: true, paperDefault: true, recoveryAfterRestart: true } },
+			checks: Object.fromEntries(REQUIRED_INSTALL_CHECKS.map((key) => [key, true])) },
 	};
 	const evidence = { schemaVersion: 1, revision, versions, pilotApproval: {
 		reviewer: "maintainer", revision, scope: "human-confirmed-live-pilot", exchange: "binance", market: "spot",
@@ -54,6 +54,26 @@ test("accepts complete, revision-bound evidence for a human-confirmed pilot only
 	const data = fixture();
 	assert.deepEqual(data.persist(), { ready: true, target: "human-confirmed-live-pilot", blockers: [] });
 });
+
+test("retains existing install gates and requires continuity and evidence registration", () => {
+	assert.deepEqual(REQUIRED_INSTALL_CHECKS, [
+		"cleanInstall", "cliVersion", "isolatedDataDir", "paperDefault", "recoveryAfterRestart",
+		"continuityAfterRestart", "evidenceTools",
+	]);
+});
+
+for (const key of REQUIRED_INSTALL_CHECKS) {
+	test(`blocks installation artifacts without explicit ${key} success even when passed is true`, () => {
+		const data = fixture();
+		for (const value of [undefined, false, "true", 1]) {
+			if (value === undefined) delete data.artifacts.installation.checks[key];
+			else data.artifacts.installation.checks[key] = value;
+			const result = data.persist();
+			assert.equal(result.ready, false);
+			assert.deepEqual(result.blockers, [`installation: ${key} has not passed`]);
+		}
+	});
+}
 
 test("never treats missing evidence or a short run as release readiness", () => {
 	assert.equal(evaluateReleaseEvidence({}, tmpdir(), end).ready, false);

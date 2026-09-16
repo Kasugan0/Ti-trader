@@ -21,8 +21,6 @@ import { describe, expect, it, vi } from "vitest";
 import { getTrading, type TradingRuntime } from "../context.ts";
 import { DEFAULT_CONFIG, type TradingConfig } from "../state.ts";
 import {
-	createGetFundingRateTool,
-	createGetFuturesPositionsTool,
 	createGetOrderListStatusTool,
 	createGetOrderStatusTool,
 	createGetPriceTool,
@@ -635,21 +633,6 @@ describe("provider injection seam", () => {
 			orderList: { id: "ol-1", listOrderStatus: "EXECUTING" },
 		});
 	});
-
-	it("constructs the factory-only tools with the same provider without calling it", () => {
-		const { runtime } = createSeamRuntime();
-		const provider: TradingProvider = vi.fn(() => runtime);
-
-		const funding = createGetFundingRateTool(provider);
-		const futuresPositions = createGetFuturesPositionsTool(provider);
-		const names = createTradingTools(provider).map((tool) => tool.name);
-
-		expect(provider).not.toHaveBeenCalled();
-		expect(funding.name).toBe("get_funding_rate");
-		expect(futuresPositions.name).toBe("get_futures_positions");
-		expect(names).toHaveLength(25);
-		expect(names).toEqual(REGISTERED_TOOL_NAMES);
-	});
 });
 
 describe("deterministic default-tool availability", () => {
@@ -828,39 +811,6 @@ describe("deterministic default-tool availability", () => {
 		assert(details);
 	});
 
-	it("executes both factory-only tools in a supported futures runtime", async () => {
-		const { runtime } = createAvailabilityRuntime({ exchange: "binance", marketType: "usdm-futures" });
-		const funding = createGetFundingRateTool(() => runtime);
-		const positions = createGetFuturesPositionsTool(() => runtime);
-		const fundingDetails = await executeWithDetails(funding, { symbol: FUTURES_SYMBOL }, "funding");
-		const positionDetails = await executeWithDetails(positions, {}, "futures-positions");
-		expect(fundingDetails).toMatchObject({ symbol: FUTURES_SYMBOL, rate: 0.0001 });
-		expect(positionDetails).toMatchObject({ marketType: "usdm-futures", positions: expect.any(Array) });
-	});
-
-	it("reports a missing live funding rate as unavailable instead of zero", async () => {
-		const { runtime, exchange } = createAvailabilityRuntime({
-			mode: "live",
-			exchange: "binance",
-			marketType: "usdm-futures",
-			orderApproval: "unattended",
-		});
-		exchange.fundingRateValue = undefined;
-
-		const details = await executeWithDetails(
-			createGetFundingRateTool(() => runtime),
-			{ symbol: FUTURES_SYMBOL },
-			"funding-missing",
-		);
-
-		expect(details).toMatchObject({
-			symbol: FUTURES_SYMBOL,
-			rate: null,
-			dataQuality: { available: false, observed: false },
-			warnings: ["Funding rate unavailable"],
-		});
-	});
-
 	it("marks incomplete funding history records as unavailable", async () => {
 		const { runtime, exchange } = createAvailabilityRuntime({
 			mode: "live",
@@ -896,29 +846,11 @@ describe("deterministic default-tool availability", () => {
 		["get_funding_rate_history", { symbol: SPOT_SYMBOL }, /Funding rate history.*spot markets/],
 		["set_leverage", { symbol: FUTURES_SYMBOL, leverage: 5 }, /Leverage.*spot markets/],
 		["set_margin_mode", { symbol: FUTURES_SYMBOL, marginType: "isolated" }, /Margin mode.*spot markets/],
-		["get_futures_positions", {}, /unavailable in spot mode/],
 	] as const)("rejects %s explicitly in Paper spot", async (name, params, expected) => {
 		const { runtime } = createAvailabilityRuntime({ exchange: "binance", marketType: "spot" });
-		const tool =
-			name === "get_futures_positions"
-				? createGetFuturesPositionsTool(() => runtime)
-				: registeredTool(name, runtime);
-		await expect(tool.execute(`unsupported-${name}`, params, undefined, undefined, context)).rejects.toThrow(
-			expected,
-		);
-	});
-
-	it("rejects Paper spot current funding-rate factory explicitly", async () => {
-		const { runtime } = createAvailabilityRuntime({ exchange: "binance", marketType: "spot" });
 		await expect(
-			createGetFundingRateTool(() => runtime).execute(
-				"unsupported-funding",
-				{ symbol: SPOT_SYMBOL },
-				undefined,
-				undefined,
-				context,
-			),
-		).rejects.toThrow(/Funding rate.*spot markets/);
+			registeredTool(name, runtime).execute(`unsupported-${name}`, params, undefined, undefined, context),
+		).rejects.toThrow(expected);
 	});
 
 	it("rejects Paper spot Multi-Assets mode explicitly", async () => {

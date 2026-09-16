@@ -36,6 +36,7 @@ describe("trading settings interactions", () => {
 	beforeEach(() => {
 		initTheme("dark", false);
 		vi.spyOn(state, "loadExchangeKeys").mockReturnValue({});
+		vi.spyOn(state, "loadExchangeKeyEntry").mockReturnValue(undefined);
 	});
 	afterEach(() => vi.restoreAllMocks());
 

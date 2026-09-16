@@ -1,10 +1,86 @@
 import { type TSchema, Type } from "typebox";
-import { MAX_CHANGE_WINDOW_SEC, type TriggerDefinition } from "./model.ts";
+import { type Condition, MAX_CHANGE_WINDOW_SEC, type TriggerDefinition } from "./model.ts";
 
-// TypeBox 1.x does not expose a recursive builder; runtime validation is completed below.
-export const conditionSchema: TSchema = Type.Unknown();
+const compareOperators = ["eq", "neq", "gt", "gte", "lt", "lte"];
 
-const compareOperators = new Set(["eq", "neq", "gt", "gte", "lt", "lte"]);
+// TypeBox 1.x has no recursive builder, so the recursive condition schema is
+// expressed as a JSON Schema definition referenced through `$ref`. `Check()`
+// resolves the reference both when `conditionSchema` is the root document and
+// when it is embedded as `triggerSchema.when`. The schema enforces structure
+// only; `validateCondition` additionally enforces the nesting-depth and
+// atomic-condition budgets, and value semantics such as date parseability.
+const factSchema = { type: "object", properties: { key: { type: "string", minLength: 1 } }, required: ["key"] };
+const compareOperatorSchema = { enum: compareOperators };
+
+const conditionDefinition = {
+	anyOf: [
+		{
+			type: "object",
+			properties: { kind: { const: "time" }, at: { type: "string", minLength: 1 } },
+			required: ["kind", "at"],
+		},
+		{
+			type: "object",
+			properties: {
+				kind: { const: "compare" },
+				fact: factSchema,
+				operator: compareOperatorSchema,
+				value: { anyOf: [{ type: "number" }, { type: "string" }, { type: "boolean" }] },
+			},
+			required: ["kind", "fact", "operator", "value"],
+		},
+		{
+			type: "object",
+			properties: {
+				kind: { const: "cross" },
+				fact: factSchema,
+				direction: { enum: ["above", "below"] },
+				value: { type: "number" },
+			},
+			required: ["kind", "fact", "direction", "value"],
+		},
+		{
+			type: "object",
+			properties: {
+				kind: { const: "change" },
+				fact: factSchema,
+				windowSec: { type: "number", exclusiveMinimum: 0, maximum: MAX_CHANGE_WINDOW_SEC },
+				operator: compareOperatorSchema,
+				value: { type: "number" },
+				unit: { enum: ["absolute", "percent"] },
+			},
+			required: ["kind", "fact", "windowSec", "operator", "value", "unit"],
+		},
+		{
+			type: "object",
+			properties: {
+				kind: { enum: ["all", "any"] },
+				conditions: { type: "array", items: { $ref: "#/$defs/condition" }, minItems: 1, maxItems: 10 },
+			},
+			required: ["kind", "conditions"],
+		},
+		{
+			type: "object",
+			properties: { kind: { const: "not" }, condition: { $ref: "#/$defs/condition" } },
+			required: ["kind", "condition"],
+		},
+		{
+			type: "object",
+			properties: {
+				kind: { const: "stable_for" },
+				condition: { $ref: "#/$defs/condition" },
+				durationSec: { type: "number", exclusiveMinimum: 0 },
+			},
+			required: ["kind", "condition", "durationSec"],
+		},
+	],
+};
+
+export const conditionSchema: TSchema = Type.Unsafe<Condition>({
+	$defs: { condition: conditionDefinition },
+	$ref: "#/$defs/condition",
+});
+
 function record(value: unknown): Record<string, unknown> {
 	if (typeof value !== "object" || value === null || Array.isArray(value))
 		throw new Error("Invalid trigger condition");
@@ -32,7 +108,7 @@ export function validateCondition(value: unknown, depth = 0, atoms = { count: 0 
 			break;
 		case "compare":
 			fact(condition.fact);
-			if (typeof condition.operator !== "string" || !compareOperators.has(condition.operator))
+			if (typeof condition.operator !== "string" || !compareOperators.includes(condition.operator))
 				throw new Error("Invalid compare operator");
 			if (!["number", "string", "boolean"].includes(typeof condition.value))
 				throw new Error("Invalid compare value");
@@ -55,7 +131,7 @@ export function validateCondition(value: unknown, depth = 0, atoms = { count: 0 
 				if (condition.windowSec > MAX_CHANGE_WINDOW_SEC)
 					throw new Error(`Change windowSec must not exceed ${MAX_CHANGE_WINDOW_SEC}`);
 				if (condition.unit !== "absolute" && condition.unit !== "percent") throw new Error("Invalid change unit");
-				if (typeof condition.operator !== "string" || !compareOperators.has(condition.operator))
+				if (typeof condition.operator !== "string" || !compareOperators.includes(condition.operator))
 					throw new Error("Invalid change operator");
 			}
 			break;
@@ -119,7 +195,9 @@ export const triggerSchema = Type.Object({
 		Type.Object({
 			mode: Type.Optional(Type.Union([Type.Literal("once"), Type.Literal("on_edge"), Type.Literal("while_true")])),
 			cooldownSec: Type.Optional(Type.Number({ minimum: 0 })),
-			expiresAt: Type.Optional(Type.String({ format: "date-time" })),
+			// Date parseability is enforced by validateTriggerDefinition; any
+			// Date.parse-able string is accepted there, not only RFC 3339.
+			expiresAt: Type.Optional(Type.String()),
 		}),
 	),
 });

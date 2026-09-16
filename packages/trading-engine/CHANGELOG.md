@@ -4,15 +4,35 @@ All notable changes to `@nikopack/ti-trading-engine` are documented in this file
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Stopped exporting `countsTowardsDailyLimit` and `futuresContractLotStep`. Both remain internal to order planning.
+
 ### Added
 
+- Optional immutable execution references and synchronous final reference validation for ordinary/OCO submissions. Referenced records survive ordinary history pruning until exact-revision archival; open linked orders retain read-only correlated refresh support.
+- `OrderFeeObservation` preserves actual original-currency charges, signed rebates, source and completeness through Paper persistence, correlated venue lookup, recovery and archival. `observedExecutionFee` aggregates only complete, terminal, correctly sourced quote charges; legacy scalars remain untrusted.
+- `Ticker.sourceTimestampKnown` distinguishes venue timestamps from local fallbacks in live and Paper market data.
+- `CcxtExchangeClient.reloadMarkets()` refreshes the process-cached markets snapshot so long-running processes can pick up newly listed symbols and changed filters.
+- Re-exported `assessProtectionTarget` and `assessLeverageSetting` from `@nikopack/ti-trading-risk` alongside the other account-risk assessors.
 - Account-wide hard-risk admission, stable intent identities, unknown-only running recovery, persistent protection targets and independent supervision. Paper supplies atomic account snapshots and atomic stop replacement/protected closure.
 - Pending cancellation/settings identities and verified-dead local lock recovery retain execution state across interrupted operations.
 
 - Paper futures now simulates limit, stop, take-profit and trailing orders with the same lazy kline-backfill matching as Paper spot. Reduce-only and closePosition orders lock the matching position; opening orders reserve quote margin. OCO, funding payments, slippage and exchange-specific liquidation remain out of scope.
 
+### Changed
+
+- Pinned `ccxt` `4.5.77` and fail closed when ccxt omits market metadata, order ids, or precision strings.
+- Submission failures are now classified by a single `isDefiniteSubmissionRejection` implementation shared by order, trailing and OCO submission paths (previously two diverging copies in `ccxt-client.ts` and `ccxt-map.ts`). Explicit venue business errors (`BadRequest`, `ArgumentsRequired`, `OperationRejected`, `NotSupported`, `PermissionDenied`, Binance codes -2014/-2015/-2021) that only one copy recognized are now definite rejections; duplicate-order replies are now uncertain so the client-order-id recovery lookup returns the already-accepted order.
+
 ### Fixed
 
+- Unchanged execution polling no longer creates archive revisions for timestamp/source-only changes or alters settled quota. Actual order parameters and late observed fees remain revisioned.
+- Resting Paper fills retain cumulative economics and persist actual charged fees against the canonical order ID, without reconstructing fees from current settings.
+- Stale-timeout lock reclamation now serializes through the `.reclaim` gate like dead-owner recovery, closing a race where two waiters that both observed a stale lock could unlink each other's replacement lock and both believe they hold it. A fresh lock installed by another reclaimer is no longer removed.
+- Live order and order-list cancellation without account hard risk no longer removes stop-flavored exits that protect an open position; the cancellation fails closed like the account-risk guard and directs the operator to a controlled close. `isProtectiveExit` is exported and `verifiedReducingOrder` accepts a position-mode-only scope.
+- A stable `intentId` that settled as a `release` (confirmation cancel, pre-submission validation failure, or definite exchange rejection) can be reused with the same fingerprint. In-flight, unknown and committed identities still refuse reuse.
+- Account-risk cancellation coverage now counts `stop`, `trailing_stop_market` and OCO stop legs, and compares remaining coverage by symbol and side instead of list index, so configuring `risk.account` no longer lets a live trailing or OCO stop be cancelled as unprotected.
 - Paper futures now cancels leftover reduce-only orders after a one-way reverse or a partial close that no longer fits, instead of leaving a stop that can deadlock settlement.
 - Opening trailing sells top up reserved margin as the peak rises, and a leverage drop re-reserves resting opening orders. A working opening order stays open when a fill cannot be margined.
 - Cross-margin liquidation counts reserved opening-order margin as equity. Reducing futures limits reserve fee only, not opening margin. A closePosition stop locks the live position quantity.

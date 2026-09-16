@@ -26,10 +26,12 @@ import {
 import { createTradingExtension } from "./commands.ts";
 import { AGENT_DIR, APP_NAME, CONFIG_DIR_NAME, ensureAgentDir } from "./config.ts";
 import { getTrading, initTrading } from "./context.ts";
+import { createDecisionEvidenceExtension } from "./decisions/extension.ts";
 import { createOperationalHealthExtension } from "./health.ts";
 import { localizeDescription } from "./i18n.ts";
 import { installMarketLabSessionBridge } from "./market-lab-bridge.ts";
 import { createOrderMonitorExtension } from "./monitor.ts";
+import { createPlanExtension } from "./plans/extension.ts";
 import { createProjectTrustContext, resolveProjectTrusted } from "./project-trust.ts";
 import {
 	buildTradingPrompt,
@@ -214,6 +216,12 @@ export async function main(argv: string[]): Promise<void> {
 						},
 					},
 					{ name: "ti-trading", hidden: true, factory: createTradingExtension() },
+					{ name: "ti-plans", hidden: true, factory: createPlanExtension() },
+					{
+						name: "ti-decision-evidence",
+						hidden: true,
+						factory: createDecisionEvidenceExtension(undefined, undefined, VERSION),
+					},
 					{ name: "ti-autonomous", hidden: true, factory: createAutonomousCommandExtension() },
 					{ name: "ti-health", hidden: true, factory: createOperationalHealthExtension() },
 					{ name: "ti-order-monitor", hidden: true, factory: createOrderMonitorExtension() },

@@ -6,10 +6,12 @@ import {
 	finiteNumber,
 	finitePositive,
 	generateClientOrderId,
-	isUncertainSubmission,
+	isDefiniteSubmissionRejection,
 	normalizeExchangeError,
 	orderKey,
 	positionSideFromInfo,
+	requireCcxtMarkets,
+	requireCcxtString,
 	submissionStatusUnknownError,
 	toOrder,
 	toOrderStatus,
@@ -19,6 +21,7 @@ import { amountStepFromCcxtPrecision } from "./ccxt-precision.ts";
 import { getSpotCostBasis } from "./ccxt-spot-cost-basis.ts";
 import type { ExchangeCredentials, FuturesMarginType, FuturesPositionMode, MarketType } from "./client-types.ts";
 import { contractSizeForMarket } from "./contract-size.ts";
+import { boundedLookup } from "./execution-recovery.ts";
 import { validateOrderInput } from "./order-input.ts";
 import {
 	type Balance,
@@ -40,18 +43,6 @@ import {
 	timeframeDurationMs,
 } from "./types.ts";
 import { type LiveVenueProfile, resolveLiveVenue } from "./venues/index.ts";
-
-function definiteSubmissionRejection(error: unknown): boolean {
-	if (!(error instanceof Error) || /duplicate/i.test(error.message)) return false;
-	return (
-		error instanceof ccxt.AuthenticationError ||
-		error instanceof ccxt.PermissionDenied ||
-		error instanceof ccxt.InsufficientFunds ||
-		error instanceof ccxt.InvalidOrder ||
-		/^HTTP 400\b/.test(error.message) ||
-		[-2010, -1013].includes(Number((error as Error & { code?: unknown }).code))
-	);
-}
 
 /** Live trading client backed by a ccxt exchange instance with API credentials. */
 export class CcxtExchangeClient implements ExchangeClient {
@@ -76,7 +67,7 @@ export class CcxtExchangeClient implements ExchangeClient {
 	private contractSizeForSymbol(symbol: string): number {
 		if (!this.marketsLoaded) throw new Error("Exchange markets are not loaded; cannot resolve contractSize");
 		return contractSizeForMarket(
-			this.exchange.markets[symbol] as {
+			requireCcxtMarkets(this.exchange)[symbol] as {
 				contract?: boolean;
 				linear?: boolean;
 				inverse?: boolean;
@@ -86,10 +77,50 @@ export class CcxtExchangeClient implements ExchangeClient {
 	}
 
 	private toDomainOrder(order: CcxtOrder): Order {
-		const market = this.exchange.markets[order.symbol] as
+		const symbol = requireCcxtString(order.symbol, "order symbol");
+		const market = requireCcxtMarkets(this.exchange)[symbol] as
 			| { contract?: boolean; linear?: boolean; inverse?: boolean; contractSize?: number }
 			| undefined;
-		return toOrder(order, this.contractSizeForSymbol(order.symbol), market?.contract === true);
+		return toOrder(order, this.contractSizeForSymbol(symbol), market?.contract === true);
+	}
+
+	private async toDomainOrderWithFees(raw: CcxtOrder): Promise<Order> {
+		const order = this.toDomainOrder(raw);
+		if (
+			order.filled <= 0 ||
+			order.feeObservation?.completeness === "complete" ||
+			this.exchange.has.fetchOrderTrades !== true ||
+			(this.id !== "okx" && !(this.id === "binance" && this.marketType === "spot"))
+		)
+			return order;
+		try {
+			// The installed Binance implementation supports Spot only. One bounded,
+			// order-scoped page is useful only if its fills fully reconcile the order.
+			const trades = await boundedLookup(
+				() => this.exchange.fetchOrderTrades(order.id, order.symbol, undefined, 1000, { paginate: false }),
+				500,
+			);
+			if (
+				!Array.isArray(trades) ||
+				trades.length === 0 ||
+				trades.length > 1000 ||
+				trades.some(
+					(trade) =>
+						trade.order !== order.id ||
+						trade.symbol !== order.symbol ||
+						trade.side !== order.side ||
+						typeof trade.id !== "string" ||
+						trade.id.length === 0,
+				)
+			)
+				return order;
+			const enriched = this.toDomainOrder({ ...raw, trades });
+			return enriched.feeObservation ? enriched : order;
+		} catch {
+			// Fee lookup failure must neither erase fills nor claim a zero charge.
+			console.error("[execution-fees] Fee lookup failed; fills are preserved but fee completeness remains unknown.");
+			return order;
+		}
 	}
 
 	private async refreshIncompleteFill(order: Order, symbol: string): Promise<Order> {
@@ -133,6 +164,16 @@ export class CcxtExchangeClient implements ExchangeClient {
 	private async ensureMarketsLoaded(): Promise<void> {
 		if (this.marketsLoaded) return;
 		await this.exchange.loadMarkets();
+		this.marketsLoaded = true;
+	}
+
+	/**
+	 * Reload exchange markets metadata. The first market operation caches the
+	 * markets snapshot for the process lifetime; long-running processes call
+	 * this to pick up newly listed symbols or changed filters.
+	 */
+	async reloadMarkets(): Promise<void> {
+		await this.exchange.loadMarkets(true);
 		this.marketsLoaded = true;
 	}
 
@@ -361,7 +402,7 @@ export class CcxtExchangeClient implements ExchangeClient {
 			const positions = await this.exchange.fetchPositions();
 			return positions.flatMap((p) => {
 				if (typeof p.symbol !== "string") return [];
-				const market = this.exchange.markets[p.symbol];
+				const market = requireCcxtMarkets(this.exchange)[p.symbol];
 				// fetchPositions() may return every derivative family even when the
 				// exchange client is configured for USDⓈ-M. Keep only the configured
 				// quote/settle linear swaps; in particular, never mix USDC-M or
@@ -525,13 +566,13 @@ export class CcxtExchangeClient implements ExchangeClient {
 		else await this.ensureMarketsLoaded();
 		const orders = await this.exchange.fetchOpenOrders(symbol);
 		for (const o of orders) {
-			this.knownSymbols.add(o.symbol);
+			this.knownSymbols.add(requireCcxtString(o.symbol, "order symbol"));
 			merged.set(orderKey(o), this.toDomainOrder(o));
 		}
 		for (const params of this.venue.extraOrderListParams(this.marketType).open) {
 			const algoOrders = await this.exchange.fetchOpenOrders(symbol, undefined, undefined, params);
 			for (const o of algoOrders) {
-				this.knownSymbols.add(o.symbol);
+				this.knownSymbols.add(requireCcxtString(o.symbol, "order symbol"));
 				const key = orderKey(o);
 				if (!merged.has(key)) merged.set(key, this.toDomainOrder(o));
 			}
@@ -592,7 +633,9 @@ export class CcxtExchangeClient implements ExchangeClient {
 
 	async getOrder(id: string, symbol: string): Promise<Order> {
 		await this.ensureMarket(symbol);
-		return this.toDomainOrder(await this.venue.fetchParsedOrder(this.exchange, id, symbol, this.marketType));
+		const raw = await this.venue.fetchParsedOrder(this.exchange, id, symbol, this.marketType);
+		if (raw.id !== id || raw.symbol !== symbol) return this.toDomainOrder(raw);
+		return this.toDomainOrderWithFees(raw);
 	}
 
 	async getOrderByClientId(clientOrderId: string, symbol: string, conditional?: boolean): Promise<Order> {
@@ -621,7 +664,7 @@ export class CcxtExchangeClient implements ExchangeClient {
 				`Emulated client id lookup on ${this.id} did not prove clientOrderId=${clientOrderId}; refusing to trust an uncorrelated order`,
 			);
 		}
-		return { ...normalized, clientOrderId };
+		return { ...(await this.toDomainOrderWithFees(raw)), clientOrderId };
 	}
 
 	async getOrderListByClientId(listClientOrderId: string): Promise<OrderList> {
@@ -873,7 +916,7 @@ export class CcxtExchangeClient implements ExchangeClient {
 				responseReceived = true;
 				return { order };
 			} catch (error) {
-				if (!responseReceived && !isUncertainSubmission(error) && definiteSubmissionRejection(error))
+				if (!responseReceived && isDefiniteSubmissionRejection(error))
 					throw new SubmissionRejectedError(normalizeExchangeError(error, "Trailing order submission").message);
 				try {
 					return {
@@ -930,12 +973,12 @@ export class CcxtExchangeClient implements ExchangeClient {
 				params,
 			);
 			responseReceived = true;
-			const mapped = this.toDomainOrder(order);
+			const mapped = await this.toDomainOrderWithFees(order);
 			if (mapped.clientOrderId !== undefined && mapped.clientOrderId !== clientOrderId)
 				throw new Error("Order response returned a conflicting client identity");
 			return { order: await this.refreshIncompleteFill({ ...mapped, clientOrderId }, input.symbol) };
 		} catch (error) {
-			if (!responseReceived && !isUncertainSubmission(error) && definiteSubmissionRejection(error))
+			if (!responseReceived && isDefiniteSubmissionRejection(error))
 				throw new SubmissionRejectedError(normalizeExchangeError(error, "Order submission").message);
 			try {
 				return {
@@ -1035,12 +1078,12 @@ export class CcxtExchangeClient implements ExchangeClient {
 				clientOrderId: listClientOrderId,
 			});
 			accepted = true;
-			const mapped = this.toDomainOrder(order);
+			const mapped = await this.toDomainOrderWithFees(order);
 			if (mapped.clientOrderId !== undefined && mapped.clientOrderId !== listClientOrderId)
 				throw new Error("OCO response returned a conflicting client identity");
 			return { orders: [{ ...mapped, clientOrderId: listClientOrderId }] };
 		} catch (error) {
-			if (accepted || isUncertainSubmission(error) || !definiteSubmissionRejection(error)) {
+			if (accepted || !isDefiniteSubmissionRejection(error)) {
 				try {
 					return await this.recoverOcoSubmission(listClientOrderId, input.symbol);
 				} catch (lookupError) {
@@ -1099,7 +1142,7 @@ export class CcxtExchangeClient implements ExchangeClient {
 		const suffix =
 			this.marketType === "usdm-futures" ? `/${this.quoteCurrency}:${this.quoteCurrency}` : `/${this.quoteCurrency}`;
 		return Object.values(tickers)
-			.filter((t) => t.symbol.endsWith(suffix))
+			.filter((t) => typeof t.symbol === "string" && t.symbol.endsWith(suffix))
 			.sort((a, b) => (b.quoteVolume ?? 0) - (a.quoteVolume ?? 0))
 			.slice(0, limit)
 			.map(toTicker);
@@ -1215,7 +1258,7 @@ export class CcxtExchangeClient implements ExchangeClient {
 
 	private async ensureMarket(symbol: string) {
 		await this.ensureMarketsLoaded();
-		const market = this.exchange.markets[symbol];
+		const market = requireCcxtMarkets(this.exchange)[symbol];
 		const validMarket =
 			this.marketType === "usdm-futures"
 				? market?.swap === true &&

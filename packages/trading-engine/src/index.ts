@@ -8,6 +8,8 @@ export {
 	appendTradingAuditEvent,
 	assessAccountRisk,
 	assessExecutionPrice,
+	assessLeverageSetting,
+	assessProtectionTarget,
 	isRiskNewExposurePause,
 	isTradingAuditState,
 	type RiskClock,
@@ -32,7 +34,13 @@ export {
 	validateAccountRiskStates,
 	validateTradingSymbol,
 } from "@nikopack/ti-trading-risk";
-export { AccountRiskError, accountRiskFacts, accountRiskKey, verifiedReducingOrder } from "./account-risk.ts";
+export {
+	AccountRiskError,
+	accountRiskFacts,
+	accountRiskKey,
+	isProtectiveExit,
+	verifiedReducingOrder,
+} from "./account-risk.ts";
 export * from "./capabilities.ts";
 export { CcxtExchangeClient } from "./ccxt-client.ts";
 export type { ExchangeCredentials, FuturesMarginType, FuturesPositionMode, MarketType } from "./client-types.ts";
@@ -52,6 +60,7 @@ export {
 	type ExecutionMaintenance,
 	type ExecutionRecord,
 	ExecutionRecoveryError,
+	type ExecutionReference,
 	type ExecutionRiskState,
 	type ExecutionScope,
 	type ExecutionStatus,
@@ -59,10 +68,13 @@ export {
 	isExecutionJournalState,
 	isUnresolvedExecution,
 	MAX_RECOVERY_ATTEMPTS,
+	observedExecutionFee,
+	REFERENCED_EXECUTION_LIMIT,
 	UNRESOLVED_EXECUTION_LIMIT,
 	validateExecutionRiskState,
 } from "./execution-journal.ts";
 export type { ManualExecutionResolution, RecoveryOptions, RecoveryReport } from "./execution-recovery.ts";
+export { boundedLookup } from "./execution-recovery.ts";
 export type {
 	OcoIntent,
 	OrderIntent,
@@ -73,9 +85,7 @@ export type {
 	ReferencePriceSource,
 } from "./order-plan.ts";
 export {
-	countsTowardsDailyLimit,
 	futuresAmountStep,
-	futuresContractLotStep,
 	isBinanceCloseAllTrigger,
 	isFuturesSymbol,
 	OrderPreparationError,
@@ -120,6 +130,7 @@ export type {
 	Order,
 	OrderBook,
 	OrderBookLevel,
+	OrderFeeObservation,
 	OrderList,
 	OrderSide,
 	OrderStatus,
@@ -134,6 +145,7 @@ export type {
 } from "./types.ts";
 export {
 	createMarketDataView,
+	isOrderFeeObservation,
 	isSubmissionStatusUnknownError,
 	SubmissionRejectedError,
 	SubmissionStatusUnknownError,

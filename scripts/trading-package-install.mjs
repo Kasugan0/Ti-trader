@@ -81,6 +81,8 @@ export function evaluateInstallChecks(observation) {
 		paperDefault: observation.mode === "paper" && observation.restartMode === "paper",
 		recoveryAfterRestart:
 			text(observation.pauseId) && observation.pauseId === observation.restartPauseId && observation.restartReason === "package-install-probe",
+		continuityAfterRestart: observation.continuityAfterRestart === true,
+		evidenceTools: observation.evidenceTools === true,
 	};
 	return { passed: Object.values(checks).every((value) => value === true), checks };
 }
@@ -106,22 +108,166 @@ function run(command, args, options) {
 	return result;
 }
 
-function writeProbe(path) {
+export function writeInstallProbe(path) {
 	writeFileSync(
 		path,
-		`import { existsSync } from "node:fs";
+		`import assert from "node:assert/strict";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { initTrading } from "ti-trader";
+import {
+	createDecisionEvidenceExtension, createPlanExtension, initTrading, PlanStore, planIndex, reviewPlan,
+} from "ti-trader";
+
+function registration() {
+	const tools = new Map();
+	const commands = new Map();
+	const events = new Map();
+	const renderers = new Map();
+	return {
+		tools, commands, events, renderers,
+		api: {
+			registerTool(tool) {
+				assert.equal(tools.has(tool.name), false, "duplicate tool");
+				assert.equal(typeof tool.execute, "function");
+				assert.equal(typeof tool.parameters, "object");
+				tools.set(tool.name, tool);
+			},
+			registerCommand(name, command) {
+				assert.equal(commands.has(name), false, "duplicate command");
+				assert.equal(typeof command.handler, "function");
+				commands.set(name, command);
+			},
+			registerEntryRenderer(name, renderer) {
+				assert.equal(renderers.has(name), false, "duplicate renderer");
+				assert.equal(typeof renderer, "function");
+				renderers.set(name, renderer);
+			},
+			on(name, handler) {
+				assert.equal(typeof handler, "function");
+				const handlers = events.get(name) ?? [];
+				handlers.push(handler);
+				events.set(name, handlers);
+			},
+		},
+	};
+}
+
 const action = process.argv[2];
+if (action !== "pause" && action !== "verify") throw new Error("probe action must be pause or verify");
 const dataDir = process.env.TI_DATA_DIR;
 const trading = await initTrading();
 try {
+	assert.equal(trading.mode, "paper", "install probe must remain in Paper mode");
+	const scope = trading.tradingEngine.getExecutionScope();
+	assert.equal(scope.mode, "paper");
+	const store = new PlanStore(join(dataDir, "agent"));
+	const plans = registration();
+	const decisions = registration();
+	await createPlanExtension(() => trading, store)(plans.api);
+	await createDecisionEvidenceExtension(() => trading)(decisions.api);
+	assert.deepEqual([...plans.tools.keys()].sort(), [
+		"append_plan_note", "create_plan", "get_plan_review", "list_plans", "read_plan", "revise_plan",
+	]);
+	assert.deepEqual([...decisions.tools.keys()].sort(), ["get_decision_evaluation", "record_decision"]);
+	assert.deepEqual([...plans.commands.keys()], ["plan"]);
+	assert.deepEqual([...decisions.commands.keys()], ["decisions"]);
+	assert.deepEqual([...plans.renderers.keys()], ["trading:plan"]);
+	for (const name of ["before_agent_start", "session_start", "session_shutdown"])
+		assert.equal(plans.events.get(name)?.length, 1, "missing plan lifecycle hook: " + name);
+	for (const name of ["before_agent_start", "tool_call", "tool_result", "agent_end", "session_shutdown"])
+		assert.equal(decisions.events.get(name)?.length, 1, "missing decision evidence hook: " + name);
+
+	let continuity;
+	if (action === "pause") {
+		assert.equal(store.list(scope).length, 0, "probe requires fresh isolated plan storage");
+		const now = Date.now();
+		const content = {
+			symbol: "BTC/" + scope.quoteCurrency,
+			timeframe: "1h",
+			direction: "observe",
+			thesis: "Original install-probe rationale; research only, never order authorization.",
+			entry: [{ fact: "price", operator: "gt", value: 100 }],
+			invalidation: [{ fact: "price", operator: "lt", value: 80 }],
+			expiresAt: new Date(now + 86400000).toISOString(),
+			reviewAt: new Date(now + 3600000).toISOString(),
+			risk: "Offline continuity probe; no orders or market observations.",
+			evidence: [{ source: "package-install-probe", observedAt: new Date(now).toISOString(),
+				summary: "Synthetic research, not observed market evidence." }],
+		};
+		const created = store.create(scope, content);
+		assert.equal(created.status, "draft");
+		assert.equal(created.activeVersion, null);
+		assert.equal(created.versions.length, 1);
+		assert.deepEqual(created.versions[0].content, content);
+		const originalVersion = structuredClone(created.versions[0]);
+		const activated = store.activate(created.id, scope, created.revision);
+		assert.equal(activated.status, "tracking");
+		assert.equal(activated.activeVersion, 1);
+		const revisedContent = { ...content, thesis: "Revised install-probe rationale; unapproved v2 research." };
+		const revised = store.revise(created.id, scope, activated.revision, revisedContent);
+		assert.deepEqual(revised.versions[0], originalVersion, "revision rewrote the original rationale");
+		assert.equal(revised.versions.length, 2);
+		assert.deepEqual(revised.versions[1].content, revisedContent);
+		assert.equal(revised.activeVersion, 1, "revision silently activated the new draft");
+		assert.equal(revised.status, "tracking");
+		const note = "Install-probe research note; not a fill, account fact or trading permission.";
+		store.note(created.id, scope, note);
+		const saved = store.read(created.id, scope);
+		assert.equal(saved.notes.length, 1);
+		assert.equal(saved.notes[0].text, note);
+		assert.equal(saved.notes[0].author, "model");
+		assert.deepEqual(saved.versions, revised.versions);
+		assert.equal(saved.activeVersion, 1);
+		assert.equal(saved.status, "tracking");
+		assert.deepEqual(saved.intents, []);
+		assert.deepEqual(saved.executions, []);
+		// Enough real stored drafts to exercise truncation, not just a short one-plan index.
+		for (let index = 1; index < 32; index++)
+			store.create(scope, { ...content, thesis: "Install-probe index capacity draft " + index });
+		continuity = { pid: process.pid, plan: saved, planIds: store.list(scope).map((plan) => plan.id) };
+	} else {
+		continuity = JSON.parse(readFileSync(0, "utf8"));
+		assert.notEqual(continuity.pid, process.pid, "continuity must be checked in a second process");
+		assert.deepEqual(continuity.plan.scope, scope, "execution scope changed across restart");
+		const reopened = store.read(continuity.plan.id, scope);
+		assert.deepEqual(reopened, continuity.plan, "saved plan evidence changed across restart");
+		assert.deepEqual(store.list(scope).map((plan) => plan.id), continuity.planIds);
+		assert.equal(reopened.activeVersion, 1, "restart activated the unapproved draft");
+		assert.equal(reopened.versions.length, 2);
+		assert.equal(reopened.status, "tracking");
+	}
+	const saved = store.read(continuity.plan.id, scope);
+	assert.deepEqual(saved.intents, []);
+	assert.deepEqual(saved.executions, []);
+	const review = reviewPlan(saved);
+	assert.equal(review.result.status, "insufficient_evidence", "no fills cannot establish a trading result");
+	assert.equal(review.result.netQuoteCashFlow, null);
+	assert.ok(review.result.gaps.some((gap) => /no attributed fills/i.test(gap)));
+	assert.deepEqual(review.versions, saved.versions);
+	assert.deepEqual(review.notes, saved.notes);
+	const index = planIndex(store, scope);
+	assert.ok(Buffer.byteLength(index, "utf8") <= 4096, "startup index exceeds 4 KiB");
+	assert.match(index, /non-authoritative research/i);
+	assert.match(index, /recheck current account facts/i);
+	assert.match(index, /read_plan/);
+	assert.match(index, /More plans omitted; call list_plans\\./);
+	assert.ok(index.includes(saved.id + " v1 tracking"));
+	assert.match(index, /draft=v2/);
+	assert.equal(index.includes(saved.versions[0].content.thesis), false, "index leaked full research");
+	assert.equal(index.includes(saved.notes[0].text), false, "index leaked research notes");
+	// Only the plan's read-only context hook runs; no monitor or decision/model lifecycle starts.
+	const startup = await plans.events.get("before_agent_start")[0]();
+	assert.equal(startup.message.customType, "trade-plan-context");
+	assert.equal(startup.message.display, false);
+	assert.equal(startup.message.content, index);
 	const pause = action === "pause"
 		? trading.tradingEngine.risk.pauseNewExposure("package-install-probe")
 		: trading.tradingEngine.risk.usage().newExposurePause;
-	if (action !== "pause" && action !== "verify") throw new Error("probe action must be pause or verify");
 	console.log(JSON.stringify({
+		continuity,
+		continuityAfterRestart: action === "verify",
+		evidenceTools: true,
 		mode: trading.mode,
 		exchange: trading.config.exchange,
 		quoteCurrency: trading.config.quoteCurrency,
@@ -138,10 +284,11 @@ try {
 	);
 }
 
-function probeTrading(installDir, dataDir, env, action) {
+function probeTrading(installDir, dataDir, env, action, continuity) {
 	const result = run(process.execPath, [join(installDir, "probe.mjs"), action], {
 		cwd: installDir,
 		env: { ...env, TI_DATA_DIR: dataDir },
+		input: continuity === undefined ? undefined : JSON.stringify(continuity),
 		timeout: 120_000,
 	});
 	const parsed = JSON.parse(result.stdout.trim());
@@ -164,8 +311,10 @@ function main(args) {
 	const revision = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).trim();
 	const versions = candidateVersions(repo);
 	const ownedWorkdir = workdirIndex === -1;
-	const workdir = resolve(workdirIndex === -1 ? mkdtempSync(join(tmpdir(), "ti-package-install-")) : args[workdirIndex + 1]);
-	mkdirSync(workdir, { recursive: true });
+	const requestedWorkdir = resolve(workdirIndex === -1 ? mkdtempSync(join(tmpdir(), "ti-package-install-")) : args[workdirIndex + 1]);
+	mkdirSync(requestedWorkdir, { recursive: true });
+	// Private plan storage rejects symlink ancestors, including macOS's /var temporary-directory alias.
+	const workdir = realpathSync(requestedWorkdir);
 	assertOutsideRepository(workdir, repo);
 	const tarballDir = resolve(tarballIndex === -1 ? join(workdir, "tarballs") : args[tarballIndex + 1]);
 	const installDir = join(workdir, "install");
@@ -193,6 +342,8 @@ function main(args) {
 			isolatedDataDir: false,
 			paperDefault: false,
 			recoveryAfterRestart: false,
+			continuityAfterRestart: false,
+			evidenceTools: false,
 		},
 		passed: false,
 	};
@@ -233,9 +384,9 @@ function main(args) {
 			env: { ...env, TI_DATA_DIR: dataDir },
 			timeout: 30_000,
 		});
-		writeProbe(join(installDir, "probe.mjs"));
+		writeInstallProbe(join(installDir, "probe.mjs"));
 		const first = probeTrading(installDir, dataDir, env, "pause");
-		const second = probeTrading(installDir, dataDir, env, "verify");
+		const second = probeTrading(installDir, dataDir, env, "verify", first.continuity);
 		const homeLeak = first.homeLeak === true || second.homeLeak === true || existsSync(join(env.HOME, ".ti-trader"));
 		const observation = {
 			versions,
@@ -248,6 +399,8 @@ function main(args) {
 			pauseId: first.pauseId,
 			restartPauseId: second.pauseId,
 			restartReason: second.reason,
+			continuityAfterRestart: second.continuityAfterRestart === true,
+			evidenceTools: first.evidenceTools === true && second.evidenceTools === true,
 		};
 		const evaluated = evaluateInstallChecks(observation);
 		report.checks = evaluated.checks;

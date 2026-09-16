@@ -228,6 +228,7 @@ export function toOrder(o: PaperOrder): Order {
 		remaining: o.amount - o.filled,
 		average: o.average,
 		cost: o.cost,
+		...(o.feeObservation ? { feeObservation: structuredClone(o.feeObservation) } : {}),
 		status: o.status,
 		timestamp: o.timestamp,
 	};

@@ -4,6 +4,8 @@
 
 The ledger is independent of exchange adapters, persistence formats, prompts, and UI. Applications supply a `RiskConfig` (mode, market type, quote currency, and limits), a state store with an atomic `transact()`, and optionally a `RiskClock`; the ledger enforces quotas and settles reservations exactly once. Position mode and other engine identity belong to the caller.
 
+`RiskLimits.account` is optional. When present it is a complete `AccountRiskLimits` object: gross/net/asset exposure, leverage, margin usage, data age, price deviation, depth, liquidation distance, protection coverage, stop distance, and `cancelEntriesOnBreach` / `reduceOnBreach`. The package evaluates those facts (`assessAccountRisk`) and persists hard-loss trips; the engine supplies account snapshots, performs the same rules at preview and final admission, and owns mutations. Opening-flow limits (`maxOrderNotional`, `maxDailyNotional`, `allowedSymbols`) remain separate from current exposure.
+
 ## Behavior
 
 - `check(symbol, notional)` validates an order against `maxOrderNotional`, `maxDailyNotional` (used plus reserved), the quote currency, and `allowedSymbols` without mutating state.

@@ -132,6 +132,8 @@ Options:
 Trading commands (interactive mode):
   /autonomous  Background Paper runtime: start|status|pause|resume|stop
   /settings    Trading settings (language, mode, approval, exchange, market, keys, risk, paper, monitor)
+  /plan        Saved research: list|show|track|archive|review|export|delete (tracking never places orders)
+  /decisions   Public decision evidence: show|evaluate|export|delete (not a profitability score)
   /balance     Account balances with valuation
   /positions   Holdings with entry price and PnL
   /orders      Open orders

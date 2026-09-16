@@ -8,12 +8,16 @@ The plan prioritizes recoverable execution and clear operator controls over more
 
 | Milestone | Priority | Depends on | Deliverable | Status |
 | --- | --- | --- | --- | --- |
-| M1: Persistent entry pause | P0 | Existing atomic risk store | Durable pause, final admission check, explicit resume | Implemented in working tree; not released |
-| M2: Execution journal | P0 | M1 | Correlated, durable order intent and outcome records | Implemented in working tree; not released |
-| M3: Restart reconciliation | P0 | M2 | Recover unresolved executions without resubmitting | Implemented in working tree; not released |
-| M4: Supported capability matrix | P0 | Can run alongside M2; evidence required by M3 | One executable source of truth for supported combinations | Implemented; evidence is offline-only |
-| M5: Durable monitoring and audit | P1 | M3 | Restart-aware monitoring, event history and health reporting | Implemented; bounded delivery and recovery behavior documented |
-| M6: Operational release gates | P1 | M3, M4, M5 | Recovery procedures, release evidence and controlled rollout | Install and soak collectors implemented; seven-day Paper evidence still pending |
+| M1: Persistent entry pause | P0 | Existing atomic risk store | Durable pause, final admission check, explicit resume | Released in 0.1.9 |
+| M2: Execution journal | P0 | M1 | Correlated, durable order intent and outcome records | Released in 0.1.9 / engine 0.2.0 |
+| M3: Restart reconciliation | P0 | M2 | Recover unresolved executions without resubmitting | Released in 0.1.9 |
+| M4: Supported capability matrix | P0 | Can run alongside M2; evidence required by M3 | One executable source of truth for supported combinations | Released; evidence is still offline-only |
+| M5: Durable monitoring and audit | P1 | M3 | Restart-aware monitoring, event history and health reporting | Released in 0.1.9; bounded delivery documented |
+| M6: Operational release gates | P1 | M3, M4, M5 | Recovery procedures, release evidence and controlled rollout | Collectors shipped; seven-day Paper soak and live pilot evidence still pending |
+| M7: Account-wide hard risk | P0 for autonomous | M3 | Exposure/loss/protection limits, supervision, latched loss trips | Implemented in working tree; not released |
+| M8: Autonomous Paper runtime | P1 | M7 | Headless Paper daemon with model-controlled wakes; live startup fail-closed | Implemented in working tree; not released |
+
+Completing M1–M6 does not authorize unattended live trading. M7–M8 are Paper-only until live adapters supply complete account-risk evidence.
 
 P0 work is required before expanding live use. P1 work is required before presenting the assistant as operationally mature. Completing M1 alone does not establish either claim.
 
@@ -133,4 +137,12 @@ Operator procedures are in the [operations runbook](trading-operations.md). The 
 
 ## Delivery policy
 
-Each milestone ships as reviewable source, focused offline regressions, operator/API documentation and an unreleased changelog entry. Do not claim automated recovery while M2-M3 remain pending, or mature unattended operation after completing only the human-confirmed assistant milestones. Commits, publication and use of real funds require explicit authorization.
+Each milestone ships as reviewable source, focused offline regressions, operator/API documentation and a changelog entry. Do not claim mature unattended live operation after completing the human-confirmed assistant milestones or Paper-only autonomous work. Seven-day Paper soak evidence and a maintainer-approved live pilot remain open. Commits, publication and use of real funds require explicit authorization.
+
+## M7: Account-wide hard risk
+
+Implemented in `@nikopack/ti-trading-risk` (`AccountRiskLimits`, `assessAccountRisk`) and the engine supervisor. Optional `risk.account` is required for autonomous Paper. Live cancellation without these limits refuses to strip a protective stop. Hard-loss trips latch across days and restarts; there is no model tool that clears them.
+
+## M8: Autonomous Paper runtime
+
+Implemented as an explicit headless Paper daemon (`ti --autonomous`, TUI `/autonomous`). The model chooses research, instruments, trades and the next wake. Autonomous live startup is rejected until adapters provide complete external-flow, fee and funding evidence. Operator procedure: [autonomous-trading.md](autonomous-trading.md). This is not a profitability or production-readiness claim.

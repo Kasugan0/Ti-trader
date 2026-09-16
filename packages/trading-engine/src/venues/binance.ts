@@ -7,7 +7,13 @@ import {
 	createBinanceSpotOco,
 	createBinanceSpotTrailingOrder,
 } from "../ccxt-binance-spot.ts";
-import { finiteNumber, isOrderNotFound, validateBinanceClientOrderId } from "../ccxt-map.ts";
+import {
+	finiteNumber,
+	isOrderNotFound,
+	requireCcxtMarket,
+	requireCcxtString,
+	validateBinanceClientOrderId,
+} from "../ccxt-map.ts";
 import type { MarketType } from "../client-types.ts";
 import { contractSizeForMarket } from "../contract-size.ts";
 import type { OrderSide, PlaceOrderType } from "../types.ts";
@@ -64,7 +70,7 @@ function privateEndpoint(
 }
 
 function parseMarketOrder(exchange: Exchange, raw: unknown, symbol: string): CcxtOrder {
-	return exchange.parseOrder(raw as Record<string, unknown>, exchange.markets[symbol]);
+	return exchange.parseOrder(raw as Record<string, unknown>, requireCcxtMarket(exchange, symbol));
 }
 
 function binanceWireMapping(input: VenueWireContext): VenueWireMapping {
@@ -95,7 +101,7 @@ async function fetchBinanceParsedOrder(
 			"privateGetOrder",
 			"Binance ccxt adapter does not expose the Spot order query endpoint",
 		)({
-			symbol: exchange.markets[symbol].id,
+			symbol: requireCcxtString(requireCcxtMarket(exchange, symbol).id, `market id for ${symbol}`),
 			orderId: id,
 		});
 		return parseMarketOrder(exchange, raw, symbol);
@@ -126,7 +132,7 @@ async function fetchBinanceParsedOrderByClientId(
 			endpointName,
 			label,
 		)({
-			symbol: exchange.markets[request.symbol].id,
+			symbol: requireCcxtString(requireCcxtMarket(exchange, request.symbol).id, `market id for ${request.symbol}`),
 			...(isFutures
 				? isConditional
 					? { clientAlgoId: request.clientOrderId }
@@ -152,7 +158,7 @@ function exposureRecord(value: unknown): Record<string, unknown> | undefined {
 
 function matchingSpotMarket(exchange: Exchange, quoteCurrency: string, symbol: unknown): boolean | undefined {
 	if (typeof symbol !== "string") return undefined;
-	const market = exchange.markets[symbol] as ExposureMarket | undefined;
+	const market = exchange.markets?.[symbol] as ExposureMarket | undefined;
 	if (!market) return undefined;
 	if (market.spot !== true || typeof market.quote !== "string") return undefined;
 	return market.quote === quoteCurrency;
@@ -160,7 +166,7 @@ function matchingSpotMarket(exchange: Exchange, quoteCurrency: string, symbol: u
 
 function matchingLinearFuturesMarket(exchange: Exchange, quoteCurrency: string, symbol: unknown): boolean | undefined {
 	if (typeof symbol !== "string") return undefined;
-	const market = exchange.markets[symbol] as ExposureMarket | undefined;
+	const market = exchange.markets?.[symbol] as ExposureMarket | undefined;
 	if (!market) return undefined;
 	if (
 		market.contract !== true ||
@@ -327,7 +333,7 @@ export const BINANCE_LIVE_VENUE: LiveVenueProfile = {
 		if (typeof endpoint !== "function")
 			throw new Error("Binance ccxt adapter does not expose a Spot order-list cancellation endpoint");
 		await (endpoint as (params: Record<string, string>) => Promise<unknown>).call(exchange, {
-			symbol: exchange.markets[symbol].id,
+			symbol: requireCcxtString(requireCcxtMarket(exchange, symbol).id, `market id for ${symbol}`),
 			orderListId,
 		});
 	},

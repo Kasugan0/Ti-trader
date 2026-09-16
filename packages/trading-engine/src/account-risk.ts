@@ -15,7 +15,7 @@ import {
 } from "@nikopack/ti-trading-risk";
 import type { ExecutionScope } from "./execution-journal.ts";
 import { boundedLookup } from "./execution-recovery.ts";
-import { reduceSide } from "./protection.ts";
+import { hasStopComponent, reduceSide } from "./protection.ts";
 import type { AccountSnapshot, ExchangeClient, Order, PlaceOrderInput, Position } from "./types.ts";
 
 export class AccountRiskError extends Error {
@@ -28,10 +28,23 @@ export function accountRiskKey(scope: ExecutionScope): string {
 		.digest("hex");
 }
 
+/**
+ * A stop-flavored order that reduces an open position. Removing such an order
+ * can strip protection, so live cancellations without account hard risk must
+ * refuse to touch it.
+ */
+export function isProtectiveExit(
+	order: Pick<Order, "symbol" | "side" | "type" | "reduceOnly" | "closePosition" | "positionSide">,
+	position: Position,
+	scope: Pick<ExecutionScope, "positionMode">,
+): boolean {
+	return verifiedReducingOrder(order, position, scope) && hasStopComponent(order);
+}
+
 export function verifiedReducingOrder(
 	order: Pick<Order, "symbol" | "side" | "reduceOnly" | "closePosition" | "positionSide">,
 	position: Position,
-	scope: ExecutionScope,
+	scope: Pick<ExecutionScope, "positionMode">,
 ): boolean {
 	return (
 		order.symbol === position.symbol &&
@@ -42,6 +55,20 @@ export function verifiedReducingOrder(
 	);
 }
 
+function protectiveStopDistancePct(order: Order, mark: number, reduce: "buy" | "sell"): number | undefined {
+	if (Number.isFinite(order.stopPrice) && order.stopPrice! > 0) {
+		if (reduce === "sell" ? order.stopPrice! >= mark : order.stopPrice! <= mark) return undefined;
+		return Math.abs(order.stopPrice! / mark - 1) * 100;
+	}
+	if (order.type === "trailing_stop_market" && Number.isFinite(order.trailingPercent) && order.trailingPercent! > 0)
+		return order.trailingPercent;
+	return undefined;
+}
+
+function exposureIdentity(exposure: { symbol: string; pending: boolean; notional: number }): string {
+	return `${exposure.symbol}:${exposure.pending ? "pending" : "open"}:${Math.sign(exposure.notional)}`;
+}
+
 export function accountRiskFacts(snapshot: AccountSnapshot, scope: ExecutionScope): AccountRiskFacts {
 	const exposures: AccountRiskFacts["exposures"] = [];
 	for (const position of snapshot.positions) {
@@ -49,13 +76,13 @@ export function accountRiskFacts(snapshot: AccountSnapshot, scope: ExecutionScop
 		if (!Number.isFinite(mark) || mark! <= 0 || !Number.isFinite(position.amount))
 			throw new Error(`Position mark/amount unavailable: ${position.symbol}`);
 		const amount = Math.abs(position.amount);
+		const reduce = reduceSide(position);
 		const stops = snapshot.orders.filter(
 			(order) =>
 				order.status === "open" &&
-				order.type === "stop_market" &&
+				hasStopComponent(order) &&
 				verifiedReducingOrder(order, position, scope) &&
-				Number.isFinite(order.stopPrice) &&
-				(reduceSide(position) === "sell" ? order.stopPrice! < mark! : order.stopPrice! > mark!),
+				protectiveStopDistancePct(order, mark!, reduce) !== undefined,
 		);
 		const groups = new Set<string>();
 		let covered = 0;
@@ -65,7 +92,7 @@ export function accountRiskFacts(snapshot: AccountSnapshot, scope: ExecutionScop
 			if (groups.has(group)) continue;
 			groups.add(group);
 			covered += order.closePosition ? amount : Math.max(0, order.remaining);
-			stopDistancePct = Math.max(stopDistancePct ?? 0, Math.abs(order.stopPrice! / mark! - 1) * 100);
+			stopDistancePct = Math.max(stopDistancePct ?? 0, protectiveStopDistancePct(order, mark!, reduce)!);
 		}
 		const futures = position.symbol.includes(":");
 		exposures.push({
@@ -409,11 +436,13 @@ export class AccountRiskGuard {
 		if (after.reasons.some((reason) => reason.startsWith("protection:") && !before.reasons.includes(reason))) {
 			throw new Error("Cancellation would remove required protection; retain it or use a controlled close");
 		}
-		// Also reject weakening already-partial coverage.
+		const previousCoverage = new Map(
+			oldCoverage.map((exposure) => [exposureIdentity(exposure), exposure.protectionCoveragePct]),
+		);
 		const newCoverage = accountRiskFacts(snapshot, this.scope).exposures;
 		if (
 			newCoverage.some(
-				(exposure, index) => exposure.protectionCoveragePct < (oldCoverage[index]?.protectionCoveragePct ?? 0),
+				(exposure) => exposure.protectionCoveragePct < (previousCoverage.get(exposureIdentity(exposure)) ?? 0),
 			)
 		) {
 			throw new Error("Cancellation would weaken protection");

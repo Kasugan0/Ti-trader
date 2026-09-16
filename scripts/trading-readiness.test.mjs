@@ -20,13 +20,16 @@ test("does not inherit credentials, provider endpoints, home paths or Node start
 
 test("runs explicit offline test selectors rather than a full provider/e2e suite", () => {
 	const commands = readinessCommands("/repo", "linux");
-	assert.deepEqual(commands.map((command) => command.name), ["repository-check", "risk", "engine", "agent", "release-gate"]);
+	assert.deepEqual(commands.map((command) => command.name), [
+		"repository-check", "risk", "engine", "triggers", "agent", "release-gate",
+	]);
 	assert.deepEqual(commands[0].args, ["run", "check"]);
+	assert.equal(commands.find((command) => command.name === "triggers")?.cwd, "/repo/packages/triggers");
 	for (const files of Object.values(READINESS_TESTS)) {
 		assert.ok(files.length > 0);
 		assert.ok(files.every((file) => file.endsWith(".test.ts") && !file.includes("*") && !file.includes("e2e")));
 	}
-	for (const command of commands.slice(1, 4)) {
+	for (const command of commands.slice(1, 5)) {
 		assert.equal(command.args[1], "--run");
 		assert.ok(command.args.length > 2);
 	}
@@ -35,6 +38,15 @@ test("runs explicit offline test selectors rather than a full provider/e2e suite
 	assert.ok(READINESS_TESTS.agent.includes("src/__tests__/execution-runtime.test.ts"));
 	assert.ok(READINESS_TESTS.agent.includes("src/__tests__/paper-reset-durability.test.ts"));
 	assert.ok(READINESS_TESTS.agent.includes("src/__tests__/health.test.ts"));
+	assert.ok(READINESS_TESTS.agent.includes("src/plans/plans.test.ts"));
+	assert.ok(READINESS_TESTS.agent.includes("src/plans/monitoring.test.ts"));
+	assert.ok(READINESS_TESTS.agent.includes("src/plans/recovery.test.ts"));
+	assert.ok(READINESS_TESTS.agent.includes("src/plans/runtime.test.ts"));
+	assert.ok(READINESS_TESTS.agent.includes("src/decisions/evidence.test.ts"));
+	assert.ok(READINESS_TESTS.agent.includes("src/decisions/study.test.ts"));
+	assert.ok(READINESS_TESTS.engine.includes("src/ccxt-fees.test.ts"));
+	assert.ok(READINESS_TESTS.engine.includes("src/paper-fees.test.ts"));
+	assert.ok(READINESS_TESTS.agent.includes("src/__tests__/plan-tools.test.ts"));
 	assert.ok(READINESS_TESTS.agent.includes("src/__tests__/published-coding-agent-api.test.ts"));
 	assert.ok(READINESS_TESTS.agent.includes("src/__tests__/project-trust.test.ts"));
 	assert.ok(commands.at(-1).args.includes("scripts/trading-package-install.test.mjs"));

@@ -122,4 +122,38 @@ describe("parsePaperAccount", () => {
 			),
 		).toThrow("entries.BTC.lots amounts must equal the absolute entry amount");
 	});
+
+	it.each([
+		{ source: "exchange", completeness: "complete", charges: [{ currency: "USDT", cost: 0.1 }] },
+		{ source: "paper-ledger", completeness: "complete", charges: [{ currency: "BTC", cost: 0.1 }] },
+		{ source: "paper-ledger", completeness: "complete", charges: [{ currency: "USDT", cost: -0.1 }] },
+		{ source: "paper-ledger", completeness: "complete", charges: [] },
+		{
+			source: "paper-ledger",
+			completeness: "complete",
+			charges: [{ currency: "USDT", cost: 0.1, secret: "invalid" }],
+		},
+	])("rejects invalid paper fee provenance: %s", (feeObservation) => {
+		expect(() =>
+			parsePaperAccount(
+				validAccount({
+					orders: [
+						{
+							id: "1",
+							symbol: "BTC/USDT",
+							side: "buy",
+							type: "market",
+							amount: 1,
+							filled: 1,
+							cost: 100,
+							status: "closed",
+							timestamp: 1,
+							feeObservation,
+						},
+					],
+				}),
+				path,
+			),
+		).toThrow(/feeObservation/);
+	});
 });

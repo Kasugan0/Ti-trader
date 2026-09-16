@@ -239,6 +239,25 @@ describe("trading prompt", () => {
 		expect(prompt).toContain("stop_market/take_profit_market close-all orders use closePosition");
 		expect(prompt).toContain("a returned amount of 0 can mean the exchange omitted quantity");
 	});
+
+	it("requires persistent public rationale without promoting notes to authority", () => {
+		const prompt = promptFor({ marketType: "spot" });
+		expect(prompt).toContain("### Continuity");
+		expect(prompt).toContain("never rewrites the historical purchase rationale");
+		expect(prompt).toContain("plan {id, version, intentId}");
+		expect(prompt).toContain("Plan-linked live orders require operator confirmation");
+		expect(prompt).toContain("Use record_decision before a mutation");
+		expect(prompt).toContain("A blocked mutation is a model attempt rejected by the engine");
+		expect(prompt).toContain("Model/prompt changes require separate evidence");
+	});
+
+	it("does not prescribe plan or decision tools when unavailable", () => {
+		const prompt = promptFor({ marketType: "spot" }, ["get_price", "buy", "check_order"]);
+		expect(prompt).not.toContain("### Continuity");
+		expect(prompt).not.toContain("### Decision evidence");
+		expect(prompt).not.toContain("record_decision");
+		expect(prompt).not.toContain("read_plan");
+	});
 });
 
 describe("collectTradingPromptTools", () => {

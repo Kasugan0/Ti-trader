@@ -11,6 +11,9 @@ describe("extension arguments", () => {
 			expect(help).toContain("/recovery");
 			expect(help).toContain("/audit");
 			expect(help).toContain("/health");
+			expect(help).toContain("/plan");
+			expect(help).toContain("/decisions");
+			expect(help).toContain("tracking never places orders");
 			expect(help).toContain("Persistent experimental monitor");
 			expect(help).not.toContain("in-memory monitor");
 		} finally {

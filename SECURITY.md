@@ -9,8 +9,10 @@ enabled, so please report security issues responsibly.
 Ti treats the local user account and files writable by that account as inside
 the same trust boundary as the Ti process itself. Exchange API keys are stored
 locally under `~/.ti-trader/agent/keys.json` with mode 600; model provider credentials
-are stored under `~/.ti-trader/agent/` via the upstream pi auth mechanism. Protecting
-those files from other local users or processes is the operating system's job,
+are stored under `~/.ti-trader/agent/` via the upstream pi auth mechanism. A
+hand-made keys file (and Zhihu/freqtrade secret files) that is group- or
+world-readable is tightened to mode 600 before it is read. Protecting those
+files from other local users or processes is still the operating system's job,
 not Ti's.
 
 Reports that depend on an attacker already having local write access to the
@@ -21,8 +23,10 @@ grants that access or crosses an operating-system privilege boundary.
 ## In Scope
 
 - Ti placing unintended live orders, bypassing the risk layer
-  (`maxOrderNotional`, `maxDailyNotional`, `allowedSymbols`), or bypassing the
-  live-order confirmation flow without the user disabling it.
+  (`maxOrderNotional`, `maxDailyNotional`, `allowedSymbols`, or configured
+  `risk.account` hard limits), cancelling a live protective stop without
+  account hard risk, or bypassing the live-order confirmation flow without
+  the user disabling it.
 - Ti exfiltrating exchange API keys or model credentials to a third party.
 - Remote code execution or privilege escalation reachable without prior local
   access.

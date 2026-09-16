@@ -1,4 +1,4 @@
-import type { RiskClock, RiskStateStore, TradingRiskState } from "@nikopack/ti-trading-risk";
+import type { AccountRiskLimits, RiskClock, RiskStateStore, TradingRiskState } from "@nikopack/ti-trading-risk";
 import { describe, expect, it, vi } from "vitest";
 import { TradingEngine as BaseTradingEngine, PreparedPlanError, type TradingEngineConfig } from "./engine.ts";
 import type { OrderIntent, PreparedOrder } from "./order-plan.ts";
@@ -6,6 +6,7 @@ import { OrderPreparationError } from "./order-plan.ts";
 import {
 	type ExchangeClient,
 	type Order,
+	type Position,
 	SubmissionRejectedError,
 	SubmissionStatusUnknownError,
 	type Ticker,
@@ -1033,5 +1034,235 @@ describe("spot lot precision", () => {
 			uncertain: true,
 			message: expect.stringContaining("market metadata refresh failed"),
 		});
+	});
+});
+
+describe("Live cancellation protection without account hard risk", () => {
+	const position: Position = { symbol: "BTC/USDT", asset: "BTC", amount: 1 };
+	const stopOrder: Order = {
+		id: "stop-1",
+		symbol: "BTC/USDT",
+		side: "sell",
+		type: "stop_market",
+		stopPrice: 90,
+		amount: 1,
+		filled: 0,
+		remaining: 1,
+		cost: 0,
+		status: "open",
+		timestamp: 1,
+	};
+	const takeProfitOrder: Order = { ...stopOrder, id: "tp-1", type: "limit", price: 120, stopPrice: undefined };
+	const entryOrder: Order = {
+		...stopOrder,
+		id: "entry-1",
+		side: "buy",
+		type: "limit",
+		price: 95,
+		stopPrice: undefined,
+	};
+
+	function liveClient(openOrders: Order[], overrides: Partial<ExchangeClient> = {}): ExchangeClient {
+		return client({
+			mode: "live",
+			getOpenOrders: async () => openOrders,
+			getPositions: async () => [position],
+			...overrides,
+		});
+	}
+
+	it("refuses cancelling a protective stop while the position is open", async () => {
+		const exchange = liveClient([stopOrder]);
+		const cancel = vi.spyOn(exchange, "cancelOrder");
+		const trading = new TradingEngine({ ...config, mode: "live" }, exchange, stateStore());
+		await expect(trading.cancelOrder("stop-1", "BTC/USDT")).rejects.toThrow(/Cancellation would remove protection/);
+		expect(cancel).not.toHaveBeenCalled();
+	});
+
+	it("refuses cancelling a live trailing stop while the position is open", async () => {
+		const trailing: Order = {
+			...stopOrder,
+			id: "trail-1",
+			type: "trailing_stop_market",
+			stopPrice: undefined,
+			trailingPercent: 5,
+		};
+		const exchange = liveClient([trailing]);
+		const cancel = vi.spyOn(exchange, "cancelOrder");
+		const trading = new TradingEngine({ ...config, mode: "live" }, exchange, stateStore());
+		await expect(trading.cancelOrder("trail-1", "BTC/USDT")).rejects.toThrow(/Cancellation would remove protection/);
+		expect(cancel).not.toHaveBeenCalled();
+	});
+
+	it("still cancels take-profit and entry orders in live mode", async () => {
+		const exchange = liveClient([takeProfitOrder, entryOrder]);
+		const cancel = vi.spyOn(exchange, "cancelOrder");
+		const trading = new TradingEngine({ ...config, mode: "live" }, exchange, stateStore());
+		await trading.cancelOrder("tp-1", "BTC/USDT");
+		await trading.cancelOrder("entry-1", "BTC/USDT");
+		expect(cancel).toHaveBeenCalledTimes(2);
+	});
+
+	it("refuses cancelling an OCO list containing the stop leg", async () => {
+		const exchange = liveClient([], {
+			getOrderList: async () => ({
+				id: "list-1",
+				listOrderStatus: "EXECUTING",
+				status: "open",
+				orders: [stopOrder, takeProfitOrder],
+			}),
+		});
+		const cancel = vi.spyOn(exchange, "cancelOrderList");
+		const trading = new TradingEngine({ ...config, mode: "live" }, exchange, stateStore());
+		await expect(trading.cancelOrderList("list-1", "BTC/USDT")).rejects.toThrow(
+			/Cancellation would remove protection/,
+		);
+		expect(cancel).not.toHaveBeenCalled();
+	});
+
+	it("does not guard paper-mode cancellations", async () => {
+		const exchange = client({
+			getOpenOrders: async () => [stopOrder],
+			getPositions: async () => [position],
+		});
+		const cancel = vi.spyOn(exchange, "cancelOrder");
+		const trading = new TradingEngine(config, exchange, stateStore());
+		await trading.cancelOrder("stop-1", "BTC/USDT");
+		expect(cancel).toHaveBeenCalledOnce();
+	});
+
+	it("requires a reduce-only constraint for futures stops to count as protection", async () => {
+		const futuresPosition: Position = { symbol: "BTC/USDT:USDT", asset: "BTC", amount: 1, positionSide: "LONG" };
+		const nakedStop: Order = { ...stopOrder, id: "naked-1", symbol: "BTC/USDT:USDT" };
+		const reduceOnlyStop: Order = { ...stopOrder, id: "ro-1", symbol: "BTC/USDT:USDT", reduceOnly: true };
+		const nakedEngine = new TradingEngine(
+			{ ...futuresConfig, mode: "live" },
+			client({
+				mode: "live",
+				getOpenOrders: async () => [nakedStop],
+				getPositions: async () => [futuresPosition],
+			}),
+			stateStore(),
+		);
+		await nakedEngine.cancelOrder("naked-1", "BTC/USDT:USDT");
+		const guardedEngine = new TradingEngine(
+			{ ...futuresConfig, mode: "live" },
+			client({
+				mode: "live",
+				getOpenOrders: async () => [reduceOnlyStop],
+				getPositions: async () => [futuresPosition],
+			}),
+			stateStore(),
+		);
+		await expect(guardedEngine.cancelOrder("ro-1", "BTC/USDT:USDT")).rejects.toThrow(
+			/Cancellation would remove protection/,
+		);
+	});
+});
+
+describe("Live cancellation protection with account hard risk", () => {
+	const accountLimits: AccountRiskLimits = {
+		maxGrossExposure: 10_000,
+		maxNetExposure: 10_000,
+		maxAssetExposure: 10_000,
+		maxLeverage: 20,
+		maxMarginUsagePct: 80,
+		maxDailyLoss: 10_000,
+		maxDrawdown: 10_000,
+		maxDataAgeMs: 10_000,
+		maxPriceDeviationPct: 50,
+		minDepthRatio: 0,
+		minLiquidationDistancePct: 1,
+		minProtectionCoveragePct: 95,
+		maxStopDistancePct: 20,
+		cancelEntriesOnBreach: true,
+		reduceOnBreach: true,
+	};
+	const position: Position = { symbol: "BTC/USDT", asset: "BTC", amount: 1 };
+	const stopOrder: Order = {
+		id: "stop-1",
+		symbol: "BTC/USDT",
+		side: "sell",
+		type: "stop_market",
+		stopPrice: 90,
+		amount: 1,
+		filled: 0,
+		remaining: 1,
+		cost: 0,
+		status: "open",
+		timestamp: 1,
+	};
+	const trailingOrder: Order = {
+		...stopOrder,
+		id: "trail-1",
+		type: "trailing_stop_market",
+		stopPrice: undefined,
+		trailingPercent: 5,
+	};
+	const takeProfitOrder: Order = { ...stopOrder, id: "tp-1", type: "limit", price: 120, stopPrice: undefined };
+	const extraStop: Order = { ...stopOrder, id: "stop-2", remaining: 1 };
+
+	function liveAccountClient(openOrders: Order[], overrides: Partial<ExchangeClient> = {}): ExchangeClient {
+		return client({
+			mode: "live",
+			feeRate: 0.001,
+			getOpenOrders: async () => openOrders,
+			getPositions: async () => [position],
+			getAccountSnapshot: async () => ({
+				source: "fixture",
+				epoch: "one",
+				observedAt: 1,
+				oldestPriceAt: 1,
+				equity: 10_000,
+				netExternalFlows: 10_000,
+				marginUsed: 0,
+				positions: [position],
+				orders: openOrders,
+				prices: { "BTC/USDT": { price: 100, timestamp: 1 } },
+				limitations: [],
+			}),
+			...overrides,
+		});
+	}
+
+	function liveAccountEngine(exchange: ExchangeClient) {
+		return new TradingEngine(
+			{ ...config, mode: "live", risk: { ...config.risk, account: accountLimits } },
+			exchange,
+			stateStore(),
+			{ now: () => new Date(1) },
+		);
+	}
+
+	it("refuses cancelling a trailing stop that is the position's protection", async () => {
+		const exchange = liveAccountClient([trailingOrder]);
+		const cancel = vi.spyOn(exchange, "cancelOrder");
+		await expect(liveAccountEngine(exchange).cancelOrder("trail-1", "BTC/USDT")).rejects.toThrow(/protection/);
+		expect(cancel).not.toHaveBeenCalled();
+	});
+
+	it("refuses cancelling an OCO list whose stop leg protects the position", async () => {
+		const listOrders = [
+			{ ...stopOrder, ocoGroup: "list-1" },
+			{ ...takeProfitOrder, ocoGroup: "list-1" },
+		];
+		const exchange = liveAccountClient(listOrders, {
+			getOrderList: async () => ({
+				id: "list-1",
+				listOrderStatus: "EXECUTING",
+				status: "open",
+				orders: listOrders,
+			}),
+		});
+		const cancel = vi.spyOn(exchange, "cancelOrderList");
+		await expect(liveAccountEngine(exchange).cancelOrderList("list-1", "BTC/USDT")).rejects.toThrow(/protection/);
+		expect(cancel).not.toHaveBeenCalled();
+	});
+
+	it("still cancels a redundant stop when remaining coverage meets the configured floor", async () => {
+		const exchange = liveAccountClient([stopOrder, extraStop]);
+		const cancel = vi.spyOn(exchange, "cancelOrder");
+		await liveAccountEngine(exchange).cancelOrder("stop-2", "BTC/USDT");
+		expect(cancel).toHaveBeenCalledOnce();
 	});
 });

@@ -13,6 +13,8 @@ export interface Ticker {
 	/** 24h volume in quote currency. */
 	quoteVolume24h?: number;
 	timestamp: number;
+	/** True only when timestamp came from the venue, not a local clock fallback. */
+	sourceTimestampKnown?: boolean;
 }
 
 export interface OrderBookLevel {
@@ -139,6 +141,40 @@ export type OrderType =
 export type PlaceOrderType = Exclude<OrderType, "oco" | "unknown">;
 export type OrderStatus = "open" | "closed" | "canceled" | "rejected" | "expired" | "unknown";
 
+/** Actual adapter-observed charges, never configured rates or estimated conversion values. */
+export interface OrderFeeObservation {
+	source: "exchange" | "paper-ledger";
+	/** Complete covers all filled quantity at this observation, not future fills of an open order. */
+	completeness: "complete" | "partial";
+	/** Original fee currency and signed cost (negative means a rebate). Empty does not establish zero fees. */
+	charges: Array<{ currency: string; cost: number }>;
+}
+
+export function isOrderFeeObservation(value: unknown): value is OrderFeeObservation {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+	const observation = value as Record<string, unknown>;
+	return (
+		(observation.source === "exchange" || observation.source === "paper-ledger") &&
+		(observation.completeness === "complete" || observation.completeness === "partial") &&
+		Object.keys(observation).every((key) => ["source", "completeness", "charges"].includes(key)) &&
+		Array.isArray(observation.charges) &&
+		observation.charges.length > 0 &&
+		observation.charges.length <= 32 &&
+		observation.charges.every((value) => {
+			if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+			const charge = value as Record<string, unknown>;
+			return (
+				typeof charge.currency === "string" &&
+				/^[A-Z0-9_-]{1,80}$/.test(charge.currency) &&
+				typeof charge.cost === "number" &&
+				Number.isFinite(charge.cost) &&
+				Object.keys(charge).every((key) => key === "currency" || key === "cost")
+			);
+		}) &&
+		new Set(observation.charges.map((charge) => charge.currency)).size === observation.charges.length
+	);
+}
+
 export interface Order {
 	id: string;
 	symbol: string;
@@ -150,6 +186,10 @@ export interface Order {
 	stopPrice?: number;
 	/** Trailing distance in percent for trailing stop orders. */
 	trailingPercent?: number;
+	/** Exchange-reported trailing activation price; omitted when unavailable. */
+	activationPrice?: number;
+	/** Exchange-reported trailing callback distance in percent. */
+	callbackRate?: number;
 	/** OCO group id linking a stop-loss and a take-profit leg. */
 	ocoGroup?: string;
 	/** Client-assigned id used to identify a submission safely. */
@@ -174,6 +214,8 @@ export interface Order {
 	average?: number;
 	/** Filled notional in quote currency. */
 	cost: number;
+	/** Missing means unknown. Foreign-currency charges remain unconverted. */
+	feeObservation?: OrderFeeObservation;
 	status: OrderStatus;
 	timestamp: number;
 }
@@ -226,7 +268,7 @@ export interface PlaceOrderInput {
 export interface PlaceOrderResult {
 	executionId?: string;
 	order: Order;
-	/** Estimated fee in quote currency (paper trading). */
+	/** Legacy quote fee for display; actual execution evidence requires order.feeObservation. */
 	fee?: number;
 }
 

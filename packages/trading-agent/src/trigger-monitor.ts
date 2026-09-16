@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type Condition, type FactSnapshot, type FactValue, validateTriggerDefinition } from "@nikopack/ti-triggers";
 import { getTrading } from "./context.ts";
+import { failureCode } from "./failure-code.ts";
 import { t, translate } from "./i18n.ts";
 import {
 	cancelTriggerNotifications,
@@ -101,7 +102,9 @@ export function createTriggerMonitorExtension(options: TriggerMonitorOptions = {
 			let failed = false;
 			const report = (source: string, error: unknown): void => {
 				failed = true;
-				const message = `${source}: ${error instanceof Error ? error.message : String(error)}; observation is unknown`;
+				// Raw transport errors can echo authenticated request details; report only
+				// the coarse failure class, mirroring the autonomous runtime.
+				const message = `${source}: ${failureCode(error)}; observation is unknown`;
 				console.error(`[trigger monitor] ${message}`);
 				warning(ctx, message);
 			};
@@ -212,12 +215,12 @@ export function createTriggerMonitorExtension(options: TriggerMonitorOptions = {
 				isCurrent,
 			);
 			for (const failure of report.failures) {
-				const message = `notification ${failure.eventId} delivery failed: ${failure.error instanceof Error ? failure.error.message : String(failure.error ?? "notification transport unavailable")}`;
+				const message = `notification ${failure.eventId} delivery failed: ${failureCode(failure.error ?? "transport unavailable")}`;
 				console.error(`[trigger monitor] ${message}`);
 				try {
 					warning(ctx, message);
 				} catch (error) {
-					console.error("[trigger monitor] delivery diagnostic failed", error);
+					console.error("[trigger monitor] delivery diagnostic failed:", failureCode(error));
 				}
 			}
 		};
@@ -322,8 +325,11 @@ export function createTriggerMonitorExtension(options: TriggerMonitorOptions = {
 				deliver(scope, ctx, isCurrent, freshDeliveries);
 			} catch (error) {
 				if (isCurrent()) {
-					console.error("[trigger monitor] poll failed", error);
-					warning(ctx, error instanceof Error ? error.message : String(error));
+					// Raw transport errors can echo authenticated request details; report
+					// only the coarse failure class, mirroring the autonomous runtime.
+					const message = `poll failed: ${failureCode(error)}`;
+					console.error(`[trigger monitor] ${message}`);
+					warning(ctx, message);
 					if (scope) {
 						try {
 							const capturedScope = scope;
@@ -334,7 +340,7 @@ export function createTriggerMonitorExtension(options: TriggerMonitorOptions = {
 								health.errorCode = "poll-failed";
 							});
 						} catch (storageError) {
-							warning(ctx, `state persistence failed: ${String(storageError)}`);
+							warning(ctx, `state persistence failed: ${failureCode(storageError)}`);
 						}
 					}
 				}

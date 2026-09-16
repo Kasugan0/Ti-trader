@@ -190,20 +190,44 @@ function reclaimDeadOwner(path: string): boolean {
 	}
 }
 
+function reclaimStaleLock(path: string, staleMs: number): boolean {
+	if (!isStaleLock(path, staleMs)) return false;
+	// Serialize reclaimers through the same gate as dead-owner recovery.
+	// Without the gate, two waiters that both observe a stale lock can race:
+	// the first reclaims and installs a fresh lock, and the second waiter's
+	// unlink then removes that live replacement, leaving two lock owners.
+	let gate: FileLock;
+	try {
+		gate = tryCreateLock(`${path}.reclaim`);
+	} catch (error) {
+		// Another reclaimer owns the gate; it will finish the reclamation, so
+		// wait for the next loop iteration instead of touching the lock file.
+		if (fsErrorCode(error) === "EEXIST") return false;
+		throw error;
+	}
+	try {
+		// Re-check under the gate: the other reclaimer may have already removed
+		// the stale lock and installed a fresh one while we waited for the gate.
+		// A fresh lock is not stale and must never be unlinked here.
+		if (!isStaleLock(path, staleMs)) return false;
+		try {
+			unlinkSync(path);
+		} catch (unlinkError) {
+			if (fsErrorCode(unlinkError) !== "ENOENT") throw unlinkError;
+		}
+		return true;
+	} finally {
+		releaseFileLock(gate);
+	}
+}
+
 function reclaimOrWaitForLock(
 	path: string,
 	options: ReturnType<typeof resolvedLockOptions>,
 	deadline: number,
 ): "retry" | "wait" {
 	if (options.reclaimDeadOwner && reclaimDeadOwner(path)) return "retry";
-	if (isStaleLock(path, options.staleMs)) {
-		try {
-			unlinkSync(path);
-		} catch (unlinkError) {
-			if (fsErrorCode(unlinkError) !== "ENOENT") throw unlinkError;
-		}
-		return "retry";
-	}
+	if (reclaimStaleLock(path, options.staleMs)) return "retry";
 	if (Date.now() >= deadline) throw new Error(options.timeoutMessage(path));
 	return "wait";
 }

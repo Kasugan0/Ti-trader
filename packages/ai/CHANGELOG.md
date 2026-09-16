@@ -4,12 +4,16 @@
 
 ### Changed
 
+- Pinned `@google/genai` `2.21.0` and map `TOO_MANY_TOOL_CALLS` as a stop error.
+- Pinned `vitest` `5.0.0` and replaced `describe.sequential` with `describe`.
 - Pinned `http-proxy-agent` and `https-proxy-agent` `9.1.0`.
 
 ### Fixed
 
 - Fixed OpenAI-compatible Chat Completions requests sending `tool_choice` without tools, which gateways can reject during compaction ([#8607](https://github.com/earendil-works/pi/issues/8607)).
 - Natural event-stream termination without a terminal result now rejects `result()` instead of leaving it pending, while iteration-only consumers remain safe from unhandled rejections.
+- Fixed quadratic CPU usage when draining buffered `EventStream` events ([#9055](https://github.com/earendil-works/pi/issues/9055)).
+- Added `RetryPolicy.maxAgentDelayMs` support to cap shared assistant retry backoff for summarization calls ([#8826](https://github.com/earendil-works/pi/issues/8826)).
 
 ## [0.84.3] - 2026-08-24
 
