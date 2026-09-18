@@ -9,6 +9,7 @@ import {
 	openSync,
 	readdirSync,
 	readSync,
+	rmSync,
 	writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -169,31 +170,40 @@ export class ChildSessionStore {
 		const id = randomUUID();
 		const directory = this.directoryFor(id);
 		mkdirSync(directory, { mode: 0o700 });
-		const manager = SessionManager.create(resolve(input.cwd), directory, { id });
-		const file = manager.getSessionFile();
-		const header = manager.getHeader();
-		if (!file || !header) throw new Error("Unable to allocate persistent subagent history");
-		writeFileSync(file, `${JSON.stringify(header)}\n`, { mode: 0o600, flag: "wx" });
-		syncFileAndDirectory(file);
-		const now = new Date().toISOString();
-		const metadata: ChildSession = {
-			version: 1,
-			id,
-			owner: this.owner,
-			cwd: resolve(input.cwd),
-			agent: input.agent.name,
-			agentScope: input.agentScope,
-			fingerprint: agentFingerprint(input.agent),
-			fileName: basename(file),
-			model: input.model,
-			subject: input.task.slice(0, 240),
-			createdAt: now,
-			updatedAt: now,
-			status: "idle",
-			runCount: 0,
-		};
-		this.save(metadata);
-		return metadata;
+		try {
+			const manager = SessionManager.create(resolve(input.cwd), directory, { id });
+			const file = manager.getSessionFile();
+			const header = manager.getHeader();
+			if (!file || !header) throw new Error("Unable to allocate persistent subagent history");
+			writeFileSync(file, `${JSON.stringify(header)}\n`, { mode: 0o600, flag: "wx" });
+			syncFileAndDirectory(file);
+			const now = new Date().toISOString();
+			const metadata: ChildSession = {
+				version: 1,
+				id,
+				owner: this.owner,
+				cwd: resolve(input.cwd),
+				agent: input.agent.name,
+				agentScope: input.agentScope,
+				fingerprint: agentFingerprint(input.agent),
+				fileName: basename(file),
+				model: input.model,
+				subject: input.task.slice(0, 240),
+				createdAt: now,
+				updatedAt: now,
+				status: "idle",
+				runCount: 0,
+			};
+			this.save(metadata);
+			return metadata;
+		} catch (error) {
+			try {
+				rmSync(directory, { recursive: true, force: true });
+			} catch {
+				// Keep the original allocation error; leftover dirs are skipped by list().
+			}
+			throw error;
+		}
 	}
 
 	historyPath(metadata: ChildSession): string {
@@ -247,8 +257,13 @@ export class ChildSessionStore {
 			}
 			if (metadata.status === "running") {
 				if (metadata.runId) {
-					const previous = this.readRun(id, metadata.runId);
-					if (previous.status === "running")
+					let previous: RunRecord | undefined;
+					try {
+						previous = this.readRun(id, metadata.runId);
+					} catch {
+						previous = undefined;
+					}
+					if (previous?.status === "running")
 						this.saveRun({
 							...previous,
 							status: "interrupted",
@@ -258,9 +273,13 @@ export class ChildSessionStore {
 					this.save({
 						...metadata,
 						status:
-							previous.status === "completed" ? "idle" : previous.status === "failed" ? "failed" : "interrupted",
+							previous?.status === "completed"
+								? "idle"
+								: previous?.status === "failed"
+									? "failed"
+									: "interrupted",
 						childPid: undefined,
-						summary: previous.report?.summary,
+						summary: previous?.report?.summary,
 					});
 				} else {
 					this.save({ ...metadata, status: "interrupted", childPid: undefined });
@@ -323,11 +342,17 @@ export class ChildSessionStore {
 	list(limit = 20, offset = 0, agent?: string): { sessions: ChildSession[]; total: number } {
 		if (!Number.isInteger(limit) || limit < 1 || limit > 50 || !Number.isInteger(offset) || offset < 0)
 			throw new Error("Invalid subagent session page");
-		const sessions = readdirSync(this.directory, { withFileTypes: true })
-			.filter((entry) => entry.isDirectory() && Value.Check(sessionIdSchema, entry.name))
-			.map((entry) => this.read(entry.name))
-			.filter((session) => !agent || session.agent === agent)
-			.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt) || left.id.localeCompare(right.id));
+		const sessions: ChildSession[] = [];
+		for (const entry of readdirSync(this.directory, { withFileTypes: true })) {
+			if (!entry.isDirectory() || !Value.Check(sessionIdSchema, entry.name)) continue;
+			try {
+				const session = this.read(entry.name);
+				if (!agent || session.agent === agent) sessions.push(session);
+			} catch {
+				// Crash or corrupt metadata in one UUID dir must not hide the rest of this owner.
+			}
+		}
+		sessions.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt) || left.id.localeCompare(right.id));
 		return { sessions: sessions.slice(offset, offset + limit), total: sessions.length };
 	}
 }

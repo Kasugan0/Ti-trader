@@ -17,6 +17,7 @@ import {
 import {
 	type AnalysisReport,
 	asRecord,
+	assertFreshFindings,
 	type Evidence,
 	FINISH_ANALYSIS_TOOL,
 	LAB_TOOLS,
@@ -448,6 +449,7 @@ export async function runSubagent(
 							maxTurns: budget.maxTurns,
 							timeoutMs: budget.timeoutMs,
 							evidence: inherited,
+							allowHistoricalFindings: item.agent.name === "reviewer",
 						},
 						signal,
 						onRequest: (name, args, childSignal) => access.call(name, args, tools, childSignal),
@@ -484,6 +486,8 @@ export async function runSubagent(
 					throw new Error(child.error ?? last?.errorMessage ?? child.stderr ?? "Child failed");
 				if (!child.report) throw new Error("Child finished without a validated finish_analysis report");
 				current.report = parseReport(child.report, current.evidence);
+				if (item.agent.name !== "reviewer")
+					assertFreshFindings(current.report, new Set(inherited.map((evidence) => evidence.id)));
 				if (child.proposals?.length && !tools.includes(PROPOSE_ORDER_TOOL))
 					throw new Error("Child returned proposals without proposal capability");
 				if ((child.proposals?.length ?? 0) > 4) throw new Error("Child exceeded the four-proposal limit");

@@ -1,8 +1,8 @@
 import { spawn } from "node:child_process";
-import { readFileSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { releaseFileLock } from "@nikopack/ti-trading-engine";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { discoverAgents } from "../../../extensions/subagent/agents.ts";
 import { ChildSessionStore } from "../../../extensions/subagent/sessions.ts";
 import { report, subagentFixture } from "./subagent-fixture.ts";
@@ -203,5 +203,38 @@ describe("durable child session registry", () => {
 			sessions: [expect.objectContaining({ id: expect.any(String) })],
 		});
 		expect(() => store.list(0)).toThrow("Invalid subagent session page");
+	});
+	it("lists intact sessions when a sibling directory is incomplete or corrupt", () => {
+		const session = createSession();
+		mkdirSync(join(store.directory, "00000000-0000-4000-8000-000000000000"), { mode: 0o700 });
+		writeFileSync(join(store.directory, session.id, "metadata.json"), '{"status":"idle"}');
+		const other = createSession();
+		expect(store.list()).toMatchObject({
+			total: 1,
+			sessions: [expect.objectContaining({ id: other.id })],
+		});
+	});
+	it("removes an incomplete directory if metadata never becomes durable", () => {
+		const save = vi.spyOn(ChildSessionStore.prototype, "save").mockImplementationOnce(() => {
+			throw new Error("fixture disk failure");
+		});
+		try {
+			expect(() => createSession()).toThrow("fixture disk failure");
+			expect(store.list()).toMatchObject({ total: 0, sessions: [] });
+		} finally {
+			save.mockRestore();
+		}
+	});
+	it("reclaims a running session whose in-flight run record is unreadable", () => {
+		const session = createSession();
+		const run = store.begin(session, "task");
+		writeFileSync(join(store.directory, session.id, "runs", `${run.runId}.json`), '{"status":"running"}');
+		const lock = store.acquire(session.id);
+		try {
+			expect(store.read(session.id).status).toBe("interrupted");
+			expect(() => store.readRun(session.id, run.runId)).toThrow("Invalid subagent run record");
+		} finally {
+			releaseFileLock(lock);
+		}
 	});
 });

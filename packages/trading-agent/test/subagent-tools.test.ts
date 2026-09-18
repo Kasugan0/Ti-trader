@@ -109,6 +109,12 @@ describe("child report protocol and budgets", () => {
 		registerChildTools(extension.api, { ...manifest(), evidence: [item] }, vi.fn());
 		expect((await extension.execute("read_evidence", { evidenceId: item.id })).details).toEqual(item);
 		await expect(extension.execute("read_evidence", { evidenceId: "foreign" })).rejects.toThrow("not available");
+		await expect(
+			extension.execute("finish_analysis", {
+				...report(),
+				findings: [{ claim: "still 10", evidenceIds: [item.id] }],
+			}),
+		).rejects.toThrow("refreshed");
 		const long = {
 			...report("市".repeat(600)),
 			findings: Array.from({ length: 5 }, () => ({ claim: "市".repeat(300), evidenceIds: [item.id] })),
@@ -117,6 +123,21 @@ describe("child report protocol and budgets", () => {
 			unknowns: Array(4).fill("市".repeat(180)),
 		};
 		expect(() => parseReport(long, [item])).toThrow("exceeds 8192 bytes");
+	});
+	it("lets reviewers cite supplied evidence without a new observation", async () => {
+		const item: Evidence = {
+			id: "batch-evidence",
+			tool: "calculate_indicators",
+			observedAt: "2025-01-01T00:00:00Z",
+			isError: false,
+			result: { content: [], details: { rsi: 50 } },
+		};
+		registerChildTools(extension.api, { ...manifest(), evidence: [item], allowHistoricalFindings: true }, vi.fn());
+		const result = await extension.execute("finish_analysis", {
+			...report(),
+			findings: [{ claim: "RSI was 50", evidenceIds: [item.id] }],
+		});
+		expect(result).toMatchObject({ terminate: true, details: { findings: [{ evidenceIds: [item.id] }] } });
 	});
 	it("proxies approved research services and blocks more than four proposals", async () => {
 		const rpc = vi.fn(async () => ({ content: [{ type: "text", text: "fixture" }], details: {} }));

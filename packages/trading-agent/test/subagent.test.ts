@@ -343,6 +343,39 @@ describe("persistent research orchestration", () => {
 		expect(requests[2].prompt).toContain("scan result");
 		expect(requests[2].prompt).toContain("technical result");
 		expect(new Set(result.details.results.map((item) => item.sessionId)).size).toBe(3);
+		expect(requests[2].manifest.allowHistoricalFindings).toBe(true);
+		expect(requests[0].manifest.allowHistoricalFindings).toBe(false);
+	});
+	it("rejects a continuation that cites only inherited evidence", async () => {
+		const item = {
+			id: "stored-evidence",
+			tool: "calculate_indicators",
+			observedAt: "2025-01-01T00:00:00Z",
+			isError: false,
+			result: { content: [{ type: "text" as const, text: "RSI=50" }], details: { rsi: 50 } },
+		};
+		const first = await runSubagent({ agent: "technical-analyst", task: "first" }, fixture.ctx, {
+			...fixture.options,
+			runChild: async () => ({
+				...childResult("first"),
+				evidence: [item],
+				report: { ...report("first"), findings: [{ claim: "RSI was 50", evidenceIds: [item.id] }] },
+			}),
+		});
+		const second = await runSubagent(
+			{ sessionId: first.details.results[0].sessionId, task: "continue" },
+			fixture.ctx,
+			{
+				...fixture.options,
+				runChild: async (request) => ({
+					...childResult("stale"),
+					evidence: request.manifest.evidence,
+					report: { ...report("stale"), findings: [{ claim: "still 50", evidenceIds: [item.id] }] },
+				}),
+			},
+		);
+		expect(second.isError).toBe(true);
+		expect(second.content[0].text).toContain("refreshed");
 	});
 	it("caps active children across separate invocations, not just one tasks array", async () => {
 		let active = 0;

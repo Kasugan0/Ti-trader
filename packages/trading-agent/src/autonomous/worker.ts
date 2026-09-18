@@ -6,7 +6,7 @@ import {
 	SettingsManager,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { timeframeDurationMs } from "@nikopack/ti-trading-engine";
+import { isFuturesSymbol, timeframeDurationMs } from "@nikopack/ti-trading-engine";
 import {
 	resolveBundledFreqtradeExtension,
 	resolveBundledMarketLabExtension,
@@ -16,6 +16,7 @@ import {
 	resolveBundledZhihuResearchExtension,
 } from "../bundled-extensions.ts";
 import { autonomousResearchTools, installResearchRuntime } from "../research-bridge.ts";
+import type { AutonomousConfig } from "./config.ts";
 import type { ModelWorkerRequest } from "./model-process.ts";
 import { failureCode } from "./runtime.ts";
 
@@ -53,6 +54,88 @@ ${request.config.services.includes("market-research") ? "market_research retains
 Finish each event with a concise decision/progress summary, including waits and incomplete actions.`;
 }
 
+type WorkerSessionCandle = {
+	timestamp: number;
+	open: number;
+	high: number;
+	low: number;
+	close: number;
+	volume: number;
+};
+
+export async function fetchWorkerSessionCandles(
+	params: { symbol: string; timeframe: string; limit: number; signal?: AbortSignal },
+	query: (args: Record<string, unknown>) => Promise<unknown>,
+	config: Pick<AutonomousConfig, "exchange" | "quoteCurrency" | "mode">,
+): Promise<{
+	candles: WorkerSessionCandle[];
+	source: { venue: string; market: "spot" | "swap"; kind: "session-klines"; mode: "paper" | "live" };
+}> {
+	params.signal?.throwIfAborted();
+	const duration = timeframeDurationMs(params.timeframe);
+	if (duration === undefined || !Number.isFinite(duration) || duration <= 0)
+		throw new Error(`Unsupported candle timeframe: ${params.timeframe}`);
+	if (!Number.isInteger(params.limit) || params.limit < 1 || params.limit > 200)
+		throw new Error("Candle limit must be an integer between 1 and 200");
+	const response = await query({
+		operation: "klines",
+		symbol: params.symbol,
+		timeframe: params.timeframe,
+		limit: Math.min(params.limit + 1, 200),
+	});
+	params.signal?.throwIfAborted();
+	if (
+		!response ||
+		typeof response !== "object" ||
+		!("status" in response) ||
+		response.status !== "ok" ||
+		!("data" in response) ||
+		!Array.isArray(response.data)
+	)
+		throw new Error("Session candle data unavailable");
+	const now = Date.now();
+	const selected: WorkerSessionCandle[] = [];
+	for (const row of response.data) {
+		if (!row || typeof row !== "object" || !("timestamp" in row))
+			throw new Error("Market data candle had an invalid timestamp");
+		const timestamp = row.timestamp;
+		if (typeof timestamp !== "number" || !Number.isFinite(timestamp) || timestamp <= 0)
+			throw new Error("Market data candle had an invalid timestamp");
+		if ("closed" in row && row.closed === false) continue;
+		if (timestamp + duration > now) continue;
+		if (
+			!("open" in row) ||
+			typeof row.open !== "number" ||
+			!("high" in row) ||
+			typeof row.high !== "number" ||
+			!("low" in row) ||
+			typeof row.low !== "number" ||
+			!("close" in row) ||
+			typeof row.close !== "number" ||
+			!("volume" in row) ||
+			typeof row.volume !== "number"
+		)
+			throw new Error("Market data candle had invalid OHLCV values");
+		selected.push({
+			timestamp,
+			open: row.open,
+			high: row.high,
+			low: row.low,
+			close: row.close,
+			volume: row.volume,
+		});
+	}
+	return {
+		candles: selected.slice(-params.limit),
+		source: {
+			venue: config.exchange,
+			market: isFuturesSymbol(params.symbol, config.quoteCurrency) ? "swap" : "spot",
+			kind: "session-klines",
+			mode: config.mode,
+		},
+	};
+}
+
 export async function runModelWorker(request: ModelWorkerRequest): Promise<void> {
 	if (!process.send) throw new Error("Model worker requires supervised IPC");
 	let ordinal = 0;
@@ -82,43 +165,12 @@ export async function runModelWorker(request: ModelWorkerRequest): Promise<void>
 	};
 	process.on("message", onMessage);
 	const holders = globalThis as Record<PropertyKey, unknown>;
-	holders[Symbol.for("ti.marketLab.candleProvider")] = async (params: {
+	holders[Symbol.for("ti.marketLab.candleProvider")] = (params: {
 		symbol: string;
 		timeframe: string;
 		limit: number;
 		signal?: AbortSignal;
-	}) => {
-		params.signal?.throwIfAborted();
-		const duration = timeframeDurationMs(params.timeframe);
-		if (duration === undefined) throw new Error("Unsupported candle timeframe");
-		const response = await call(
-			"query_trading",
-			{ operation: "klines", symbol: params.symbol, timeframe: params.timeframe, limit: params.limit },
-			false,
-		);
-		params.signal?.throwIfAborted();
-		if (!response || typeof response !== "object" || !("data" in response) || !Array.isArray(response.data))
-			throw new Error("Session candle data unavailable");
-		return {
-			candles: response.data.filter(
-				(candle: unknown) =>
-					candle &&
-					typeof candle === "object" &&
-					!("closed" in candle && candle.closed === false) &&
-					"timestamp" in candle &&
-					typeof candle.timestamp === "number" &&
-					Number.isFinite(candle.timestamp) &&
-					candle.timestamp > 0 &&
-					candle.timestamp + duration <= Date.now(),
-			),
-			source: {
-				venue: request.config.exchange,
-				market: params.symbol.includes(":") ? "swap" : "spot",
-				kind: "session-klines",
-				mode: request.config.mode,
-			},
-		};
-	};
+	}) => fetchWorkerSessionCandles(params, (args) => call("query_trading", args, false), request.config);
 	let session: AgentSession | undefined;
 	let uninstallResearchRuntime: (() => void) | undefined;
 	let stopping = false;

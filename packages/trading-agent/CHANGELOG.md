@@ -37,6 +37,10 @@ All notable changes to `ti-trader` are documented in this file.
 
 ### Fixed
 
+- Autonomous market-lab candle requests fetch one extra bar and keep closed candles, matching the interactive session bridge, so the 20-bar minimum is reachable during market hours. Futures vs spot source uses `isFuturesSymbol`.
+- Subagent session listing skips incomplete or corrupt session directories instead of failing the whole owner scope. `create()` removes a directory if metadata never becomes durable.
+- Reclaiming a session whose in-flight run record is unreadable marks the session interrupted instead of leaving it stuck `running`.
+- Non-review continuations cannot complete using only inherited evidence citations; at least one observation from the current run is required.
 - Research children use a supervised read-only bridge to the parent's actual market and enabled services, preserving futures symbols, source metadata and batch candle cutoffs instead of silently reverting Ti research to public spot data.
 - Reclaiming a research session kills an orphaned detached child instead of leaving the session busy; worker stop waits past the child SIGKILL watchdog; busy errors and session listings expose `childPid`.
 - Plan-linked `intentId` reuse fingerprints stable order identity only. A moved ticker snapshot no longer throws before the engine can reuse a released identity or block an unknown one.

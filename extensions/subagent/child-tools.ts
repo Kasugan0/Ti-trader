@@ -6,6 +6,7 @@ import { PROPOSE_ORDER_TOOL } from "./child-orders.ts";
 import {
 	analysisBudgetSchema,
 	asRecord,
+	assertFreshFindings,
 	CANDLE_PROVIDER_KEY,
 	type CandleRequest,
 	type ChildManifest,
@@ -116,6 +117,8 @@ export function registerChildTools(pi: ExtensionAPI, manifest: ChildManifest, ca
 		parameters: reportSchema,
 		async execute(_id, params) {
 			const report = parseReport(params, [...evidence.values()]);
+			if (!manifest.allowHistoricalFindings)
+				assertFreshFindings(report, new Set(manifest.evidence.map((item) => item.id)));
 			finished = true;
 			return {
 				content: [{ type: "text", text: JSON.stringify(report) }],
@@ -149,6 +152,7 @@ export default function childToolsExtension(pi: ExtensionAPI): void {
 		) ||
 		!Array.isArray(manifest.evidence) ||
 		manifest.evidence.some((item) => !Value.Check(evidenceSchema, item)) ||
+		(manifest.allowHistoricalFindings !== undefined && typeof manifest.allowHistoricalFindings !== "boolean") ||
 		!Value.Check(analysisBudgetSchema, {
 			maxToolCalls: manifest.maxToolCalls,
 			maxTurns: manifest.maxTurns,

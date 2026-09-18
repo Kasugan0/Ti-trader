@@ -91,6 +91,7 @@ export type ChildManifest = Pick<AnalysisBudget, "maxToolCalls" | "maxTurns" | "
 	bridge: boolean;
 	allowedTools: string[];
 	evidence: Evidence[];
+	allowHistoricalFindings?: boolean;
 };
 
 export function researchRuntime(): ResearchRuntime | undefined {
@@ -123,6 +124,13 @@ export function parseReport(value: unknown, evidence: readonly Pick<Evidence, "i
 		}
 	}
 	return report;
+}
+
+export function assertFreshFindings(report: AnalysisReport, inheritedIds: ReadonlySet<string>): void {
+	if (inheritedIds.size === 0) return;
+	const cited = report.findings.flatMap((finding) => finding.evidenceIds);
+	if (cited.length > 0 && cited.every((id) => inheritedIds.has(id)))
+		throw new Error("Historical data must be refreshed; cite at least one observation from this run");
 }
 
 export function asRecord(value: unknown): Record<string, unknown> | undefined {
