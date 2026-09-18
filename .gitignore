@@ -49,6 +49,7 @@ packages/coding-agent/binaries/
 todo.md
 plans/
 .ti-local/
+/.serena/
 .pi/hf-sessions/
 .pi/hf-sessions-backup/
 collect.sh
